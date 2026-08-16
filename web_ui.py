@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """iCloud HME Web UI — 多账号聚合管理平台 — Flask single-page app."""
-import sys, os, json, time, queue, secrets, threading, re
+import sys, os, json, time, queue, secrets, threading, re, hashlib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from html import escape as _html_escape
@@ -9,7 +9,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path: sys.path.insert(0, str(HERE))
 
-from flask import Flask, Response, request, jsonify, render_template_string
+from flask import Flask, Response, request, jsonify, render_template_string, redirect
 from icloud_hme import ICloudHME, extract_chrome_cookies
 from account_manager import AccountManager
 from pickup_links import PickupLinkStore
@@ -21,6 +21,48 @@ RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__)
+ADMIN_ACCESS_TOKEN = os.environ.get("ADMIN_ACCESS_TOKEN", "").strip()
+_ADMIN_COOKIE_NAME = "__Host-icloud_admin"
+_ADMIN_COOKIE_VALUE = (
+    hashlib.sha256(("icloud-admin-cookie:" + ADMIN_ACCESS_TOKEN).encode()).hexdigest()
+    if ADMIN_ACCESS_TOKEN else ""
+)
+
+
+@app.before_request
+def _require_admin_access():
+    if request.path.startswith("/pickup/") or request.path == "/healthz":
+        return None
+    if not ADMIN_ACCESS_TOKEN:
+        return None
+
+    cookie = request.cookies.get(_ADMIN_COOKIE_NAME, "")
+    if cookie and secrets.compare_digest(cookie, _ADMIN_COOKIE_VALUE):
+        return None
+
+    supplied = request.args.get("access", "")
+    if supplied and secrets.compare_digest(supplied, ADMIN_ACCESS_TOKEN):
+        response = redirect(request.path or "/", code=302)
+        response.set_cookie(
+            _ADMIN_COOKIE_NAME,
+            _ADMIN_COOKIE_VALUE,
+            max_age=30 * 24 * 60 * 60,
+            secure=True,
+            httponly=True,
+            samesite="Strict",
+            path="/",
+        )
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return response
+
+    return Response("Not Found", status=404, mimetype="text/plain")
+
+
+@app.route("/healthz")
+def healthz():
+    return jsonify({"ok": True}), 200, {"Cache-Control": "no-store"}
+
 _log_queue = queue.Queue()
 _today_key = datetime.now().strftime("%Y%m%d")
 _global_state = {"running":False,"creating":False,"round_status":"","total_created":0,"today_created":0,"current_round_created":0,"next_trigger":None,"last_error":None,"cookies_ok":False,"alias_count":0,"alias_active":0}
