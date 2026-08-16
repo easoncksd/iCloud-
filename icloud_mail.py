@@ -95,6 +95,20 @@ class ICloudMail:
             all_msgs = self._search_and_fetch(None, limit * 3, days)
             return [m for m in all_msgs if recipient.lower() in m.get("to", "").lower()][:limit]
 
+    def recent_uids(self, limit: int = 100, days: int = 30) -> List[bytes]:
+        """Return recent message UIDs newest first without fetching message data."""
+        self._ensure_connected()
+        since = (datetime.now() - timedelta(days=days)).strftime("%d-%b-%Y")
+        status, data = self._conn.uid("SEARCH", None, f'(SINCE "{since}")')
+        if status != "OK" or not data[0]:
+            return []
+        uids = data[0].split()
+        return list(reversed(uids[-limit:]))
+
+    def fetch_header(self, uid: bytes) -> Optional[Dict]:
+        self._ensure_connected()
+        return self._fetch_headers_uid(uid)
+
     def stream_inbox(self, limit: int = 50, days: int = 7):
         self._ensure_connected()
         since = (datetime.now() - timedelta(days=days)).strftime("%d-%b-%Y")

@@ -66,3 +66,32 @@ class PickupLinkStore:
 
     def list_for_aliases(self, aliases):
         return [self.ensure(a["account_id"], a["email"]) for a in aliases if a.get("account_id") and a.get("email")]
+
+    def list_for_account(self, account_id):
+        with self._lock:
+            return [
+                dict(item)
+                for item in self._links.values()
+                if item.get("account_id") == account_id and item.get("active")
+            ]
+
+    def rebind_stale_accounts(self, valid_account_ids):
+        """Keep old pickup tokens working after an account is re-imported."""
+        valid_ids = set(valid_account_ids)
+        with self._lock:
+            current_by_alias = {
+                item.get("alias_email", "").lower(): item.get("account_id")
+                for item in self._links.values()
+                if item.get("active") and item.get("account_id") in valid_ids
+            }
+            changed = 0
+            for item in self._links.values():
+                if not item.get("active") or item.get("account_id") in valid_ids:
+                    continue
+                account_id = current_by_alias.get(item.get("alias_email", "").lower())
+                if account_id:
+                    item["account_id"] = account_id
+                    changed += 1
+            if changed:
+                self._save()
+            return changed

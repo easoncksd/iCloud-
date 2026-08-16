@@ -43,6 +43,8 @@ class AccountManager:
         self.accounts: Dict[str, Dict] = {}
         # _save() also takes this lock; use RLock for callers that update then persist.
         self._lock = threading.RLock()
+        self._mail_clients: Dict[str, Any] = {}
+        self._mail_sync_locks: Dict[str, threading.Lock] = {}
         self._cache = get_cache()
         self._load()
 
@@ -189,6 +191,7 @@ class AccountManager:
 
     def remove_account(self, acc_id: str) -> bool:
         if acc_id in self.accounts:
+            self._drop_mail_client(acc_id)
             del self.accounts[acc_id]
             self._save()
             return True
@@ -302,11 +305,22 @@ class AccountManager:
         )
 
     def set_app_password(self, acc_id: str, app_password: str):
+        self._drop_mail_client(acc_id)
         with self._lock:
             if acc_id not in self.accounts:
                 raise KeyError(f"账号不存在: {acc_id}")
             self.accounts[acc_id]["app_password"] = app_password
             self._save()
+
+    def _drop_mail_client(self, acc_id: str):
+        with self._lock:
+            client = self._mail_clients.pop(acc_id, None)
+        if client:
+            client.disconnect()
+
+    def _mail_sync_lock(self, acc_id: str) -> threading.Lock:
+        with self._lock:
+            return self._mail_sync_locks.setdefault(acc_id, threading.Lock())
 
     def get_mail_client(self, acc_id: str, verbose: bool = False):
         from icloud_mail import ICloudMail
@@ -422,6 +436,94 @@ class AccountManager:
             self._cache.set_alias_mail_batch(acc_id, results)
 
         return results
+
+    def sync_pickup_mail(self, acc_id: str, alias_emails: List[str],
+                         scan_limit: int = 100, days: int = 30) -> Dict:
+        """Incrementally sync pickup mail over IMAP without using iCloud cookies."""
+        aliases = {x.strip().lower() for x in alias_emails if x and x.strip()}
+        if not aliases:
+            return {"messages": {}, "bodies": {}}
+
+        cached_by_alias = self._cache.get_all_alias_mail(acc_id)
+        known_ids = {
+            str(msg.get("id", ""))
+            for msg in self._cache.get_inbox(acc_id)
+            if msg.get("id") is not None
+        }
+        for messages in cached_by_alias.values():
+            known_ids.update(
+                str(msg.get("id", ""))
+                for msg in messages
+                if msg.get("id") is not None
+            )
+
+        with self._mail_sync_lock(acc_id):
+            for attempt in range(2):
+                new_headers: List[Dict] = []
+                by_alias: Dict[str, List[Dict]] = {}
+                bodies: Dict[str, Dict] = {}
+                with self._lock:
+                    mail = self._mail_clients.get(acc_id)
+                if not mail:
+                    mail = self.get_mail_client(acc_id)
+                    with self._lock:
+                        self._mail_clients[acc_id] = mail
+                try:
+                    for uid in mail.recent_uids(limit=scan_limit, days=days):
+                        uid_text = uid.decode() if isinstance(uid, bytes) else str(uid)
+                        if uid_text in known_ids:
+                            continue
+                        header = mail.fetch_header(uid)
+                        if not header:
+                            continue
+                        new_headers.append(header)
+                        to_field = header.get("to", "").lower()
+                        matched = next((alias for alias in aliases if alias in to_field), None)
+                        if not matched:
+                            continue
+                        by_alias.setdefault(matched, []).append(header)
+
+                    # The first item for each alias is the newest UID. Fetch its
+                    # body while the authenticated IMAP connection is still open.
+                    for messages in by_alias.values():
+                        if not messages:
+                            continue
+                        message = messages[0]
+                        msg_id = str(message.get("id", ""))
+                        if not msg_id:
+                            continue
+                        full = mail.fetch_full(msg_id.encode()) or {}
+                        full.update(message)
+                        bodies[msg_id] = full
+                    break
+                except Exception:
+                    self._drop_mail_client(acc_id)
+                    if attempt:
+                        raise
+
+        # Calling set_inbox even with no new messages advances last_checked.
+        self._cache.set_inbox(acc_id, new_headers)
+        if by_alias:
+            self._cache.set_alias_mail_batch(acc_id, by_alias)
+        return {"messages": by_alias, "bodies": bodies}
+
+    def fetch_pickup_message(self, acc_id: str, msg_id: str) -> Dict:
+        """Fetch one full message through the account's persistent IMAP session."""
+        with self._mail_sync_lock(acc_id):
+            for attempt in range(2):
+                with self._lock:
+                    mail = self._mail_clients.get(acc_id)
+                if not mail:
+                    mail = self.get_mail_client(acc_id)
+                    with self._lock:
+                        self._mail_clients[acc_id] = mail
+                try:
+                    return mail.fetch_full(str(msg_id).encode()) or {}
+                except Exception:
+                    self._drop_mail_client(acc_id)
+                    if attempt:
+                        raise
+        return {}
 
     def test_imap_connection(self, acc_id: str) -> Dict:
         try:

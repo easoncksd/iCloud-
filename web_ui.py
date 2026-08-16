@@ -71,6 +71,7 @@ _scheduler_thread = None
 _stop_event = threading.Event()
 _account_mgr = AccountManager()
 _pickup_store = PickupLinkStore(RESULTS_DIR / "pickup_links.json")
+_pickup_store.rebind_stale_accounts(_account_mgr.accounts.keys())
 PICKUP_BASE_URL = os.environ.get("PICKUP_BASE_URL", "").rstrip("/")
 _pickup_refresh_lock = threading.Lock()
 _pickup_refreshing = set()
@@ -391,6 +392,7 @@ def api_pickup_links():
     try:
         aliases = _account_mgr.get_all_aliases()
         links = _pickup_store.list_for_aliases(aliases)
+        _pickup_store.rebind_stale_accounts(_account_mgr.accounts.keys())
         base = PICKUP_BASE_URL or request.host_url.rstrip("/")
         return jsonify({"links": [
             {"account_id": x["account_id"], "email": x["alias_email"], "token": x["token"],
@@ -424,15 +426,27 @@ def pickup_page(token):
     html = """<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
 <title>邮件</title><style>*{box-sizing:border-box}html,body{margin:0;min-height:100%;background:#fff;font-family:system-ui,-apple-system,"Microsoft YaHei",sans-serif}#mailbox{min-height:100vh;background:#fff}.mail-frame{display:block;width:100%;min-height:100vh;border:0;background:#fff}.state{display:flex;align-items:center;justify-content:center;min-height:100vh;color:#718594;background:#f5f8fa}.status{position:fixed;right:12px;top:10px;z-index:10;padding:5px 10px;border-radius:3px;background:rgba(16,26,35,.82);color:#fff;font-size:12px;opacity:0;transition:opacity .2s;pointer-events:none}.status.show{opacity:1}</style></head><body>
 <div id='status' class='status'>正在获取最新邮件...</div><main id='mailbox'><div class='state'>正在打开最新邮件...</div></main>
-<script>const token=__TOKEN__;let busy=false;let currentId='';const bodies={};const statusEl=document.getElementById('status');function status(text,hold){statusEl.textContent=text;statusEl.classList.add('show');if(!hold)setTimeout(()=>statusEl.classList.remove('show'),1800)}function showEmail(data){const box=document.getElementById('mailbox');box.innerHTML='';if(data.html){const frame=document.createElement('iframe');frame.className='mail-frame';frame.setAttribute('sandbox','allow-same-origin allow-popups');frame.setAttribute('referrerpolicy','no-referrer');const csp=`<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src https: http: data: cid:; style-src 'unsafe-inline' https: http:; font-src https: http: data:;">`;frame.srcdoc=csp+data.html;frame.onload=function(){try{frame.style.height=Math.max(frame.contentDocument.documentElement.scrollHeight+20,window.innerHeight)+'px'}catch(e){}};box.appendChild(frame)}else{const div=document.createElement('div');div.className='state';div.style.whiteSpace='pre-wrap';div.style.alignItems='flex-start';div.style.justifyContent='flex-start';div.style.padding='32px';div.textContent=data.body||'(无正文内容)';box.appendChild(div)}}async function fetchMessages(force){const r=await fetch('/pickup/'+encodeURIComponent(token)+'/messages'+(force?'?force=1':''),{cache:'no-store'});const d=await r.json();if(!r.ok)throw new Error(d.error||'读取失败');return d}async function openLatest(m){if(!m||!m.id){document.getElementById('mailbox').innerHTML='<div class="state">暂无邮件。</div>';return}if(currentId===String(m.id)&&bodies[m.id])return;currentId=String(m.id);status('正在打开最新邮件...',true);for(let n=0;n<25;n++){try{const r=await fetch('/pickup/'+encodeURIComponent(token)+'/message/'+encodeURIComponent(m.id),{cache:'no-store'});const d=await r.json();if(r.ok&&d.ready){bodies[m.id]=d.message||{};showEmail(bodies[m.id]);status('最新邮件已打开',false);return}}catch(e){}await new Promise(r=>setTimeout(r,800))}status('邮件打开较慢，稍后自动重试',false)}async function sync(){if(busy)return;busy=true;try{status('正在获取最新邮件...',true);let d=await fetchMessages(true);let list=(d.emails||[]).slice().reverse();if(list.length)await openLatest(list[0]);if(d.refreshing){for(let i=0;i<25;i++){await new Promise(r=>setTimeout(r,800));d=await fetchMessages(false);if(!d.refreshing){list=(d.emails||[]).slice().reverse();await openLatest(list[0]);break}}}if(!list.length)document.getElementById('mailbox').innerHTML='<div class="state">暂无邮件。</div>';status('已是最新邮件',false)}catch(e){status('读取失败，稍后自动重试',false)}finally{busy=false}}sync();setInterval(sync,15000);</script></body></html>"""
+<script>const token=__TOKEN__;let busy=false;let currentId='';const bodies={};const statusEl=document.getElementById('status');function status(text,hold){statusEl.textContent=text;statusEl.classList.add('show');if(!hold)setTimeout(()=>statusEl.classList.remove('show'),1800)}function showEmail(data){const box=document.getElementById('mailbox');box.innerHTML='';if(data.html){const frame=document.createElement('iframe');frame.className='mail-frame';frame.setAttribute('sandbox','allow-same-origin allow-popups');frame.setAttribute('referrerpolicy','no-referrer');const csp=`<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src https: http: data: cid:; style-src 'unsafe-inline' https: http:; font-src https: http: data:;">`;frame.srcdoc=csp+data.html;frame.onload=function(){try{frame.style.height=Math.max(frame.contentDocument.documentElement.scrollHeight+20,window.innerHeight)+'px'}catch(e){}};box.appendChild(frame)}else{const div=document.createElement('div');div.className='state';div.style.whiteSpace='pre-wrap';div.style.alignItems='flex-start';div.style.justifyContent='flex-start';div.style.padding='32px';div.textContent=data.body||'(无正文内容)';box.appendChild(div)}}async function fetchMessages(force){const r=await fetch('/pickup/'+encodeURIComponent(token)+'/messages'+(force?'?force=1':''),{cache:'no-store'});const d=await r.json();if(!r.ok)throw new Error(d.error||'读取失败');return d}async function openLatest(m){if(!m||!m.id){document.getElementById('mailbox').innerHTML='<div class="state">暂无邮件。</div>';return}if(currentId===String(m.id)&&bodies[m.id])return;currentId=String(m.id);status('正在打开最新邮件...',true);for(let n=0;n<25;n++){try{const r=await fetch('/pickup/'+encodeURIComponent(token)+'/message/'+encodeURIComponent(m.id),{cache:'no-store'});const d=await r.json();if(r.ok&&d.ready){bodies[m.id]=d.message||{};showEmail(bodies[m.id]);status('最新邮件已打开',false);return}}catch(e){}await new Promise(r=>setTimeout(r,800))}status('邮件打开较慢，稍后自动重试',false)}async function sync(){if(busy)return;busy=true;try{status('正在获取最新邮件...',true);let d=await fetchMessages(true);let list=(d.emails||[]).slice().reverse();if(list.length)await openLatest(list[0]);if(d.refreshing){for(let i=0;i<25;i++){await new Promise(r=>setTimeout(r,800));d=await fetchMessages(false);if(!d.refreshing){list=(d.emails||[]).slice().reverse();await openLatest(list[0]);break}}}if(!list.length)document.getElementById('mailbox').innerHTML='<div class="state">暂无邮件。</div>';status('已是最新邮件',false)}catch(e){status('读取失败，稍后自动重试',false)}finally{busy=false}}sync();(function schedule(){setTimeout(async function(){await sync();schedule()},4000+Math.random()*2000)})();</script></body></html>"""
     html = html.replace("__ALIAS__", alias_html).replace("__TOKEN__", token_js)
     return Response(html, mimetype="text/html", headers={"Cache-Control": "no-store"})
 
 def _refresh_pickup_account(account_id):
     global _pickup_pending
     try:
-        # One IMAP sync per iCloud account, then serve all aliases from cache.
-        _account_mgr.check_all_aliases_mail(account_id, limit_per=20, days=30, force=True)
+        # Pickup links already contain the alias mapping. Avoid the iCloud HME
+        # API here so an expired browser cookie cannot block IMAP delivery.
+        links = _pickup_store.list_for_account(account_id)
+        aliases = [item.get("alias_email", "") for item in links]
+        synced = _account_mgr.sync_pickup_mail(account_id, aliases, scan_limit=100, days=30)
+        with _pickup_refresh_lock:
+            for msg_id, message in synced.get("bodies", {}).items():
+                message["verification_code"] = _pickup_code(
+                    message.get("subject", ""), message.get("body", "")
+                )
+                message["clean_body"] = _clean_pickup_body(message.get("body", ""))
+                _pickup_body_cache[(account_id, str(msg_id))] = message
+            while len(_pickup_body_cache) > 5000:
+                _pickup_body_cache.pop(next(iter(_pickup_body_cache)))
     finally:
         with _pickup_refresh_lock:
             _pickup_last_account_refresh[account_id] = time.time()
@@ -462,11 +476,7 @@ def _refresh_pickup_body(account_id, msg_id):
     global _pickup_pending
     key = (account_id, msg_id)
     try:
-        mail = _account_mgr.get_mail_client(account_id)
-        try:
-            full = mail.fetch_full(msg_id.encode() if isinstance(msg_id, str) else msg_id) or {}
-        finally:
-            mail.disconnect()
+        full = _account_mgr.fetch_pickup_message(account_id, msg_id)
         full["verification_code"] = _pickup_code(full.get("subject", ""), full.get("body", ""))
         full["clean_body"] = _clean_pickup_body(full.get("body", ""))
         with _pickup_refresh_lock:
@@ -484,13 +494,18 @@ def pickup_messages(token):
     item = _pickup_store.get_by_token(token)
     if not item:
         return jsonify({"error": "取件链接无效或已撤销"}), 404
-    cached = _account_mgr._cache.get_alias_mail(item["account_id"], item["alias_email"])[-20:]
+    cached = _account_mgr._cache.get_alias_mail(item["account_id"], item["alias_email"])
+    cached = sorted(
+        cached,
+        key=lambda message: int(str(message.get("id", "0")))
+        if str(message.get("id", "")).isdigit() else 0,
+    )[-20:]
     now = time.time()
     force = request.args.get("force", "0") == "1"
     account_id = item["account_id"]
     with _pickup_refresh_lock:
         refreshing = account_id in _pickup_refreshing_accounts
-        if not refreshing and (force or now - _pickup_last_account_refresh.get(account_id, 0) >= 12) and _pickup_pending < _PICKUP_MAX_PENDING:
+        if not refreshing and now - _pickup_last_account_refresh.get(account_id, 0) >= 4 and _pickup_pending < _PICKUP_MAX_PENDING:
             _pickup_refreshing_accounts.add(account_id)
             _pickup_pending += 1
             refreshing = True
