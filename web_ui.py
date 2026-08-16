@@ -29,6 +29,9 @@ _stop_event = threading.Event()
 _account_mgr = AccountManager()
 _pickup_store = PickupLinkStore(RESULTS_DIR / "pickup_links.json")
 PICKUP_BASE_URL = os.environ.get("PICKUP_BASE_URL", "").rstrip("/")
+_pickup_refresh_lock = threading.Lock()
+_pickup_refreshing = set()
+_pickup_last_refresh = {}
 
 _RATE_LIMIT_KW = ["limit","exceeded","maximum","quota","429","too many","try again","unavailable","上限","超过","过多","频繁","rate limit","throttle","blocked"]
 
@@ -362,26 +365,42 @@ def api_revoke_pickup_link(acc_id, alias_email):
 
 @app.route("/pickup/<token>")
 def pickup_page(token):
-    """Public bearer page. It exposes only messages, never the alias or account."""
+    """Render immediately; messages are fetched asynchronously by the browser."""
     item = _pickup_store.get_by_token(token)
     if not item:
         return Response("取件链接无效或已撤销", status=404, mimetype="text/plain")
-    limit = min(request.args.get("limit", 20, type=int), 50)
-    force = request.args.get("force", "0") == "1"
-    try:
-        messages = _account_mgr.check_alias_mail(item["account_id"], item["alias_email"], limit=limit, force=force)
-    except Exception:
-        messages = []
-    rows = []
-    for m in messages:
-        body = m.get("text") or m.get("body") or m.get("html") or ""
-        rows.append(f"<article><h2>{_html_escape(m.get('subject') or '(无主题)')}</h2>"
-                    f"<div class='meta'>{_html_escape(m.get('from') or '')} · {_html_escape(m.get('date') or '')}</div>"
-                    f"<pre>{_html_escape(str(body))}</pre></article>")
-    html = """<!doctype html><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>取件箱</title><style>body{font:15px system-ui,sans-serif;max-width:760px;margin:32px auto;padding:0 16px;background:#f5f2ea;color:#171513}h1{font-size:20px;font-weight:500}article{border-top:1px solid #c9c2b5;padding:18px 0}h2{font-size:16px;margin:0 0 6px}.meta{color:#756e64;font-size:12px}pre{white-space:pre-wrap;word-break:break-word;font:14px/1.6 ui-monospace,monospace;background:#ebe5d9;padding:12px;overflow:auto}a{color:#8c2d24}</style>
-<h1>取件箱</h1><p><a href='?force=1'>刷新邮件</a></p>__ROWS__""".replace("__ROWS__", "".join(rows) or "<p>暂无邮件</p>")
+    token_js = json.dumps(token)
+    alias_html = _html_escape(item["alias_email"])
+    html = """<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>最近邮件</title><style>*{box-sizing:border-box}body{margin:0;background:#edf2f5;color:#41586b;font:14px/1.6 system-ui,-apple-system,"Microsoft YaHei",sans-serif}.top{background:#101a23;color:#fff;padding:20px 24px}.wrap{width:min(1010px,calc(100% - 32px));margin:auto}.top h1{font-size:20px;margin:0 0 2px}.alias{color:#91c1dd;font-size:15px;word-break:break-all}.main{padding:18px 0 48px}.hint{margin:0 0 12px;color:#6c8799}.status{float:right}.mailbox{background:#fff;border:1px dashed #ced9e0;min-height:126px}.empty,.loading,.error{text-align:center;padding:52px 20px;color:#6d8290}.mail{padding:18px 20px;border-bottom:1px solid #e3eaee}.mail:last-child{border-bottom:0}.subject{font-size:16px;font-weight:600;color:#203442;margin-bottom:4px}.meta{font-size:12px;color:#8397a5}.body{margin-top:12px;padding:12px;background:#f5f8fa;color:#344c5c;white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,Consolas,monospace;max-height:360px;overflow:auto}@media(max-width:600px){.top{padding:16px 0}.main{padding-top:14px}.wrap{width:calc(100% - 24px)}.mail{padding:15px}}</style></head><body>
+<header class='top'><div class='wrap'><h1>最近邮件</h1><div class='alias'>__ALIAS__</div></div></header>
+<main class='wrap main'><p class='hint'>页面每 15 秒自动刷新。<span class='status' id='status'>正在读取...</span></p><section class='mailbox' id='mailbox'><div class='loading'>正在检查邮件...</div></section></main>
+<script>const token=__TOKEN__;let busy=false;function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}function render(items){const box=document.getElementById('mailbox');if(!items.length){box.innerHTML='<div class="empty">暂无邮件。</div>';return}box.innerHTML=items.slice().reverse().map(m=>{const body=m.text||m.body||m.preview||'';return '<article class="mail"><div class="subject">'+esc(m.subject||'(无主题)')+'</div><div class="meta">'+esc(m.from||'')+' · '+esc(m.date||'')+'</div>'+(body?'<div class="body">'+esc(body)+'</div>':'')+'</article>'}).join('')}async function load(){if(busy)return;busy=true;const status=document.getElementById('status');try{const r=await fetch('/pickup/'+encodeURIComponent(token)+'/messages',{cache:'no-store'});const d=await r.json();if(!r.ok)throw new Error(d.error||'读取失败');render(d.emails||[]);status.textContent=d.refreshing?'后台查件中':'刚刚刷新'}catch(e){status.textContent='读取失败';if(!document.querySelector('.mail'))document.getElementById('mailbox').innerHTML='<div class="error">读取失败，15 秒后自动重试。</div>'}finally{busy=false}}load();setInterval(load,15000);</script></body></html>"""
+    html = html.replace("__ALIAS__", alias_html).replace("__TOKEN__", token_js)
     return Response(html, mimetype="text/html", headers={"Cache-Control": "no-store"})
+
+def _refresh_pickup_mail(token, item):
+    try:
+        _account_mgr.check_alias_mail(item["account_id"], item["alias_email"], limit=20, days=30, force=True)
+    finally:
+        with _pickup_refresh_lock:
+            _pickup_last_refresh[token] = time.time()
+            _pickup_refreshing.discard(token)
+
+@app.route("/pickup/<token>/messages")
+def pickup_messages(token):
+    item = _pickup_store.get_by_token(token)
+    if not item:
+        return jsonify({"error": "取件链接无效或已撤销"}), 404
+    cached = _account_mgr._cache.get_alias_mail(item["account_id"], item["alias_email"])[-20:]
+    now = time.time()
+    with _pickup_refresh_lock:
+        refreshing = token in _pickup_refreshing
+        if not refreshing and now - _pickup_last_refresh.get(token, 0) >= 12:
+            _pickup_refreshing.add(token)
+            refreshing = True
+            threading.Thread(target=_refresh_pickup_mail, args=(token, item), daemon=True).start()
+    return jsonify({"emails": cached, "count": len(cached), "refreshing": refreshing}), 200, {"Cache-Control": "no-store"}
 
 @app.route("/api/emails")
 def api_emails():
