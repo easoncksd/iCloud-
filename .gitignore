@@ -12,6 +12,8 @@ __pycache__/
 
 # Backups
 backup/
+*.bak-*
+*.bak
 
 # Sensitive — never commit
 logs/
@@ -23,3 +25,4 @@ accounts.json
 scheduler_state.json
 latest_emails.txt
 mail_cache.json
+pickup_links.json

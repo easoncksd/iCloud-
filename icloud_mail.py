@@ -28,7 +28,8 @@ from typing import Optional, Dict, List
 
 IMAP_SERVER = "imap.mail.me.com"
 IMAP_PORT = 993
-IMAP_TIMEOUT = 20
+# Keep a failed IMAP handshake from blocking the Web UI for a long time.
+IMAP_TIMEOUT = 10
 
 
 class ICloudMail:

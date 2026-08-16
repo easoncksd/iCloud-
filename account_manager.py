@@ -41,7 +41,8 @@ class AccountManager:
 
     def __init__(self):
         self.accounts: Dict[str, Dict] = {}
-        self._lock = threading.Lock()
+        # _save() also takes this lock; use RLock for callers that update then persist.
+        self._lock = threading.RLock()
         self._cache = get_cache()
         self._load()
 
