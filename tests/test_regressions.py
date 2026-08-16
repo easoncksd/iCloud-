@@ -505,6 +505,42 @@ def test_pickup_links_api_does_not_call_icloud():
     print("  PASS test_pickup_links_api_does_not_call_icloud")
 
 
+def test_runtime_logs_persist_replay_and_resume():
+    """运行日志应落盘，SSE 首次连接回放历史，前端按序号续接。"""
+    import web_ui
+
+    original_file = web_ui._RUNTIME_LOG_FILE
+    original_entries = list(web_ui._log_entries)
+    original_seq = web_ui._log_seq
+    with tempfile.TemporaryDirectory() as td:
+        web_ui._RUNTIME_LOG_FILE = Path(td) / "runtime.jsonl"
+        with web_ui._log_condition:
+            web_ui._log_entries = web_ui.deque(maxlen=1000)
+            web_ui._log_seq = 0
+        try:
+            web_ui._emit_log("info", "日志回放测试")
+            loaded = web_ui._load_runtime_logs(web_ui._RUNTIME_LOG_FILE)
+            assert len(loaded) == 1
+            assert loaded[0]["msg"] == "日志回放测试"
+            assert len(loaded[0]["time"]) == 19
+
+            response = web_ui.app.test_client().get(
+                "/api/log-stream?after=0", buffered=False
+            )
+            chunk = next(response.response).decode("utf-8")
+            response.close()
+            assert "id: 1" in chunk
+            assert "日志回放测试" in chunk
+            assert "?after='+logCursor" in web_ui.UI_HTML
+            assert "entry.seq||0)<=logCursor" in web_ui.UI_HTML
+        finally:
+            web_ui._RUNTIME_LOG_FILE = original_file
+            with web_ui._log_condition:
+                web_ui._log_entries = web_ui.deque(original_entries, maxlen=1000)
+                web_ui._log_seq = original_seq
+    print("  PASS test_runtime_logs_persist_replay_and_resume")
+
+
 if __name__ == "__main__":
     tests = [
         ("parse_cookie_header_string", test_parse_cookie_header_string),
@@ -527,6 +563,7 @@ if __name__ == "__main__":
         ("async_batch_retries_temporary_limit_after_cooldown", test_async_batch_retries_temporary_limit_after_cooldown),
         ("email_api_uses_saved_and_pickup_creation_times", test_email_api_uses_saved_and_pickup_creation_times),
         ("pickup_links_api_does_not_call_icloud", test_pickup_links_api_does_not_call_icloud),
+        ("runtime_logs_persist_replay_and_resume", test_runtime_logs_persist_replay_and_resume),
     ]
     
     passed = 0

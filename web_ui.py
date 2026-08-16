@@ -67,9 +67,29 @@ def healthz():
     return jsonify({"ok": True}), 200, {"Cache-Control": "no-store"}
 
 _BJ_TZ = ZoneInfo("Asia/Shanghai")
+_RUNTIME_LOG_FILE = LOGS_DIR / "runtime.jsonl"
+
+
+def _load_runtime_logs(path=_RUNTIME_LOG_FILE):
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()[-1000:]
+    except OSError:
+        return []
+    entries = []
+    for line in lines:
+        try:
+            entry = json.loads(line)
+            if isinstance(entry, dict) and isinstance(entry.get("seq"), int):
+                entries.append(entry)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return entries
+
+
+_loaded_log_entries = _load_runtime_logs()
 _log_condition = threading.Condition()
-_log_entries = deque(maxlen=1000)
-_log_seq = 0
+_log_entries = deque(_loaded_log_entries, maxlen=1000)
+_log_seq = max((entry["seq"] for entry in _loaded_log_entries), default=0)
 _today_key = datetime.now(_BJ_TZ).strftime("%Y%m%d")
 _global_state = {"running":False,"creating":False,"round_status":"","total_created":0,"today_created":0,"current_round_created":0,"next_trigger":None,"last_error":None,"cookies_ok":False,"alias_count":0,"alias_active":0}
 _lock = threading.Lock()
@@ -143,7 +163,26 @@ def _emit_log(level, msg):
     global _log_seq
     with _log_condition:
         _log_seq += 1
-        _log_entries.append({"seq":_log_seq,"time":_now().strftime("%H:%M:%S"),"level":level,"msg":msg})
+        entry = {
+            "seq": _log_seq,
+            "time": _now().strftime("%Y-%m-%d %H:%M:%S"),
+            "level": level,
+            "msg": str(msg)[:1000],
+        }
+        _log_entries.append(entry)
+        try:
+            with open(_RUNTIME_LOG_FILE, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            if _RUNTIME_LOG_FILE.stat().st_size > 2 * 1024 * 1024:
+                _RUNTIME_LOG_FILE.write_text(
+                    "".join(
+                        json.dumps(item, ensure_ascii=False) + "\n"
+                        for item in _log_entries
+                    ),
+                    encoding="utf-8",
+                )
+        except OSError:
+            pass
         _log_condition.notify_all()
 
 def _update_state(**kw):
@@ -275,6 +314,15 @@ UI_HTML = UI_HTML.replace(
 ).replace(
     "e.account_email=acc?(acc.real_email||''):'';});E('emailCount').textContent=emails.length;updateEmailFilter();}",
     "e.account_email=acc?(acc.real_email||''):'';});pickupLinksLoaded=true;E('emailCount').textContent=emails.length;updateEmailFilter();}",
+).replace(
+    "var accounts=[],emails=[],logs=[];var curTab=",
+    "var accounts=[],emails=[],logs=[],logCursor=0;var curTab=",
+).replace(
+    "sseConn=new EventSource('/api/log-stream');",
+    "sseConn=new EventSource('/api/log-stream?after='+logCursor);",
+).replace(
+    "var entry=JSON.parse(e.data);logs.push(entry);",
+    "var entry=JSON.parse(e.data);if((entry.seq||0)<=logCursor)return;logCursor=entry.seq||logCursor;logs.push(entry);",
 )
 
 # ----- Flask Routes -----
@@ -1007,6 +1055,7 @@ def main():
         print(f"[+] {len(accounts)} account(s) loaded")
         for a in accounts: print(f"    [OK] {a.get('name','?')} - {a.get('real_email','?')} ({a.get('alias_total',0)} aliases)")
     else: print("[*] No accounts yet")
+    _emit_log("info", f"服务已启动，加载 {len(accounts)} 个主账号")
     if args.scheduler:
         global _scheduler_thread
         _scheduler_stop_event.clear()
