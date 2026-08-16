@@ -413,6 +413,48 @@ def test_async_batch_retries_temporary_limit_after_cooldown():
     print("  PASS test_async_batch_retries_temporary_limit_after_cooldown")
 
 
+def test_email_api_uses_saved_and_pickup_creation_times():
+    """新记录读取保存时间，旧记录使用取件链接时间兜底。"""
+    import web_ui
+
+    class FakePickupStore:
+        def list_all(self):
+            return [{
+                "alias_email": "old@icloud.com",
+                "created_at": "2026-08-01T02:03:04+00:00",
+            }]
+
+    class FakeExportStore:
+        def status_map(self, _emails):
+            return {}
+
+    original_results = web_ui.RESULTS_DIR
+    original_pickup = web_ui._pickup_store
+    original_export = web_ui._export_store
+    with tempfile.TemporaryDirectory() as td:
+        results_dir = Path(td)
+        (results_dir / "latest_emails.txt").write_text(
+            "old@icloud.com\tacc-old\n"
+            "new@icloud.com\tacc-new\t2026-08-16T12:30:00+08:00\n",
+            encoding="utf-8",
+        )
+        web_ui.RESULTS_DIR = results_dir
+        web_ui._pickup_store = FakePickupStore()
+        web_ui._export_store = FakeExportStore()
+        try:
+            payload = web_ui.app.test_client().get("/api/emails").get_json()
+            by_email = {item["email"]: item for item in payload["emails"]}
+            assert by_email["new@icloud.com"]["created_at"] == "2026-08-16T12:30:00+08:00"
+            assert by_email["old@icloud.com"]["created_at"] == "2026-08-01T02:03:04+00:00"
+            assert "<th>创建时间</th>" in web_ui.UI_HTML
+            assert "formatExportTime(e.created_at)" in web_ui.UI_HTML
+        finally:
+            web_ui.RESULTS_DIR = original_results
+            web_ui._pickup_store = original_pickup
+            web_ui._export_store = original_export
+    print("  PASS test_email_api_uses_saved_and_pickup_creation_times")
+
+
 if __name__ == "__main__":
     tests = [
         ("parse_cookie_header_string", test_parse_cookie_header_string),
@@ -433,6 +475,7 @@ if __name__ == "__main__":
         ("create_alias_stops_retrying_on_address_limit", test_create_alias_stops_retrying_on_address_limit),
         ("async_batch_skips_limited_account_and_continues", test_async_batch_skips_limited_account_and_continues),
         ("async_batch_retries_temporary_limit_after_cooldown", test_async_batch_retries_temporary_limit_after_cooldown),
+        ("email_api_uses_saved_and_pickup_creation_times", test_email_api_uses_saved_and_pickup_creation_times),
     ]
     
     passed = 0

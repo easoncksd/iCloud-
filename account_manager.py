@@ -621,14 +621,16 @@ class AccountManager:
                 result = client.create_alias(label=alias_label, max_retries=3)
                 email = result.get("email", "")
                 if email:
+                    created_at = result.get("created_at") or datetime.now().astimezone().isoformat()
                     results.append({
                         "email": email,
                         "account_id": acc_id,
                         "ok": True,
+                        "created_at": created_at,
                     })
                     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
                     with open(str(LATEST_EMAILS), "a", encoding="utf-8") as f:
-                        f.write(f"{email}\t{acc_id}\n")
+                        f.write(f"{email}\t{acc_id}\t{created_at}\n")
                     account["alias_total"] = account.get("alias_total", 0) + 1
                     account["alias_active"] = account.get("alias_active", 0) + 1
                     account["create_status"] = "available"

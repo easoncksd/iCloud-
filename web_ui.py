@@ -250,7 +250,7 @@ UI_HTML = UI_HTML.replace(
     ".panel-body{padding:0}#aliasTableContainer{overflow-x:auto}",
 ).replace(
     ".email-table{width:100%;",
-    ".email-table{width:100%;min-width:1100px;",
+    ".email-table{width:100%;min-width:1250px;",
 ).replace(
     'id="batchCount" value="5" min="1" max="20"',
     'id="batchCount" value="5" min="1" max="750"',
@@ -260,6 +260,15 @@ UI_HTML = UI_HTML.replace(
 ).replace(
     "var labels={queued:",
     "var labels={waiting:'暂停 30 分钟',queued:",
+).replace(
+    "<th>标签</th><th>导出状态</th>",
+    "<th>标签</th><th>创建时间</th><th>导出状态</th>",
+).replace(
+    "+'</td><td>'+exportHtml+'</td><td>'+activeHtml",
+    "+'</td><td style=\"font-size:11px;white-space:nowrap\">'+esc(formatExportTime(e.created_at))+'</td><td>'+exportHtml+'</td><td>'+activeHtml",
+).replace(
+    "e.anonymousId=apiData.anonymousId;e.account_name=",
+    "e.anonymousId=apiData.anonymousId;e.created_at=apiData.createdAt||e.created_at;e.account_name=",
 )
 
 # ----- Flask Routes -----
@@ -888,6 +897,10 @@ def pickup_message(token, msg_id):
 def api_emails():
     limit = request.args.get("limit",0,type=int)
     emails = []
+    pickup_created_at = {
+        item.get("alias_email", "").strip().lower(): item.get("created_at", "")
+        for item in _pickup_store.list_all()
+    }
     f = RESULTS_DIR / "latest_emails.txt"
     if f.exists():
         lines = f.read_text(encoding="utf-8").strip().split("\n")
@@ -896,7 +909,13 @@ def api_emails():
             line = line.strip()
             if line and "@" in line:
                 parts = line.split("\t")
-                emails.append({"email":parts[0],"account_id":parts[1] if len(parts)>1 else "","created_at":""})
+                email = parts[0]
+                created_at = parts[2] if len(parts) > 2 else pickup_created_at.get(email.lower(), "")
+                emails.append({
+                    "email": email,
+                    "account_id": parts[1] if len(parts) > 1 else "",
+                    "created_at": created_at,
+                })
     emails.reverse()
     history = _export_store.status_map(item["email"] for item in emails)
     exported_count = 0
