@@ -8,6 +8,8 @@ iCloud HME — 邮件本地缓存
 """
 
 import json
+import os
+import copy
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -15,6 +17,8 @@ from typing import Dict, List, Optional
 
 HERE = Path(__file__).resolve().parent
 CACHE_FILE = HERE / "results" / "mail_cache.json"
+MAX_INBOX_MESSAGES = 1000
+MAX_ALIAS_MESSAGES = 100
 
 
 class MailCache:
@@ -36,10 +40,13 @@ class MailCache:
 
     def _save(self):
         with self._lock:
-            CACHE_FILE.write_text(
-                json.dumps(self._data, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
+            tmp = CACHE_FILE.with_suffix(CACHE_FILE.suffix + ".tmp")
+            payload = json.dumps(self._data, indent=2, ensure_ascii=False)
+            with open(tmp, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, CACHE_FILE)
 
     def _ensure_account(self, acc_id: str):
         if acc_id not in self._data:
@@ -57,15 +64,22 @@ class MailCache:
     def set_inbox(self, acc_id: str, emails: List[Dict]):
         with self._lock:
             self._ensure_account(acc_id)
-            existing_ids = {e.get("id") for e in self._data[acc_id]["inbox_emails"]}
-            new_emails = [e for e in emails if e.get("id") not in existing_ids]
+            existing_ids = {str(e.get("id")) for e in self._data[acc_id]["inbox_emails"]}
+            new_emails = []
+            for email in emails:
+                msg_id = str(email.get("id"))
+                if msg_id in existing_ids:
+                    continue
+                existing_ids.add(msg_id)
+                new_emails.append(email)
             if new_emails:
                 self._data[acc_id]["inbox_emails"].extend(new_emails)
-                if len(self._data[acc_id]["inbox_emails"]) > 500:
+                if len(self._data[acc_id]["inbox_emails"]) > MAX_INBOX_MESSAGES:
                     self._data[acc_id]["inbox_emails"] = \
-                        self._data[acc_id]["inbox_emails"][-500:]
+                        self._data[acc_id]["inbox_emails"][-MAX_INBOX_MESSAGES:]
             self._data[acc_id]["last_checked"] = datetime.now().isoformat()
-            self._save()
+            if new_emails:
+                self._save()
 
     def get_alias_mail(self, acc_id: str, alias_email: str) -> List[Dict]:
         with self._lock:
@@ -77,32 +91,52 @@ class MailCache:
             self._ensure_account(acc_id)
             if alias_email not in self._data[acc_id]["alias_emails"]:
                 self._data[acc_id]["alias_emails"][alias_email] = []
-            existing_ids = {e.get("id") for e in self._data[acc_id]["alias_emails"][alias_email]}
-            new_emails = [e for e in emails if e.get("id") not in existing_ids]
+            existing_ids = {str(e.get("id")) for e in self._data[acc_id]["alias_emails"][alias_email]}
+            new_emails = []
+            for email in emails:
+                msg_id = str(email.get("id"))
+                if msg_id in existing_ids:
+                    continue
+                existing_ids.add(msg_id)
+                new_emails.append(email)
             if new_emails:
                 self._data[acc_id]["alias_emails"][alias_email].extend(new_emails)
-            self._save()
+                self._data[acc_id]["alias_emails"][alias_email] = \
+                    self._data[acc_id]["alias_emails"][alias_email][-MAX_ALIAS_MESSAGES:]
+                self._save()
 
     def set_alias_mail_batch(self, acc_id: str, by_alias: Dict[str, List[Dict]]):
         with self._lock:
             self._ensure_account(acc_id)
+            changed = False
             for alias, emails in by_alias.items():
                 if alias not in self._data[acc_id]["alias_emails"]:
                     self._data[acc_id]["alias_emails"][alias] = []
-                existing_ids = {e.get("id") for e in self._data[acc_id]["alias_emails"][alias]}
-                new_emails = [e for e in emails if e.get("id") not in existing_ids]
+                existing_ids = {str(e.get("id")) for e in self._data[acc_id]["alias_emails"][alias]}
+                new_emails = []
+                for email in emails:
+                    msg_id = str(email.get("id"))
+                    if msg_id in existing_ids:
+                        continue
+                    existing_ids.add(msg_id)
+                    new_emails.append(email)
                 if new_emails:
                     self._data[acc_id]["alias_emails"][alias].extend(new_emails)
-            self._save()
+                    self._data[acc_id]["alias_emails"][alias] = \
+                        self._data[acc_id]["alias_emails"][alias][-MAX_ALIAS_MESSAGES:]
+                    changed = True
+            if changed:
+                self._save()
 
     def get_all_alias_mail(self, acc_id: str) -> Dict[str, List[Dict]]:
         with self._lock:
             self._ensure_account(acc_id)
-            return dict(self._data[acc_id].get("alias_emails", {}))
+            return copy.deepcopy(self._data[acc_id].get("alias_emails", {}))
 
     def last_checked(self, acc_id: str) -> Optional[str]:
-        self._ensure_account(acc_id)
-        return self._data[acc_id].get("last_checked")
+        with self._lock:
+            self._ensure_account(acc_id)
+            return self._data[acc_id].get("last_checked")
 
     def cache_age_seconds(self, acc_id: str) -> float:
         lc = self.last_checked(acc_id)
@@ -115,26 +149,29 @@ class MailCache:
             return float("inf")
 
     def clear_account(self, acc_id: str):
-        if acc_id in self._data:
-            del self._data[acc_id]
-            self._save()
+        with self._lock:
+            if acc_id in self._data:
+                del self._data[acc_id]
+                self._save()
 
     def clear_all(self):
-        self._data = {}
-        self._save()
+        with self._lock:
+            self._data = {}
+            self._save()
 
     def get_stats(self, acc_id: str) -> Dict:
-        self._ensure_account(acc_id)
-        acc = self._data[acc_id]
-        inbox_count = len(acc.get("inbox_emails", []))
-        alias_count = sum(len(v) for v in acc.get("alias_emails", {}).values())
-        return {
-            "last_checked": acc.get("last_checked"),
-            "cache_age_sec": self.cache_age_seconds(acc_id),
-            "inbox_cached": inbox_count,
-            "alias_cached": alias_count,
-            "alias_count": len(acc.get("alias_emails", {})),
-        }
+        with self._lock:
+            self._ensure_account(acc_id)
+            acc = self._data[acc_id]
+            inbox_count = len(acc.get("inbox_emails", []))
+            alias_count = sum(len(v) for v in acc.get("alias_emails", {}).values())
+            return {
+                "last_checked": acc.get("last_checked"),
+                "cache_age_sec": self.cache_age_seconds(acc_id),
+                "inbox_cached": inbox_count,
+                "alias_cached": alias_count,
+                "alias_count": len(acc.get("alias_emails", {})),
+            }
 
 
 _mail_cache: Optional[MailCache] = None

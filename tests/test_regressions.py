@@ -4,6 +4,7 @@
 import sys
 import json
 import os
+import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent.parent
@@ -67,18 +68,21 @@ def test_derive_icloud_email_appleid_is_icloud():
 
 
 def test_derive_icloud_email_third_party():
-    """appleId 是第三方邮箱时推导"""
+    """第三方 Apple ID 不能被猜成同名前缀的 iCloud 邮箱"""
     from account_manager import AccountManager
     info = {"appleId": "test@gmail.com", "primaryEmail": ""}
     result = AccountManager._derive_icloud_email(info)
-    assert result == "test@icloud.com"
+    assert result == ""
     print("  PASS test_derive_icloud_email_third_party")
 
 
 def test_mail_cache_basic():
     """邮件缓存基本读写"""
-    from mail_cache import MailCache
-    cache = MailCache()
+    import mail_cache
+    old_path = mail_cache.CACHE_FILE
+    temp_dir = tempfile.TemporaryDirectory()
+    mail_cache.CACHE_FILE = Path(temp_dir.name) / "mail_cache.json"
+    cache = mail_cache.MailCache()
     
     emails = [
         {"id": "1", "from": "a@b.com", "to": "x@icloud.com", "subject": "Hello", "date": "2025-01-01T00:00:00"},
@@ -95,7 +99,68 @@ def test_mail_cache_basic():
     # 清理
     cache.clear_account("test_acc")
     assert len(cache.get_inbox("test_acc")) == 0
+    mail_cache.CACHE_FILE = old_path
+    temp_dir.cleanup()
     print("  PASS test_mail_cache_basic")
+
+
+def test_pickup_rebind_deduplicates_and_revokes():
+    """旧账号迁移不得留下无法撤销的重复 token"""
+    from pickup_links import PickupLinkStore
+    with tempfile.TemporaryDirectory() as directory:
+        store = PickupLinkStore(Path(directory) / "pickup_links.json")
+        old = store.ensure("old", "same@icloud.com")
+        current = store.ensure("current", "same@icloud.com")
+        store.rebind_stale_accounts(["current"])
+        assert len(store.list_for_account("current")) == 1
+        assert store.revoke("current", "same@icloud.com")
+        assert store.get_by_token(old["token"]) is None
+        assert store.get_by_token(current["token"]) is None
+    print("  PASS test_pickup_rebind_deduplicates_and_revokes")
+
+
+def test_account_api_reports_validation_failure():
+    """账号底层状态为 error 时 API 不能返回 ok=true"""
+    import web_ui
+    client = web_ui.app.test_client()
+
+    class FakeManager:
+        def add_account(self, *_args, **_kwargs):
+            return {"id": "x", "name": "bad", "status": "error", "last_error": "expired"}
+
+        def validate_account(self, *_args, **_kwargs):
+            return {"id": "x", "status": "error", "last_error": "expired"}
+
+    original = web_ui._account_mgr
+    web_ui._account_mgr = FakeManager()
+    try:
+        added = client.post("/api/accounts/add", json={"name": "bad", "cookie_input": "a=b"})
+        validated = client.post("/api/accounts/x/validate")
+        assert added.status_code == 400 and added.get_json()["ok"] is False
+        assert validated.status_code == 400 and validated.get_json()["ok"] is False
+    finally:
+        web_ui._account_mgr = original
+    print("  PASS test_account_api_reports_validation_failure")
+
+
+def test_scheduler_start_is_idempotent():
+    """重复启动只能保留一个调度线程，停止不得触发全局关机事件"""
+    import web_ui
+    client = web_ui.app.test_client()
+    first_result = client.post("/api/scheduler/start").get_json()
+    first_thread = web_ui._scheduler_thread
+    second_result = client.post("/api/scheduler/start").get_json()
+    second_thread = web_ui._scheduler_thread
+    try:
+        assert first_result["already_running"] is False
+        assert second_result["already_running"] is True
+        assert first_thread is second_thread and first_thread.is_alive()
+    finally:
+        client.post("/api/scheduler/stop")
+        first_thread.join(timeout=2)
+    assert not first_thread.is_alive()
+    assert not web_ui._shutdown_event.is_set()
+    print("  PASS test_scheduler_start_is_idempotent")
 
 
 def test_strip_html():
@@ -141,6 +206,9 @@ if __name__ == "__main__":
         ("derive_icloud_email_appleid_is_icloud", test_derive_icloud_email_appleid_is_icloud),
         ("derive_icloud_email_third_party", test_derive_icloud_email_third_party),
         ("mail_cache_basic", test_mail_cache_basic),
+        ("pickup_rebind_deduplicates_and_revokes", test_pickup_rebind_deduplicates_and_revokes),
+        ("account_api_reports_validation_failure", test_account_api_reports_validation_failure),
+        ("scheduler_start_is_idempotent", test_scheduler_start_is_idempotent),
         ("strip_html", test_strip_html),
         ("strip_html_with_link", test_strip_html_with_link),
         ("icloud_hme_account_info", test_icloud_hme_account_info),

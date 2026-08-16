@@ -20,6 +20,7 @@ iCloud HME — 多账号管理器
 """
 
 import json
+import os
 import time
 import uuid
 import threading
@@ -65,13 +66,16 @@ class AccountManager:
 
     def _save(self):
         with self._lock:
-            ACCOUNTS_FILE.write_text(
-                json.dumps({
+            payload = json.dumps({
                     "accounts": self.accounts,
                     "updated_at": datetime.now().isoformat(),
-                }, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
+                }, indent=2, ensure_ascii=False)
+            tmp = ACCOUNTS_FILE.with_suffix(ACCOUNTS_FILE.suffix + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, ACCOUNTS_FILE)
 
     def _migrate_old_cookies(self):
         try:
@@ -185,17 +189,19 @@ class AccountManager:
             account["status"] = "error"
             account["last_error"] = str(e)[:300]
 
-        self.accounts[acc_id] = account
-        self._save()
+        with self._lock:
+            self.accounts[acc_id] = account
+            self._save()
         return account
 
     def remove_account(self, acc_id: str) -> bool:
-        if acc_id in self.accounts:
-            self._drop_mail_client(acc_id)
-            del self.accounts[acc_id]
-            self._save()
-            return True
-        return False
+        self._drop_mail_client(acc_id)
+        with self._lock:
+            if acc_id in self.accounts:
+                del self.accounts[acc_id]
+                self._save()
+                return True
+            return False
 
     def get_account(self, acc_id: str) -> Optional[Dict]:
         return self.accounts.get(acc_id)
@@ -225,11 +231,9 @@ class AccountManager:
         if apple_id and ("@icloud.com" in apple_id or "@me.com" in apple_id or "@mac.com" in apple_id):
             return apple_id
 
-        if apple_id and "@" in apple_id:
-            local = apple_id.split("@")[0]
-            return f"{local}@icloud.com"
-
-        return primary or apple_id
+        # A third-party Apple ID does not imply a matching @icloud.com address.
+        # Guessing here produces valid-looking credentials that can never log in.
+        return ""
 
     def validate_account(self, acc_id: str) -> Dict:
         from icloud_hme import ICloudHME
@@ -362,6 +366,8 @@ class AccountManager:
             new_msgs = mail.check_inbox(limit=50, days=days)
             mail.disconnect()
         except Exception:
+            if force or not cached:
+                raise
             new_msgs = []
 
         if new_msgs:
@@ -383,6 +389,8 @@ class AccountManager:
             new_msgs = mail.find_by_recipient(alias_email, limit=20, days=days)
             mail.disconnect()
         except Exception:
+            if force or not cached:
+                raise
             new_msgs = []
 
         if new_msgs:
@@ -423,14 +431,12 @@ class AccountManager:
 
         results: Dict[str, List[Dict]] = {}
         for msg in all_inbox:
-            to_field = msg.get("to", "").lower()
-            for alias in alias_set:
-                if alias and alias in to_field:
-                    if alias not in results:
-                        results[alias] = []
-                    if len(results[alias]) < limit_per:
-                        results[alias].append(msg)
-                    break
+            alias = self._match_alias(msg, alias_set)
+            if alias:
+                if alias not in results:
+                    results[alias] = []
+                if len(results[alias]) < limit_per:
+                    results[alias].append(msg)
 
         if results:
             self._cache.set_alias_mail_batch(acc_id, results)
@@ -445,11 +451,8 @@ class AccountManager:
             return {"messages": {}, "bodies": {}}
 
         cached_by_alias = self._cache.get_all_alias_mail(acc_id)
-        known_ids = {
-            str(msg.get("id", ""))
-            for msg in self._cache.get_inbox(acc_id)
-            if msg.get("id") is not None
-        }
+        inbox_messages = self._cache.get_inbox(acc_id)
+        known_ids = set()
         for messages in cached_by_alias.values():
             known_ids.update(
                 str(msg.get("id", ""))
@@ -457,10 +460,28 @@ class AccountManager:
                 if msg.get("id") is not None
             )
 
+        # A message may have reached the general inbox cache before a pickup
+        # link was created. Map cached headers first so it is not skipped forever.
+        recovered_by_alias: Dict[str, List[Dict]] = {}
+        for header in inbox_messages:
+            msg_id = str(header.get("id", ""))
+            matched = self._match_alias(header, aliases)
+            if matched and msg_id not in known_ids:
+                recovered_by_alias.setdefault(matched, []).append(header)
+                known_ids.add(msg_id)
+        known_ids.update(
+            str(message.get("id", ""))
+            for message in inbox_messages
+            if message.get("id") is not None
+        )
+
         with self._mail_sync_lock(acc_id):
             for attempt in range(2):
                 new_headers: List[Dict] = []
-                by_alias: Dict[str, List[Dict]] = {}
+                by_alias: Dict[str, List[Dict]] = {
+                    alias: list(messages)
+                    for alias, messages in recovered_by_alias.items()
+                }
                 bodies: Dict[str, Dict] = {}
                 with self._lock:
                     mail = self._mail_clients.get(acc_id)
@@ -477,8 +498,7 @@ class AccountManager:
                         if not header:
                             continue
                         new_headers.append(header)
-                        to_field = header.get("to", "").lower()
-                        matched = next((alias for alias in aliases if alias in to_field), None)
+                        matched = self._match_alias(header, aliases)
                         if not matched:
                             continue
                         by_alias.setdefault(matched, []).append(header)
@@ -506,6 +526,22 @@ class AccountManager:
         if by_alias:
             self._cache.set_alias_mail_batch(acc_id, by_alias)
         return {"messages": by_alias, "bodies": bodies}
+
+    @staticmethod
+    def _match_alias(header: Dict, aliases) -> Optional[str]:
+        recipients = {
+            str(value).strip().lower()
+            for value in header.get("recipients", [])
+            if value
+        }
+        if not recipients:
+            from email.utils import getaddresses
+            recipients = {
+                address.strip().lower()
+                for _, address in getaddresses([header.get("to", "")])
+                if address
+            }
+        return next((alias for alias in aliases if alias in recipients), None)
 
     def fetch_pickup_message(self, acc_id: str, msg_id: str) -> Dict:
         """Fetch one full message through the account's persistent IMAP session."""

@@ -6,6 +6,7 @@
 - 🔗 **账号-别名映射** — 自动提取真实 Apple ID，每个隐私邮箱标注归属账号
 - ⏱ **定时调度** — 整点自动触发，多账号轮询创建，触达上限自动切下一个
 - 🌐 **Web UI** — 暖色面板，仪表盘 + 账号列表 + 别名管理 + 跨账号批量创建
+- 📬 **独立取件链接** — 每个隐私邮箱使用不可猜测 token，自动刷新最新邮件
 
 ## 前提条件
 
@@ -123,6 +124,20 @@ requests>=2.25          # HTTP
 pycryptodome>=3.15     # Chrome cookie 解密 (Windows)
 pywin32>=305           # Windows DPAPI (仅 Windows)
 flask>=3.0             # Web UI
+```
+
+## 生产部署说明
+
+- 管理面板通过 `ADMIN_ACCESS_TOKEN` 建立 30 天安全 Cookie；取件链接本身是 bearer credential，请勿公开传播。
+- `deploy/` 包含当前 Nginx 限流、脱敏日志和 systemd 资源边界配置。
+- 取件 token 不会写入 Nginx 日志；邮件中的外部图片默认不加载，避免追踪访问设备 IP。
+- 取件查询使用 O(1) token 索引，同一主账号最多每 4 秒进行一次真实 IMAP 同步。
+
+## 测试
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest -q
 ```
 
 ## License

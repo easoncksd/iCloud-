@@ -23,7 +23,7 @@ import email
 import time
 from datetime import datetime, timedelta
 from email.header import decode_header
-from email.utils import parsedate_to_datetime
+from email.utils import parsedate_to_datetime, getaddresses
 from typing import Optional, Dict, List
 
 IMAP_SERVER = "imap.mail.me.com"
@@ -164,10 +164,17 @@ class ICloudMail:
             msg = email.message_from_bytes(raw + b"\r\n\r\n")
         except Exception:
             return None
+        recipient_headers = [
+            msg.get(name, "")
+            for name in ("To", "Cc", "Delivered-To", "X-Original-To", "Envelope-To", "X-Envelope-To")
+            if msg.get(name)
+        ]
+        recipients = [address.lower() for _, address in getaddresses(recipient_headers) if address]
         return {
             "id": msg_id.decode() if isinstance(msg_id, bytes) else str(msg_id),
             "from": self._decode_header(msg.get("From", "")),
             "to": self._decode_header(msg.get("To", "")),
+            "recipients": recipients,
             "subject": self._decode_header(msg.get("Subject", "")),
             "date": self._safe_date(msg.get("Date", "")),
             "body_preview": "",
@@ -304,6 +311,8 @@ class ICloudMail:
             return {"ok": True, "email": self.apple_id, "inbox_count": msg_count}
         except Exception as e:
             return {"ok": False, "error": str(e)[:200]}
+        finally:
+            self.disconnect()
 
     @staticmethod
     def _safe_date(date_str: str) -> str:
