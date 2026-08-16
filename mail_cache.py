@@ -21,7 +21,8 @@ class MailCache:
     """邮件本地缓存"""
 
     def __init__(self):
-        self._lock = threading.Lock()
+        # Setters persist while holding this lock, so _save() must be re-entrant.
+        self._lock = threading.RLock()
         self._data: Dict = {}
         self._load()
 

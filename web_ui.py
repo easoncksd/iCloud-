@@ -33,6 +33,8 @@ PICKUP_BASE_URL = os.environ.get("PICKUP_BASE_URL", "").rstrip("/")
 _pickup_refresh_lock = threading.Lock()
 _pickup_refreshing = set()
 _pickup_last_refresh = {}
+_pickup_refreshing_accounts = set()
+_pickup_last_account_refresh = {}
 _pickup_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="pickup")
 _pickup_pending = 0
 _PICKUP_MAX_PENDING = 32
@@ -383,14 +385,15 @@ def pickup_page(token):
     html = html.replace("__ALIAS__", alias_html).replace("__TOKEN__", token_js)
     return Response(html, mimetype="text/html", headers={"Cache-Control": "no-store"})
 
-def _refresh_pickup_mail(token, item):
+def _refresh_pickup_account(account_id):
     global _pickup_pending
     try:
-        _account_mgr.check_alias_mail(item["account_id"], item["alias_email"], limit=20, days=30, force=True)
+        # One IMAP sync per iCloud account, then serve all aliases from cache.
+        _account_mgr.check_all_aliases_mail(account_id, limit_per=20, days=30, force=True)
     finally:
         with _pickup_refresh_lock:
-            _pickup_last_refresh[token] = time.time()
-            _pickup_refreshing.discard(token)
+            _pickup_last_account_refresh[account_id] = time.time()
+            _pickup_refreshing_accounts.discard(account_id)
             _pickup_pending = max(0, _pickup_pending - 1)
 
 @app.route("/pickup/<token>/messages")
@@ -401,13 +404,14 @@ def pickup_messages(token):
         return jsonify({"error": "取件链接无效或已撤销"}), 404
     cached = _account_mgr._cache.get_alias_mail(item["account_id"], item["alias_email"])[-20:]
     now = time.time()
+    account_id = item["account_id"]
     with _pickup_refresh_lock:
-        refreshing = token in _pickup_refreshing
-        if not refreshing and now - _pickup_last_refresh.get(token, 0) >= 12 and _pickup_pending < _PICKUP_MAX_PENDING:
-            _pickup_refreshing.add(token)
+        refreshing = account_id in _pickup_refreshing_accounts
+        if not refreshing and now - _pickup_last_account_refresh.get(account_id, 0) >= 12 and _pickup_pending < _PICKUP_MAX_PENDING:
+            _pickup_refreshing_accounts.add(account_id)
             _pickup_pending += 1
             refreshing = True
-            _pickup_executor.submit(_refresh_pickup_mail, token, item)
+            _pickup_executor.submit(_refresh_pickup_account, account_id)
     return jsonify({"emails": cached, "count": len(cached), "refreshing": refreshing}), 200, {"Cache-Control": "no-store"}
 
 @app.route("/api/emails")
