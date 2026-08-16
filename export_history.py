@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""Persistent export state for Hide My Email aliases."""
+import json
+import os
+import threading
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+class ExportHistoryStore:
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        self._records = self._load()
+
+    @staticmethod
+    def _key(email):
+        return str(email or "").strip().lower()
+
+    def _load(self):
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return {}
+            return {
+                self._key(email): dict(record)
+                for email, record in data.items()
+                if self._key(email) and isinstance(record, dict)
+            }
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _save(self):
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        payload = json.dumps(self._records, ensure_ascii=False, indent=2)
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, self.path)
+
+    def get(self, email):
+        with self._lock:
+            record = self._records.get(self._key(email))
+            return dict(record) if record else None
+
+    def status_map(self, emails=None):
+        with self._lock:
+            if emails is None:
+                return {email: dict(record) for email, record in self._records.items()}
+            return {
+                key: dict(self._records[key])
+                for key in (self._key(email) for email in emails)
+                if key in self._records
+            }
+
+    def claim(self, items):
+        """Atomically mark new aliases exported and return (claimed, skipped)."""
+        claimed = []
+        skipped = []
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            seen = set()
+            for raw in items:
+                email = self._key(raw.get("email"))
+                if not email or email in seen:
+                    continue
+                seen.add(email)
+                if email in self._records:
+                    skipped.append(email)
+                    continue
+                record = {
+                    "email": email,
+                    "account_id": str(raw.get("account_id") or ""),
+                    "exported_at": now,
+                    "export_count": 1,
+                }
+                self._records[email] = record
+                claimed.append(dict(record))
+            if claimed:
+                self._save()
+        return claimed, skipped
+
+    def restore(self, emails):
+        restored = []
+        with self._lock:
+            for email in emails:
+                key = self._key(email)
+                if key and key in self._records:
+                    del self._records[key]
+                    restored.append(key)
+            if restored:
+                self._save()
+        return restored

@@ -119,6 +119,34 @@ def test_pickup_rebind_deduplicates_and_revokes():
     print("  PASS test_pickup_rebind_deduplicates_and_revokes")
 
 
+def test_export_history_is_persistent_and_idempotent():
+    """导出状态必须持久化，并且同一邮箱不得重复领取"""
+    from export_history import ExportHistoryStore
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "export_history.json"
+        store = ExportHistoryStore(path)
+        claimed, skipped = store.claim([
+            {"email": "Alias@icloud.com", "account_id": "a1"},
+            {"email": "alias@icloud.com", "account_id": "a1"},
+        ])
+        assert len(claimed) == 1 and skipped == []
+
+        reloaded = ExportHistoryStore(path)
+        claimed, skipped = reloaded.claim([
+            {"email": "ALIAS@icloud.com", "account_id": "a2"},
+        ])
+        assert claimed == [] and skipped == ["alias@icloud.com"]
+        assert reloaded.get("alias@icloud.com")["account_id"] == "a1"
+
+        assert reloaded.restore(["alias@icloud.com"]) == ["alias@icloud.com"]
+        claimed, skipped = reloaded.claim([
+            {"email": "alias@icloud.com", "account_id": "a2"},
+        ])
+        assert len(claimed) == 1 and skipped == []
+        assert claimed[0]["account_id"] == "a2"
+    print("  PASS test_export_history_is_persistent_and_idempotent")
+
+
 def test_account_api_reports_validation_failure():
     """账号底层状态为 error 时 API 不能返回 ok=true"""
     import web_ui
@@ -141,6 +169,51 @@ def test_account_api_reports_validation_failure():
     finally:
         web_ui._account_mgr = original
     print("  PASS test_account_api_reports_validation_failure")
+
+
+def test_export_api_prevents_duplicate_downloads():
+    """导出接口必须原子防重，恢复后才能再次导出"""
+    import web_ui
+    from export_history import ExportHistoryStore
+
+    assert "refreshEmails().then(renderAliasTable)" in web_ui.UI_HTML
+    assert "#aliasTableContainer{overflow-x:auto}" in web_ui.UI_HTML
+
+    class FakePickupStore:
+        def list_all(self):
+            return [{
+                "alias_email": "one@icloud.com",
+                "account_id": "a1",
+                "token": "opaque-token",
+            }]
+
+    original_pickup = web_ui._pickup_store
+    original_export = web_ui._export_store
+    original_base = web_ui.PICKUP_BASE_URL
+    with tempfile.TemporaryDirectory() as directory:
+        web_ui._pickup_store = FakePickupStore()
+        web_ui._export_store = ExportHistoryStore(Path(directory) / "exports.json")
+        web_ui.PICKUP_BASE_URL = "https://mail.example.test"
+        client = web_ui.app.test_client()
+        try:
+            first = client.post("/api/pickup-links/export", json={"emails": ["one@icloud.com"]}).get_json()
+            second = client.post("/api/pickup-links/export", json={"emails": ["ONE@icloud.com"]}).get_json()
+            assert first["ok"] and first["count"] == 1
+            assert first["lines"] == ["one@icloud.com----https://mail.example.test/pickup/opaque-token"]
+            assert second["ok"] and second["count"] == 0
+            assert second["skipped"] == ["one@icloud.com"]
+
+            restored = client.post(
+                "/api/export-history/restore", json={"emails": ["one@icloud.com"]}
+            ).get_json()
+            third = client.post("/api/pickup-links/export", json={"emails": ["one@icloud.com"]}).get_json()
+            assert restored["ok"] and restored["count"] == 1
+            assert third["ok"] and third["count"] == 1
+        finally:
+            web_ui._pickup_store = original_pickup
+            web_ui._export_store = original_export
+            web_ui.PICKUP_BASE_URL = original_base
+    print("  PASS test_export_api_prevents_duplicate_downloads")
 
 
 def test_scheduler_start_is_idempotent():
@@ -207,7 +280,9 @@ if __name__ == "__main__":
         ("derive_icloud_email_third_party", test_derive_icloud_email_third_party),
         ("mail_cache_basic", test_mail_cache_basic),
         ("pickup_rebind_deduplicates_and_revokes", test_pickup_rebind_deduplicates_and_revokes),
+        ("export_history_is_persistent_and_idempotent", test_export_history_is_persistent_and_idempotent),
         ("account_api_reports_validation_failure", test_account_api_reports_validation_failure),
+        ("export_api_prevents_duplicate_downloads", test_export_api_prevents_duplicate_downloads),
         ("scheduler_start_is_idempotent", test_scheduler_start_is_idempotent),
         ("strip_html", test_strip_html),
         ("strip_html_with_link", test_strip_html_with_link),

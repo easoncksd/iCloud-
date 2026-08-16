@@ -16,7 +16,7 @@ fi
 
 cd "$SOURCE_DIR"
 /root/iCloud/.venv/bin/python -m py_compile \
-    account_manager.py icloud_hme.py icloud_mail.py mail_cache.py \
+    account_manager.py export_history.py icloud_hme.py icloud_mail.py mail_cache.py \
     pickup_links.py scheduler.py web_ui.py
 mkdir -p results
 /root/iCloud/.venv/bin/python tests/test_regressions.py
@@ -45,7 +45,7 @@ rollback() {
 trap rollback ERR
 
 for file in README.md requirements.txt requirements-dev.txt \
-    account_manager.py icloud_hme.py icloud_mail.py mail_cache.py \
+    account_manager.py export_history.py icloud_hme.py icloud_mail.py mail_cache.py \
     pickup_links.py scheduler.py web_ui.py; do
     install -m 644 "$file" "$PROJECT_DIR/$file"
 done
