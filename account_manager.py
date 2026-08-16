@@ -54,6 +54,17 @@ class AccountManager:
         "创建过多",
         "操作频繁",
     )
+    _CREATE_TEMPORARY_LIMIT_MARKERS = (
+        "right now",
+        "try again later",
+        "rate limit",
+        "too many requests",
+        "429",
+        "temporarily",
+        "throttle",
+        "操作频繁",
+        "稍后再试",
+    )
 
     def __init__(self):
         self.accounts: Dict[str, Dict] = {}
@@ -633,17 +644,23 @@ class AccountManager:
             except Exception as e:
                 err_str = str(e)
                 lower = err_str.lower()
-                limited = any(marker in lower for marker in self._CREATE_LIMIT_MARKERS)
+                retryable = any(
+                    marker in lower for marker in self._CREATE_TEMPORARY_LIMIT_MARKERS
+                )
+                limited = retryable or any(
+                    marker in lower for marker in self._CREATE_LIMIT_MARKERS
+                )
                 results.append({
                     "email": None,
                     "account_id": acc_id,
                     "ok": False,
                     "error": err_str[:200],
                     "limited": limited,
+                    "retryable": retryable,
                 })
                 account["create_last_error"] = err_str[:300]
                 if limited:
-                    account["create_status"] = "limited"
+                    account["create_status"] = "cooldown" if retryable else "limited"
                     account["create_limited_at"] = datetime.now().isoformat()
                     break
 

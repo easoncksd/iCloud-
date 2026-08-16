@@ -98,6 +98,24 @@ _batch_lock = threading.RLock()
 _batch_jobs = OrderedDict()
 _batch_active_id = None
 _BATCH_JOB_HISTORY = 20
+_BATCH_RETRY_DELAY_SECONDS = max(
+    1.0, float(os.environ.get("BATCH_RETRY_DELAY_SECONDS", "1800"))
+)
+
+_TEMPORARY_CREATE_LIMIT_MARKERS = (
+    "right now",
+    "try again later",
+    "rate limit",
+    "too many requests",
+    "429",
+    "temporarily",
+    "throttle",
+)
+
+
+def _is_temporary_create_limit(error):
+    lower = str(error or "").lower()
+    return any(marker in lower for marker in _TEMPORARY_CREATE_LIMIT_MARKERS)
 
 _RATE_LIMIT_KW = ["limit","exceeded","maximum","quota","429","too many","try again","unavailable","上限","超过","过多","频繁","rate limit","throttle","blocked"]
 
@@ -239,6 +257,9 @@ UI_HTML = UI_HTML.replace(
 ).replace(
     "Math.min(parseInt(E('batchCount').value)||5,20)",
     "Math.min(parseInt(E('batchCount').value)||5,750)",
+).replace(
+    "var labels={queued:",
+    "var labels={waiting:'暂停 30 分钟',queued:",
 )
 
 # ----- Flask Routes -----
@@ -326,6 +347,52 @@ def _batch_job_snapshot(job_id):
         return json.loads(json.dumps(job, ensure_ascii=False)) if job else None
 
 
+def _create_account_with_cooldown(job, acc_id, count, label, name):
+    """Create the remaining aliases, pausing after Apple's temporary throttle."""
+    successful = []
+    while len(successful) < count:
+        remaining = count - len(successful)
+        results = _account_mgr.create_aliases_for_account(acc_id, remaining, label)
+        successful.extend(result for result in results if result.get("ok"))
+        errors = [result for result in results if not result.get("ok")]
+        if not errors:
+            if len(successful) >= count:
+                return successful
+            return successful + [{
+                "ok": False,
+                "limited": False,
+                "error": "创建接口未返回完整结果",
+            }]
+
+        first_error = str(errors[0].get("error") or "")
+        retryable = any(result.get("retryable") for result in errors)
+        if not retryable and not _is_temporary_create_limit(first_error):
+            return successful + errors
+
+        retry_at = datetime.now(_BJ_TZ) + timedelta(seconds=_BATCH_RETRY_DELAY_SECONDS)
+        retry_at_text = retry_at.strftime("%Y-%m-%d %H:%M:%S")
+        with _batch_lock:
+            entry = job["accounts"][acc_id]
+            entry["status"] = "waiting"
+            entry["created"] = len(successful)
+            entry["retry_count"] = entry.get("retry_count", 0) + 1
+            entry["retry_at"] = retry_at.isoformat()
+            entry["error"] = f"Apple 临时限制，{retry_at_text} 自动继续"
+            job["updated_at"] = datetime.now(_BJ_TZ).isoformat()
+        _emit_log("warn", f"[{name}] Apple 临时限制，暂停 30 分钟后继续剩余 {remaining} 个")
+
+        if _shutdown_event.wait(_BATCH_RETRY_DELAY_SECONDS):
+            return successful + errors
+        with _batch_lock:
+            entry = job["accounts"][acc_id]
+            entry["status"] = "running"
+            entry["retry_at"] = None
+            entry["error"] = ""
+            job["updated_at"] = datetime.now(_BJ_TZ).isoformat()
+
+    return successful
+
+
 def _run_batch_job(job_id):
     global _batch_active_id
     with _batch_lock:
@@ -354,7 +421,9 @@ def _run_batch_job(job_id):
             elif account.get("status") != "active":
                 results = [{"ok": False, "error": "账号不可用", "limited": False}]
             else:
-                results = _account_mgr.create_aliases_for_account(acc_id, count, label)
+                results = _create_account_with_cooldown(
+                    job, acc_id, count, label, name
+                )
 
             created = sum(1 for result in results if result.get("ok"))
             errors = [result for result in results if not result.get("ok")]
@@ -375,6 +444,7 @@ def _run_batch_job(job_id):
                     "errors": len(errors),
                     "limited": limited,
                     "error": first_error,
+                    "retry_at": None,
                     "finished_at": datetime.now(_BJ_TZ).isoformat(),
                 })
                 job["completed_accounts"] = index + 1
@@ -463,6 +533,8 @@ def api_create_batch():
                     "errors": 0,
                     "limited": False,
                     "error": "",
+                    "retry_count": 0,
+                    "retry_at": None,
                 }
                 for acc_id in account_ids
             },

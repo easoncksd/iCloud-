@@ -350,6 +350,69 @@ def test_async_batch_skips_limited_account_and_continues():
     print("  PASS test_async_batch_skips_limited_account_and_continues")
 
 
+def test_async_batch_retries_temporary_limit_after_cooldown():
+    """临时频率限制应等待后继续创建剩余数量。"""
+    import web_ui
+
+    class FakeManager:
+        calls = 0
+
+        def get_account(self, _account_id):
+            return {"id": "temporary", "name": "temporary", "status": "active"}
+
+        def create_aliases_for_account(self, account_id, count, _label):
+            self.calls += 1
+            if self.calls == 1:
+                return [{
+                    "ok": False,
+                    "limited": True,
+                    "error": "You have reached the limit of addresses you can create right now.",
+                }]
+            return [
+                {"ok": True, "email": f"ok-{index}@icloud.com", "account_id": account_id}
+                for index in range(count)
+            ]
+
+    original_manager = web_ui._account_mgr
+    original_delay = web_ui._BATCH_RETRY_DELAY_SECONDS
+    with web_ui._batch_lock:
+        original_jobs = web_ui._batch_jobs
+        original_active = web_ui._batch_active_id
+        web_ui._batch_jobs = web_ui.OrderedDict()
+        web_ui._batch_active_id = None
+    web_ui._account_mgr = FakeManager()
+    web_ui._BATCH_RETRY_DELAY_SECONDS = 0.01
+    client = web_ui.app.test_client()
+    try:
+        started = client.post("/api/create-batch", json={
+            "account_ids": ["temporary"],
+            "count_per_account": 2,
+            "interval": 0,
+        })
+        assert started.status_code == 202
+        job_id = started.get_json()["job_id"]
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            job = client.get(f"/api/create-batch/{job_id}").get_json()["job"]
+            if job["status"] not in ("queued", "running"):
+                break
+            time.sleep(0.01)
+        assert job["status"] == "completed"
+        assert job["total_created"] == 2
+        assert job["total_errors"] == 0
+        assert job["accounts"]["temporary"]["retry_count"] == 1
+        assert job["accounts"]["temporary"]["status"] == "completed"
+        assert web_ui._account_mgr.calls == 2
+        assert "暂停 30 分钟" in web_ui.UI_HTML
+    finally:
+        web_ui._account_mgr = original_manager
+        web_ui._BATCH_RETRY_DELAY_SECONDS = original_delay
+        with web_ui._batch_lock:
+            web_ui._batch_jobs = original_jobs
+            web_ui._batch_active_id = original_active
+    print("  PASS test_async_batch_retries_temporary_limit_after_cooldown")
+
+
 if __name__ == "__main__":
     tests = [
         ("parse_cookie_header_string", test_parse_cookie_header_string),
@@ -369,6 +432,7 @@ if __name__ == "__main__":
         ("icloud_hme_account_info", test_icloud_hme_account_info),
         ("create_alias_stops_retrying_on_address_limit", test_create_alias_stops_retrying_on_address_limit),
         ("async_batch_skips_limited_account_and_continues", test_async_batch_skips_limited_account_and_continues),
+        ("async_batch_retries_temporary_limit_after_cooldown", test_async_batch_retries_temporary_limit_after_cooldown),
     ]
     
     passed = 0
