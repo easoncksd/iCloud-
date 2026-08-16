@@ -119,7 +119,7 @@ _batch_jobs = OrderedDict()
 _batch_active_id = None
 _BATCH_JOB_HISTORY = 20
 _BATCH_RETRY_DELAY_SECONDS = max(
-    1.0, float(os.environ.get("BATCH_RETRY_DELAY_SECONDS", "1800"))
+    1.0, float(os.environ.get("BATCH_RETRY_DELAY_SECONDS", "60"))
 )
 
 _TEMPORARY_CREATE_LIMIT_MARKERS = (
@@ -298,7 +298,7 @@ UI_HTML = UI_HTML.replace(
     "Math.min(parseInt(E('batchCount').value)||5,750)",
 ).replace(
     "var labels={queued:",
-    "var labels={waiting:'暂停 30 分钟',queued:",
+    "var labels={waiting:'暂停 1 分钟',queued:",
 ).replace(
     "<th>标签</th><th>导出状态</th>",
     "<th>标签</th><th>创建时间</th><th>导出状态</th>",
@@ -442,7 +442,7 @@ def _create_account_with_cooldown(job, acc_id, count, label, name):
             entry["retry_at"] = retry_at.isoformat()
             entry["error"] = f"Apple 临时限制，{retry_at_text} 自动继续"
             job["updated_at"] = datetime.now(_BJ_TZ).isoformat()
-        _emit_log("warn", f"[{name}] Apple 临时限制，暂停 30 分钟后继续剩余 {remaining} 个")
+        _emit_log("warn", f"[{name}] Apple 临时限制，暂停 1 分钟后继续剩余 {remaining} 个")
 
         if _shutdown_event.wait(_BATCH_RETRY_DELAY_SECONDS):
             return successful + errors

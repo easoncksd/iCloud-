@@ -403,7 +403,7 @@ def test_async_batch_retries_temporary_limit_after_cooldown():
         assert job["accounts"]["temporary"]["retry_count"] == 1
         assert job["accounts"]["temporary"]["status"] == "completed"
         assert web_ui._account_mgr.calls == 2
-        assert "暂停 30 分钟" in web_ui.UI_HTML
+        assert "暂停 1 分钟" in web_ui.UI_HTML
     finally:
         web_ui._account_mgr = original_manager
         web_ui._BATCH_RETRY_DELAY_SECONDS = original_delay
