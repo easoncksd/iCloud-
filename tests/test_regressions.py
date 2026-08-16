@@ -705,6 +705,90 @@ def test_manual_create_rejects_invalid_counts():
     print("  PASS test_manual_create_rejects_invalid_counts")
 
 
+def test_mail_body_store_persists_and_prunes():
+    from mail_body_store import MailBodyStore
+
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "bodies.sqlite3"
+        store = MailBodyStore(path, max_items=2, max_bytes=1024 * 1024)
+        store.put("acc", "1", {"body": "one"})
+        store.put("acc", "2", {"body": "two"})
+        store.put("acc", "3", {"body": "three"})
+        assert store.get("acc", "1") is None
+        assert store.get("acc", "3")["body"] == "three"
+        assert store.stats()["count"] == 2
+        store.close()
+
+        reopened = MailBodyStore(path, max_items=2, max_bytes=1024 * 1024)
+        assert reopened.get("acc", "2")["body"] == "two"
+        assert reopened.get("acc", "3")["body"] == "three"
+        reopened.close()
+    print("  PASS test_mail_body_store_persists_and_prunes")
+
+
+def test_pickup_uses_persistent_body_and_deduplicates_sync():
+    import web_ui
+
+    class FakePickupStore:
+        def get_by_token(self, token):
+            if token == "valid":
+                return {"account_id": "acc", "alias_email": "alias@icloud.com"}
+            return None
+
+    class FakeCache:
+        def get_alias_mail(self, _account_id, _alias):
+            return [{"id": "7", "subject": "cached"}]
+
+    class FakeManager:
+        _cache = FakeCache()
+
+    class FakeBodyStore:
+        def get(self, account_id, message_id):
+            if account_id == "acc" and message_id == "7":
+                return {"id": "7", "body": "persisted body", "html": ""}
+            return None
+
+    class FakeExecutor:
+        calls = 0
+
+        def submit(self, _fn, _account_id):
+            self.calls += 1
+
+    originals = (
+        web_ui._pickup_store, web_ui._account_mgr, web_ui._pickup_body_store,
+        web_ui._pickup_executor, web_ui._pickup_refreshing_accounts,
+        web_ui._pickup_last_account_refresh, web_ui._pickup_pending,
+    )
+    try:
+        web_ui._pickup_store = FakePickupStore()
+        web_ui._account_mgr = FakeManager()
+        web_ui._pickup_body_store = FakeBodyStore()
+        web_ui._pickup_executor = FakeExecutor()
+        web_ui._pickup_refreshing_accounts = set()
+        web_ui._pickup_last_account_refresh = {}
+        web_ui._pickup_pending = 0
+        client = web_ui.app.test_client()
+
+        first = client.get("/pickup/valid/messages")
+        second = client.get("/pickup/valid/messages")
+        assert first.status_code == 200 and second.status_code == 200
+        assert web_ui._pickup_executor.calls == 1
+
+        body = client.get("/pickup/valid/message/7")
+        assert body.status_code == 200
+        assert body.get_json()["ready"] is True
+        assert body.get_json()["message"]["body"] == "persisted body"
+        page = client.get("/pickup/valid")
+        assert "2500+Math.random()*1500" in page.get_data(as_text=True)
+    finally:
+        (
+            web_ui._pickup_store, web_ui._account_mgr, web_ui._pickup_body_store,
+            web_ui._pickup_executor, web_ui._pickup_refreshing_accounts,
+            web_ui._pickup_last_account_refresh, web_ui._pickup_pending,
+        ) = originals
+    print("  PASS test_pickup_uses_persistent_body_and_deduplicates_sync")
+
+
 if __name__ == "__main__":
     tests = [
         ("parse_cookie_header_string", test_parse_cookie_header_string),
@@ -732,6 +816,8 @@ if __name__ == "__main__":
         ("invalid_imap_credentials_are_not_persisted", test_invalid_imap_credentials_are_not_persisted),
         ("fetch_full_uses_single_imap_fetch", test_fetch_full_uses_single_imap_fetch),
         ("manual_create_rejects_invalid_counts", test_manual_create_rejects_invalid_counts),
+        ("mail_body_store_persists_and_prunes", test_mail_body_store_persists_and_prunes),
+        ("pickup_uses_persistent_body_and_deduplicates_sync", test_pickup_uses_persistent_body_and_deduplicates_sync),
     ]
     
     passed = 0

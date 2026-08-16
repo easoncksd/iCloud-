@@ -15,6 +15,7 @@ from flask import Flask, Response, request, jsonify, render_template_string, red
 from icloud_hme import ICloudHME, extract_chrome_cookies
 from account_manager import AccountManager
 from export_history import ExportHistoryStore
+from mail_body_store import MailBodyStore
 from pickup_links import PickupLinkStore
 
 # ---- config ----
@@ -106,14 +107,23 @@ _pickup_refresh_lock = threading.Lock()
 _pickup_refreshing_accounts = set()
 _pickup_last_account_refresh = {}
 _pickup_refresh_errors = {}
+_pickup_error_log_state = {}
 _pickup_executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix="pickup")
 _pickup_pending = 0
 _PICKUP_MAX_PENDING = 256
+_PICKUP_SYNC_INTERVAL_SECONDS = max(
+    1.0, float(os.environ.get("PICKUP_SYNC_INTERVAL_SECONDS", "2"))
+)
 _PICKUP_BODY_MAX_ITEMS = 1000
 _PICKUP_BODY_MAX_BYTES = 64 * 1024 * 1024
 _pickup_body_cache = OrderedDict()
 _pickup_body_cache_bytes = 0
 _pickup_body_refreshing = set()
+_pickup_body_store = MailBodyStore(
+    RESULTS_DIR / "mail_bodies.sqlite3",
+    max_items=5000,
+    max_bytes=_PICKUP_BODY_MAX_BYTES,
+)
 _batch_lock = threading.RLock()
 _BATCH_STATE_FILE = RESULTS_DIR / "batch_jobs.json"
 _BATCH_JOB_HISTORY = 20
@@ -927,8 +937,29 @@ def pickup_page(token):
 <title>邮件</title><style>*{box-sizing:border-box}html,body{margin:0;min-height:100%;background:#fff;font-family:system-ui,-apple-system,"Microsoft YaHei",sans-serif}#mailbox{min-height:100vh;background:#fff}.mail-frame{display:block;width:100%;min-height:100vh;border:0;background:#fff}.state{display:flex;align-items:center;justify-content:center;min-height:100vh;color:#718594;background:#f5f8fa}.status{position:fixed;right:12px;top:10px;z-index:10;padding:5px 10px;border-radius:3px;background:rgba(16,26,35,.82);color:#fff;font-size:12px;opacity:0;transition:opacity .2s;pointer-events:none}.status.show{opacity:1}</style></head><body>
 <div id='status' class='status'>正在获取最新邮件...</div><main id='mailbox'><div class='state'>正在打开最新邮件...</div></main>
 <script>const token=__TOKEN__;let busy=false;let currentId='';const bodies={};const statusEl=document.getElementById('status');function status(text,hold){statusEl.textContent=text;statusEl.classList.add('show');if(!hold)setTimeout(()=>statusEl.classList.remove('show'),1800)}function showEmail(data){const box=document.getElementById('mailbox');box.innerHTML='';if(data.html){const frame=document.createElement('iframe');frame.className='mail-frame';frame.setAttribute('sandbox','allow-same-origin allow-popups');frame.setAttribute('referrerpolicy','no-referrer');const csp=`<meta name="referrer" content="no-referrer"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data: cid:; style-src 'unsafe-inline'; font-src data:;">`;frame.srcdoc=csp+data.html;frame.onload=function(){try{frame.style.height=Math.max(frame.contentDocument.documentElement.scrollHeight+20,window.innerHeight)+'px'}catch(e){}};box.appendChild(frame)}else{const div=document.createElement('div');div.className='state';div.style.whiteSpace='pre-wrap';div.style.alignItems='flex-start';div.style.justifyContent='flex-start';div.style.padding='32px';div.textContent=data.body||'(无正文内容)';box.appendChild(div)}}async function fetchMessages(force){const r=await fetch('/pickup/'+encodeURIComponent(token)+'/messages'+(force?'?force=1':''),{cache:'no-store'});const d=await r.json();if(!r.ok||d.error)throw new Error(d.error||'读取失败');return d}async function openLatest(m){if(!m||!m.id){document.getElementById('mailbox').innerHTML='<div class="state">暂无邮件。</div>';return}if(currentId===String(m.id)&&bodies[m.id])return;currentId=String(m.id);status('正在打开最新邮件...',true);for(let n=0;n<25;n++){try{const r=await fetch('/pickup/'+encodeURIComponent(token)+'/message/'+encodeURIComponent(m.id),{cache:'no-store'});const d=await r.json();if(r.ok&&d.ready){bodies[m.id]=d.message||{};showEmail(bodies[m.id]);status('最新邮件已打开',false);return}}catch(e){}await new Promise(r=>setTimeout(r,800))}status('邮件打开较慢，稍后自动重试',false)}async function sync(){if(busy)return;busy=true;try{status('正在获取最新邮件...',true);let d=await fetchMessages(true);let list=(d.emails||[]).slice().reverse();if(list.length)await openLatest(list[0]);if(d.refreshing){for(let i=0;i<25;i++){await new Promise(r=>setTimeout(r,800));d=await fetchMessages(false);if(!d.refreshing){list=(d.emails||[]).slice().reverse();await openLatest(list[0]);break}}}if(!list.length)document.getElementById('mailbox').innerHTML='<div class="state">暂无邮件。</div>';status('已是最新邮件',false)}catch(e){status('读取失败，稍后自动重试',false)}finally{busy=false}}sync();(function schedule(){setTimeout(async function(){await sync();schedule()},4000+Math.random()*2000)})();</script></body></html>"""
-    html = html.replace("__ALIAS__", alias_html).replace("__TOKEN__", token_js)
+    html = (
+        html.replace("__ALIAS__", alias_html)
+        .replace("__TOKEN__", token_js)
+        .replace("4000+Math.random()*2000", "2500+Math.random()*1500")
+    )
     return Response(html, mimetype="text/html", headers={"Cache-Control": "no-store"})
+
+def _prepare_pickup_message(message):
+    prepared = dict(message or {})
+    prepared["verification_code"] = _pickup_code(
+        prepared.get("subject", ""), prepared.get("body", "")
+    )
+    prepared["clean_body"] = _clean_pickup_body(prepared.get("body", ""))
+    return prepared
+
+
+def _store_pickup_body(account_id, msg_id, message):
+    prepared = _prepare_pickup_message(message)
+    _pickup_body_store.put(account_id, str(msg_id), prepared)
+    with _pickup_refresh_lock:
+        _cache_pickup_body_locked((account_id, str(msg_id)), prepared)
+    return prepared
+
 
 def _refresh_pickup_account(account_id):
     global _pickup_pending
@@ -938,23 +969,98 @@ def _refresh_pickup_account(account_id):
         links = _pickup_store.list_for_account(account_id)
         aliases = [item.get("alias_email", "") for item in links]
         synced = _account_mgr.sync_pickup_mail(account_id, aliases, scan_limit=100, days=30)
+        for msg_id, message in synced.get("bodies", {}).items():
+            _store_pickup_body(account_id, msg_id, message)
+
+        # Warm the latest body for each alias once. This makes the first page
+        # open fast even after the service has restarted.
+        warm_targets = []
+        for alias in aliases:
+            if len(warm_targets) >= 8:
+                break
+            messages = _account_mgr._cache.get_alias_mail(account_id, alias)
+            if not messages:
+                continue
+            latest = max(
+                messages,
+                key=lambda item: int(str(item.get("id", "0")))
+                if str(item.get("id", "")).isdigit() else 0,
+            )
+            msg_id = str(latest.get("id", ""))
+            if not msg_id or _pickup_body_store.contains(account_id, msg_id):
+                continue
+            key = (account_id, msg_id)
+            with _pickup_refresh_lock:
+                if key in _pickup_body_cache or key in _pickup_body_refreshing:
+                    continue
+                _pickup_body_refreshing.add(key)
+            warm_targets.append((key, latest))
+
+        for key, header in warm_targets:
+            try:
+                full = _account_mgr.fetch_pickup_message(account_id, key[1])
+                if full:
+                    full.update(header)
+                    _store_pickup_body(account_id, key[1], full)
+            except Exception:
+                pass
+            finally:
+                with _pickup_refresh_lock:
+                    _pickup_body_refreshing.discard(key)
+
         with _pickup_refresh_lock:
-            for msg_id, message in synced.get("bodies", {}).items():
-                message["verification_code"] = _pickup_code(
-                    message.get("subject", ""), message.get("body", "")
-                )
-                message["clean_body"] = _clean_pickup_body(message.get("body", ""))
-                _cache_pickup_body_locked((account_id, str(msg_id)), message)
             _pickup_refresh_errors.pop(account_id, None)
+            _pickup_error_log_state.pop(account_id, None)
     except Exception as e:
+        now = time.time()
+        error_text = str(e)[:160]
         with _pickup_refresh_lock:
-            _pickup_refresh_errors[account_id] = str(e)[:160]
-        _emit_log("warn", f"取件同步失败 [{account_id}]: {str(e)[:100]}")
+            _pickup_refresh_errors[account_id] = error_text
+            previous = _pickup_error_log_state.get(account_id)
+            should_log = not previous or previous[0] != error_text or now - previous[1] >= 60
+            if should_log:
+                _pickup_error_log_state[account_id] = (error_text, now)
+        if should_log:
+            _emit_log("warn", f"取件同步失败 [{account_id}]: {error_text[:100]}")
     finally:
         with _pickup_refresh_lock:
-            _pickup_last_account_refresh[account_id] = time.time()
             _pickup_refreshing_accounts.discard(account_id)
             _pickup_pending = max(0, _pickup_pending - 1)
+
+
+def _schedule_pickup_account_refresh(account_id):
+    global _pickup_pending
+    now = time.time()
+    with _pickup_refresh_lock:
+        if account_id in _pickup_refreshing_accounts:
+            return True
+        if now - _pickup_last_account_refresh.get(account_id, 0) < _PICKUP_SYNC_INTERVAL_SECONDS:
+            return False
+        if _pickup_pending >= _PICKUP_MAX_PENDING:
+            return False
+        _pickup_refreshing_accounts.add(account_id)
+        _pickup_last_account_refresh[account_id] = now
+        _pickup_pending += 1
+    try:
+        _pickup_executor.submit(_refresh_pickup_account, account_id)
+        return True
+    except RuntimeError:
+        with _pickup_refresh_lock:
+            _pickup_refreshing_accounts.discard(account_id)
+            _pickup_pending = max(0, _pickup_pending - 1)
+        return False
+
+
+def _pickup_sync_loop():
+    while not _shutdown_event.is_set():
+        account_ids = {
+            item.get("account_id")
+            for item in _pickup_store.list_all()
+            if item.get("account_id")
+        }
+        for account_id in account_ids:
+            _schedule_pickup_account_refresh(account_id)
+        _shutdown_event.wait(min(0.5, _PICKUP_SYNC_INTERVAL_SECONDS / 2))
 
 def _pickup_code(subject, body):
     text = f"{subject}\n{body}"
@@ -1003,10 +1109,10 @@ def _refresh_pickup_body(account_id, msg_id):
     key = (account_id, msg_id)
     try:
         full = _account_mgr.fetch_pickup_message(account_id, msg_id)
-        full["verification_code"] = _pickup_code(full.get("subject", ""), full.get("body", ""))
-        full["clean_body"] = _clean_pickup_body(full.get("body", ""))
+        if not full:
+            raise RuntimeError("邮件正文为空")
+        _store_pickup_body(account_id, msg_id, full)
         with _pickup_refresh_lock:
-            _cache_pickup_body_locked(key, full)
             _pickup_refresh_errors.pop(account_id, None)
     except Exception as e:
         with _pickup_refresh_lock:
@@ -1019,7 +1125,6 @@ def _refresh_pickup_body(account_id, msg_id):
 
 @app.route("/pickup/<token>/messages")
 def pickup_messages(token):
-    global _pickup_pending
     item = _pickup_store.get_by_token(token)
     if not item:
         return jsonify({"error": "取件链接无效或已撤销"}), 404
@@ -1029,19 +1134,14 @@ def pickup_messages(token):
         key=lambda message: int(str(message.get("id", "0")))
         if str(message.get("id", "")).isdigit() else 0,
     )[-20:]
-    now = time.time()
-    force = request.args.get("force", "0") == "1"
     account_id = item["account_id"]
+    _schedule_pickup_account_refresh(account_id)
     with _pickup_refresh_lock:
         refreshing = account_id in _pickup_refreshing_accounts
-        if not refreshing and now - _pickup_last_account_refresh.get(account_id, 0) >= 4 and _pickup_pending < _PICKUP_MAX_PENDING:
-            _pickup_refreshing_accounts.add(account_id)
-            _pickup_pending += 1
-            refreshing = True
-            _pickup_executor.submit(_refresh_pickup_account, account_id)
         refresh_error = _pickup_refresh_errors.get(account_id)
-    public_error = "邮件同步暂时失败" if refresh_error else None
-    return jsonify({"emails": cached, "count": len(cached), "refreshing": refreshing, "error": public_error}), 200, {"Cache-Control": "no-store"}
+    public_error = "邮件同步暂时失败" if refresh_error and not cached else None
+    warning = "邮件同步暂时失败，当前显示缓存内容" if refresh_error and cached else None
+    return jsonify({"emails": cached, "count": len(cached), "refreshing": refreshing, "error": public_error, "warning": warning}), 200, {"Cache-Control": "no-store"}
 
 @app.route("/pickup/<token>/message/<msg_id>")
 def pickup_message(token, msg_id):
@@ -1058,6 +1158,14 @@ def pickup_message(token, msg_id):
         cached_body = _get_pickup_body_locked(key)
         if cached_body is not None:
             return jsonify({"ready": True, "message": cached_body}), 200, {"Cache-Control": "no-store"}
+
+    persisted_body = _pickup_body_store.get(account_id, msg_id)
+    if persisted_body is not None:
+        with _pickup_refresh_lock:
+            _cache_pickup_body_locked(key, persisted_body)
+        return jsonify({"ready": True, "message": persisted_body}), 200, {"Cache-Control": "no-store"}
+
+    with _pickup_refresh_lock:
         refreshing = key in _pickup_body_refreshing
         if not refreshing and _pickup_pending < _PICKUP_MAX_PENDING:
             _pickup_body_refreshing.add(key)
@@ -1178,6 +1286,13 @@ def main():
         for a in accounts: print(f"    [OK] {a.get('name','?')} - {a.get('real_email','?')} ({a.get('alias_total',0)} aliases)")
     else: print("[*] No accounts yet")
     _emit_log("info", f"服务已启动，加载 {len(accounts)} 个主账号")
+    threading.Thread(
+        target=_pickup_sync_loop, daemon=True, name="pickup-sync"
+    ).start()
+    _emit_log(
+        "info",
+        f"取件后台同步已启动，账号级间隔 {_PICKUP_SYNC_INTERVAL_SECONDS:g} 秒",
+    )
     _resume_batch_job_if_needed()
     if args.scheduler:
         global _scheduler_thread
