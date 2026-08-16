@@ -38,6 +38,8 @@ _pickup_last_account_refresh = {}
 _pickup_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="pickup")
 _pickup_pending = 0
 _PICKUP_MAX_PENDING = 32
+_pickup_body_cache = {}
+_pickup_body_refreshing = set()
 
 _RATE_LIMIT_KW = ["limit","exceeded","maximum","quota","429","too many","try again","unavailable","上限","超过","过多","频繁","rate limit","throttle","blocked"]
 
@@ -378,10 +380,10 @@ def pickup_page(token):
     token_js = json.dumps(token)
     alias_html = _html_escape(item["alias_email"])
     html = """<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>最近邮件</title><style>*{box-sizing:border-box}body{margin:0;background:#edf2f5;color:#41586b;font:14px/1.6 system-ui,-apple-system,"Microsoft YaHei",sans-serif}.top{background:#101a23;color:#fff;padding:20px 24px}.wrap{width:min(1010px,calc(100% - 32px));margin:auto}.top h1{font-size:20px;margin:0 0 2px}.alias{color:#91c1dd;font-size:15px;word-break:break-all}.main{padding:18px 0 48px}.hint{margin:0 0 12px;color:#6c8799}.status{float:right}#refresh{margin-left:12px;border:1px solid #9eb1bd;background:#fff;color:#466579;padding:4px 12px;cursor:pointer}#refresh:disabled{opacity:.5;cursor:wait}.mailbox{background:#fff;border:1px dashed #ced9e0;min-height:126px}.empty,.loading,.error{text-align:center;padding:52px 20px;color:#6d8290}.mail{padding:18px 20px;border-bottom:1px solid #e3eaee}.mail:last-child{border-bottom:0}.subject{font-size:16px;font-weight:600;color:#203442;margin-bottom:4px}.meta{font-size:12px;color:#8397a5}.body{margin-top:12px;padding:12px;background:#f5f8fa;color:#344c5c;white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,Consolas,monospace;max-height:360px;overflow:auto}@media(max-width:600px){.top{padding:16px 0}.main{padding-top:14px}.wrap{width:calc(100% - 24px)}.mail{padding:15px}}</style></head><body>
+<title>最近邮件</title><style>*{box-sizing:border-box}body{margin:0;background:#edf2f5;color:#41586b;font:14px/1.6 system-ui,-apple-system,"Microsoft YaHei",sans-serif}.top{background:#101a23;color:#fff;padding:20px 24px}.wrap{width:min(1010px,calc(100% - 32px));margin:auto}.top h1{font-size:20px;margin:0 0 2px}.alias{color:#91c1dd;font-size:15px;word-break:break-all}.main{padding:18px 0 48px}.hint{margin:0 0 12px;color:#6c8799}.status{float:right}.mailbox{background:#fff;border:1px dashed #ced9e0;min-height:126px}.empty,.loading,.error{text-align:center;padding:52px 20px;color:#6d8290}.mail{padding:18px 20px;border-bottom:1px solid #e3eaee;cursor:pointer}.mail:last-child{border-bottom:0}.subject{font-size:16px;font-weight:600;color:#203442;margin-bottom:4px}.meta{font-size:12px;color:#8397a5}.body{margin-top:12px;padding:12px;background:#f5f8fa;color:#344c5c;white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,Consolas,monospace;max-height:360px;overflow:auto}@media(max-width:600px){.top{padding:16px 0}.main{padding-top:14px}.wrap{width:calc(100% - 24px)}.mail{padding:15px}}</style></head><body>
 <header class='top'><div class='wrap'><h1>最近邮件</h1><div class='alias'>__ALIAS__</div></div></header>
-<main class='wrap main'><p class='hint'>页面每 15 秒自动刷新。<button id='refresh' onclick='manualRefresh()'>立即刷新</button><span class='status' id='status'>正在读取...</span></p><section class='mailbox' id='mailbox'><div class='loading'>正在检查邮件...</div></section></main>
-<script>const token=__TOKEN__;let busy=false;function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}function render(items){const box=document.getElementById('mailbox');if(!items.length){box.innerHTML='<div class="empty">暂无邮件。</div>';return}box.innerHTML=items.slice().reverse().map(m=>{const body=m.text||m.body||m.preview||'';return '<article class="mail"><div class="subject">'+esc(m.subject||'(无主题)')+'</div><div class="meta">'+esc(m.from||'')+' · '+esc(m.date||'')+'</div>'+(body?'<div class="body">'+esc(body)+'</div>':'')+'</article>'}).join('')}async function fetchMessages(force){const q=force?'?force=1':'';const r=await fetch('/pickup/'+encodeURIComponent(token)+'/messages'+q,{cache:'no-store'});const d=await r.json();if(!r.ok)throw new Error(d.error||'读取失败');return d}async function load(force){if(busy)return;busy=true;const status=document.getElementById('status');const btn=document.getElementById('refresh');try{let d=await fetchMessages(!!force);render(d.emails||[]);status.textContent=d.refreshing?(force?'正在同步新邮件...':'后台查件中'):'刚刚刷新';if(force&&d.refreshing){for(let i=0;i<20;i++){await new Promise(r=>setTimeout(r,1000));d=await fetchMessages(false);render(d.emails||[]);if(!d.refreshing){status.textContent='新邮件已刷新';break}}}}catch(e){status.textContent='读取失败';if(!document.querySelector('.mail'))document.getElementById('mailbox').innerHTML='<div class="error">读取失败，稍后自动重试。</div>'}finally{busy=false;btn.disabled=false}}function manualRefresh(){document.getElementById('refresh').disabled=true;load(true)}load(false);setInterval(function(){load(false)},15000);</script></body></html>"""
+<main class='wrap main'><p class='hint'>页面打开及每 15 秒自动获取最新邮件。<span class='status' id='status'>正在读取...</span></p><section class='mailbox' id='mailbox'><div class='loading'>正在检查邮件...</div></section></main>
+<script>const token=__TOKEN__;let busy=false;let current=[];const bodies={};function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}function render(items){current=items.slice().reverse();const box=document.getElementById('mailbox');if(!current.length){box.innerHTML='<div class="empty">暂无邮件。</div>';return}box.innerHTML=current.map((m,i)=>'<article class="mail" onclick="openMessage('+i+')"><div class="subject">'+esc(m.subject||'(无主题)')+'</div><div class="meta">'+esc(m.from||'')+' · '+esc(m.date||'')+'</div><div class="body" id="body-'+i+'" style="display:none"></div></article>').join('');openMessage(0,true)}async function fetchMessages(force){const q=force?'?force=1':'';const r=await fetch('/pickup/'+encodeURIComponent(token)+'/messages'+q,{cache:'no-store'});const d=await r.json();if(!r.ok)throw new Error(d.error||'读取失败');return d}async function openMessage(i,auto){const m=current[i];if(!m||!m.id)return;const el=document.getElementById('body-'+i);if(!el)return;if(el.style.display==='block'&&!auto){el.style.display='none';return}el.style.display='block';if(bodies[m.id]){el.textContent=bodies[m.id];return}el.textContent='正在打开邮件...';for(let n=0;n<20;n++){try{const r=await fetch('/pickup/'+encodeURIComponent(token)+'/message/'+encodeURIComponent(m.id),{cache:'no-store'});const d=await r.json();if(r.ok&&d.ready){const body=(d.message&&d.message.body)||'(无正文内容)';bodies[m.id]=body;el.textContent=body;return}if(r.status===404){el.textContent=d.error||'邮件不存在';return}}catch(e){}await new Promise(r=>setTimeout(r,1000))}el.textContent='正文读取较慢，请点击邮件重试。'}async function load(){if(busy)return;busy=true;const status=document.getElementById('status');try{let d=await fetchMessages(true);render(d.emails||[]);status.textContent=d.refreshing?'正在同步最新邮件...':'刚刚刷新';if(d.refreshing){for(let i=0;i<20;i++){await new Promise(r=>setTimeout(r,1000));d=await fetchMessages(false);if(!d.refreshing){render(d.emails||[]);status.textContent='最新邮件已显示';break}}}}catch(e){status.textContent='读取失败';if(!document.querySelector('.mail'))document.getElementById('mailbox').innerHTML='<div class="error">读取失败，稍后自动重试。</div>'}finally{busy=false}}load();setInterval(load,15000);</script></body></html>"""
     html = html.replace("__ALIAS__", alias_html).replace("__TOKEN__", token_js)
     return Response(html, mimetype="text/html", headers={"Cache-Control": "no-store"})
 
@@ -394,6 +396,24 @@ def _refresh_pickup_account(account_id):
         with _pickup_refresh_lock:
             _pickup_last_account_refresh[account_id] = time.time()
             _pickup_refreshing_accounts.discard(account_id)
+            _pickup_pending = max(0, _pickup_pending - 1)
+
+def _refresh_pickup_body(account_id, msg_id):
+    global _pickup_pending
+    key = (account_id, msg_id)
+    try:
+        mail = _account_mgr.get_mail_client(account_id)
+        try:
+            full = mail.fetch_full(msg_id.encode() if isinstance(msg_id, str) else msg_id) or {}
+        finally:
+            mail.disconnect()
+        with _pickup_refresh_lock:
+            _pickup_body_cache[key] = full
+    except Exception:
+        pass
+    finally:
+        with _pickup_refresh_lock:
+            _pickup_body_refreshing.discard(key)
             _pickup_pending = max(0, _pickup_pending - 1)
 
 @app.route("/pickup/<token>/messages")
@@ -414,6 +434,28 @@ def pickup_messages(token):
             refreshing = True
             _pickup_executor.submit(_refresh_pickup_account, account_id)
     return jsonify({"emails": cached, "count": len(cached), "refreshing": refreshing}), 200, {"Cache-Control": "no-store"}
+
+@app.route("/pickup/<token>/message/<msg_id>")
+def pickup_message(token, msg_id):
+    global _pickup_pending
+    item = _pickup_store.get_by_token(token)
+    if not item:
+        return jsonify({"error": "取件链接无效或已撤销"}), 404
+    account_id = item["account_id"]
+    allowed = _account_mgr._cache.get_alias_mail(account_id, item["alias_email"])
+    if msg_id not in {str(m.get("id", "")) for m in allowed}:
+        return jsonify({"error": "邮件不存在"}), 404
+    key = (account_id, msg_id)
+    with _pickup_refresh_lock:
+        if key in _pickup_body_cache:
+            return jsonify({"ready": True, "message": _pickup_body_cache[key]}), 200, {"Cache-Control": "no-store"}
+        refreshing = key in _pickup_body_refreshing
+        if not refreshing and _pickup_pending < _PICKUP_MAX_PENDING:
+            _pickup_body_refreshing.add(key)
+            _pickup_pending += 1
+            refreshing = True
+            _pickup_executor.submit(_refresh_pickup_body, account_id, msg_id)
+    return jsonify({"ready": False, "refreshing": refreshing}), 202, {"Cache-Control": "no-store"}
 
 @app.route("/api/emails")
 def api_emails():
