@@ -196,13 +196,7 @@ class ICloudMail:
 
     def fetch_full(self, msg_id: bytes) -> Optional[Dict]:
         self._ensure_connected()
-        msg = self._fetch_full_message(msg_id)
-        if not msg:
-            return None
-        hdr = self._fetch_headers_uid(msg_id)
-        if hdr:
-            msg.update(hdr)
-        return msg
+        return self._fetch_full_message(msg_id)
 
     def _fetch_full_message(self, msg_id: bytes) -> Optional[Dict]:
         status, data = self._conn.uid("FETCH", msg_id, "(BODY.PEEK[])")
@@ -256,10 +250,31 @@ class ICloudMail:
         if not body and html_body:
             body = _strip_html(html_body)
 
+        recipient_headers = [
+            em.get(name, "")
+            for name in (
+                "To", "Cc", "Delivered-To", "X-Original-To",
+                "Envelope-To", "X-Envelope-To",
+            )
+            if em.get(name)
+        ]
+        recipients = [
+            address.lower()
+            for _, address in getaddresses(recipient_headers)
+            if address
+        ]
+
         return {
+            "id": msg_id.decode() if isinstance(msg_id, bytes) else str(msg_id),
+            "from": self._decode_header(em.get("From", "")),
+            "to": self._decode_header(em.get("To", "")),
+            "recipients": recipients,
+            "subject": self._decode_header(em.get("Subject", "")),
+            "date": self._safe_date(em.get("Date", "")),
             "body": body[:10000],
             "html": html_body[:200000],
             "content_type": em.get_content_type(),
+            "size": len(raw),
         }
 
     @staticmethod

@@ -72,6 +72,8 @@ class AccountManager:
         self._lock = threading.RLock()
         self._mail_clients: Dict[str, Any] = {}
         self._mail_sync_locks: Dict[str, threading.Lock] = {}
+        self._operation_locks: Dict[str, threading.RLock] = {}
+        self._latest_emails_lock = threading.Lock()
         self._cache = get_cache()
         self._load()
 
@@ -221,13 +223,14 @@ class AccountManager:
         return account
 
     def remove_account(self, acc_id: str) -> bool:
-        self._drop_mail_client(acc_id)
-        with self._lock:
-            if acc_id in self.accounts:
-                del self.accounts[acc_id]
-                self._save()
-                return True
-            return False
+        with self._operation_lock(acc_id):
+            self._drop_mail_client(acc_id)
+            with self._lock:
+                if acc_id in self.accounts:
+                    del self.accounts[acc_id]
+                    self._save()
+                    return True
+                return False
 
     def get_account(self, acc_id: str) -> Optional[Dict]:
         return self.accounts.get(acc_id)
@@ -261,7 +264,15 @@ class AccountManager:
         # Guessing here produces valid-looking credentials that can never log in.
         return ""
 
+    def _operation_lock(self, acc_id: str) -> threading.RLock:
+        with self._lock:
+            return self._operation_locks.setdefault(acc_id, threading.RLock())
+
     def validate_account(self, acc_id: str) -> Dict:
+        with self._operation_lock(acc_id):
+            return self._validate_account_unlocked(acc_id)
+
+    def _validate_account_unlocked(self, acc_id: str) -> Dict:
         from icloud_hme import ICloudHME
 
         account = self.accounts.get(acc_id)
@@ -599,6 +610,12 @@ class AccountManager:
     def create_aliases_for_account(
         self, acc_id: str, count: int = 1, label: str = ""
     ) -> List[Dict]:
+        with self._operation_lock(acc_id):
+            return self._create_aliases_for_account_unlocked(acc_id, count, label)
+
+    def _create_aliases_for_account_unlocked(
+        self, acc_id: str, count: int = 1, label: str = ""
+    ) -> List[Dict]:
         from icloud_hme import ICloudHME
 
         account = self.accounts.get(acc_id)
@@ -629,8 +646,11 @@ class AccountManager:
                         "created_at": created_at,
                     })
                     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-                    with open(str(LATEST_EMAILS), "a", encoding="utf-8") as f:
-                        f.write(f"{email}\t{acc_id}\t{created_at}\n")
+                    with self._latest_emails_lock:
+                        with open(str(LATEST_EMAILS), "a", encoding="utf-8") as f:
+                            f.write(f"{email}\t{acc_id}\t{created_at}\n")
+                            f.flush()
+                            os.fsync(f.fileno())
                     account["alias_total"] = account.get("alias_total", 0) + 1
                     account["alias_active"] = account.get("alias_active", 0) + 1
                     account["create_status"] = "available"

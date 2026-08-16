@@ -315,6 +315,9 @@ def test_async_batch_skips_limited_account_and_continues():
             ]
 
     original_manager = web_ui._account_mgr
+    original_state_file = web_ui._BATCH_STATE_FILE
+    temp_dir = tempfile.TemporaryDirectory()
+    web_ui._BATCH_STATE_FILE = Path(temp_dir.name) / "batch_jobs.json"
     with web_ui._batch_lock:
         original_jobs = web_ui._batch_jobs
         original_active = web_ui._batch_active_id
@@ -347,6 +350,8 @@ def test_async_batch_skips_limited_account_and_continues():
         with web_ui._batch_lock:
             web_ui._batch_jobs = original_jobs
             web_ui._batch_active_id = original_active
+        web_ui._BATCH_STATE_FILE = original_state_file
+        temp_dir.cleanup()
     print("  PASS test_async_batch_skips_limited_account_and_continues")
 
 
@@ -375,6 +380,9 @@ def test_async_batch_retries_temporary_limit_after_cooldown():
 
     original_manager = web_ui._account_mgr
     original_delay = web_ui._BATCH_RETRY_DELAY_SECONDS
+    original_state_file = web_ui._BATCH_STATE_FILE
+    temp_dir = tempfile.TemporaryDirectory()
+    web_ui._BATCH_STATE_FILE = Path(temp_dir.name) / "batch_jobs.json"
     with web_ui._batch_lock:
         original_jobs = web_ui._batch_jobs
         original_active = web_ui._batch_active_id
@@ -410,6 +418,8 @@ def test_async_batch_retries_temporary_limit_after_cooldown():
         with web_ui._batch_lock:
             web_ui._batch_jobs = original_jobs
             web_ui._batch_active_id = original_active
+        web_ui._BATCH_STATE_FILE = original_state_file
+        temp_dir.cleanup()
     print("  PASS test_async_batch_retries_temporary_limit_after_cooldown")
 
 
@@ -541,6 +551,160 @@ def test_runtime_logs_persist_replay_and_resume():
     print("  PASS test_runtime_logs_persist_replay_and_resume")
 
 
+def test_batch_state_persists_and_resumes_remaining_count():
+    """重启恢复时只能继续尚未创建的数量，不能重复创建。"""
+    import web_ui
+
+    class FakeManager:
+        requested = []
+
+        def get_account(self, _account_id):
+            return {"id": "one", "name": "one", "status": "active"}
+
+        def create_aliases_for_account(self, account_id, count, _label):
+            self.requested.append(count)
+            return [
+                {"ok": True, "email": f"new-{i}@icloud.com", "account_id": account_id}
+                for i in range(count)
+            ]
+
+    original_manager = web_ui._account_mgr
+    original_jobs = web_ui._batch_jobs
+    original_active = web_ui._batch_active_id
+    original_state_file = web_ui._BATCH_STATE_FILE
+    with tempfile.TemporaryDirectory() as td:
+        state_file = Path(td) / "batch_jobs.json"
+        job = {
+            "id": "resume-job",
+            "status": "running",
+            "account_ids": ["one"],
+            "count_per_account": 5,
+            "interval": 0,
+            "label": "",
+            "total_accounts": 1,
+            "completed_accounts": 0,
+            "total_created": 0,
+            "total_errors": 0,
+            "created_at": "2026-08-17T00:00:00+08:00",
+            "updated_at": "2026-08-17T00:00:00+08:00",
+            "accounts": {
+                "one": {
+                    "account_id": "one", "name": "one", "status": "waiting",
+                    "created": 4, "errors": 0, "limited": False, "error": "",
+                    "retry_count": 2, "retry_at": None,
+                }
+            },
+        }
+        try:
+            web_ui._account_mgr = FakeManager()
+            web_ui._BATCH_STATE_FILE = state_file
+            web_ui._batch_jobs = web_ui.OrderedDict([("resume-job", job)])
+            web_ui._batch_active_id = "resume-job"
+            with web_ui._batch_lock:
+                web_ui._save_batch_state_locked()
+            loaded, active = web_ui._load_batch_state(state_file)
+            assert active == "resume-job"
+            assert loaded["resume-job"]["accounts"]["one"]["created"] == 4
+            web_ui._run_batch_job("resume-job")
+            assert web_ui._account_mgr.requested == [1]
+            assert job["total_created"] == 5
+            assert job["accounts"]["one"]["status"] == "completed"
+        finally:
+            web_ui._account_mgr = original_manager
+            web_ui._batch_jobs = original_jobs
+            web_ui._batch_active_id = original_active
+            web_ui._BATCH_STATE_FILE = original_state_file
+    print("  PASS test_batch_state_persists_and_resumes_remaining_count")
+
+
+def test_invalid_imap_credentials_are_not_persisted():
+    """新 IMAP 凭据测试失败时不能覆盖原有可用配置。"""
+    import icloud_mail
+    import web_ui
+
+    class FakeManager:
+        updated = False
+
+        def get_account(self, _account_id):
+            return {"id": "one", "icloud_email": "old@icloud.com"}
+
+        def _drop_mail_client(self, _account_id):
+            raise AssertionError("失败凭据不应替换连接")
+
+        def update_account(self, _account_id, **_kwargs):
+            self.updated = True
+
+    class RejectingMail:
+        def __init__(self, _email, _password):
+            pass
+
+        def test_connection(self):
+            return {"ok": False, "error": "login failed"}
+
+    original_manager = web_ui._account_mgr
+    original_mail = icloud_mail.ICloudMail
+    try:
+        web_ui._account_mgr = FakeManager()
+        icloud_mail.ICloudMail = RejectingMail
+        response = web_ui.app.test_client().post(
+            "/api/accounts/one/app-password",
+            json={"icloud_email": "new@icloud.com", "app_password": "wrong"},
+        )
+        assert response.status_code == 400
+        assert web_ui._account_mgr.updated is False
+    finally:
+        web_ui._account_mgr = original_manager
+        icloud_mail.ICloudMail = original_mail
+    print("  PASS test_invalid_imap_credentials_are_not_persisted")
+
+
+def test_fetch_full_uses_single_imap_fetch():
+    """完整邮件已经含有头部，正文读取不应再发第二次 IMAP 请求。"""
+    from icloud_mail import ICloudMail
+
+    raw = (
+        b"From: Sender <sender@example.com>\r\n"
+        b"To: alias@icloud.com\r\n"
+        b"Subject: Single fetch\r\n"
+        b"Date: Sun, 17 Aug 2026 00:00:00 +0800\r\n"
+        b"Content-Type: text/plain; charset=utf-8\r\n\r\n"
+        + b"x" * 600
+    )
+
+    class FakeConnection:
+        state = "SELECTED"
+        calls = 0
+
+        def uid(self, command, _uid, _query):
+            assert command == "FETCH"
+            self.calls += 1
+            return "OK", [(b"1 (UID 7 BODY[])", raw), b")"]
+
+    mail = ICloudMail("user@icloud.com", "password")
+    mail._conn = FakeConnection()
+    message = mail.fetch_full(b"7")
+    assert mail._conn.calls == 1
+    assert message["subject"] == "Single fetch"
+    assert message["recipients"] == ["alias@icloud.com"]
+    print("  PASS test_fetch_full_uses_single_imap_fetch")
+
+
+def test_manual_create_rejects_invalid_counts():
+    import web_ui
+
+    client = web_ui.app.test_client()
+    for value in (0, 751, "bad"):
+        response = client.post("/api/accounts/one/create", json={"count": value})
+        assert response.status_code == 400
+        response = client.post(
+            "/api/create-batch",
+            json={"account_ids": ["one"], "count_per_account": value},
+        )
+        assert response.status_code == 400
+    assert "Apple 临时限制时会暂停 1 分钟并自动续建" in web_ui.UI_HTML
+    print("  PASS test_manual_create_rejects_invalid_counts")
+
+
 if __name__ == "__main__":
     tests = [
         ("parse_cookie_header_string", test_parse_cookie_header_string),
@@ -564,6 +728,10 @@ if __name__ == "__main__":
         ("email_api_uses_saved_and_pickup_creation_times", test_email_api_uses_saved_and_pickup_creation_times),
         ("pickup_links_api_does_not_call_icloud", test_pickup_links_api_does_not_call_icloud),
         ("runtime_logs_persist_replay_and_resume", test_runtime_logs_persist_replay_and_resume),
+        ("batch_state_persists_and_resumes_remaining_count", test_batch_state_persists_and_resumes_remaining_count),
+        ("invalid_imap_credentials_are_not_persisted", test_invalid_imap_credentials_are_not_persisted),
+        ("fetch_full_uses_single_imap_fetch", test_fetch_full_uses_single_imap_fetch),
+        ("manual_create_rejects_invalid_counts", test_manual_create_rejects_invalid_counts),
     ]
     
     passed = 0

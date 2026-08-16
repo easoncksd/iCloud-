@@ -115,8 +115,7 @@ _pickup_body_cache = OrderedDict()
 _pickup_body_cache_bytes = 0
 _pickup_body_refreshing = set()
 _batch_lock = threading.RLock()
-_batch_jobs = OrderedDict()
-_batch_active_id = None
+_BATCH_STATE_FILE = RESULTS_DIR / "batch_jobs.json"
 _BATCH_JOB_HISTORY = 20
 _BATCH_RETRY_DELAY_SECONDS = max(
     1.0, float(os.environ.get("BATCH_RETRY_DELAY_SECONDS", "60"))
@@ -131,6 +130,57 @@ _TEMPORARY_CREATE_LIMIT_MARKERS = (
     "temporarily",
     "throttle",
 )
+
+
+def _load_batch_state(path=_BATCH_STATE_FILE):
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        raw_jobs = data.get("jobs", {})
+        jobs = OrderedDict(
+            (str(job_id), job)
+            for job_id, job in raw_jobs.items()
+            if isinstance(job, dict)
+        )
+        while len(jobs) > _BATCH_JOB_HISTORY:
+            jobs.popitem(last=False)
+        active_id = str(data.get("active_id") or "") or None
+        if active_id not in jobs or jobs.get(active_id, {}).get("status") not in (
+            "queued", "running"
+        ):
+            active_id = next(
+                (
+                    job_id
+                    for job_id, job in reversed(jobs.items())
+                    if job.get("status") in ("queued", "running")
+                ),
+                None,
+            )
+        return jobs, active_id
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return OrderedDict(), None
+
+
+_batch_jobs, _batch_active_id = _load_batch_state()
+
+
+def _save_batch_state_locked(path=None):
+    target = Path(path or _BATCH_STATE_FILE)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(
+        {"active_id": _batch_active_id, "jobs": _batch_jobs},
+        ensure_ascii=False,
+        indent=2,
+    )
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, target)
+
+
+class _BatchInterrupted(Exception):
+    pass
 
 
 def _is_temporary_create_limit(error):
@@ -323,6 +373,12 @@ UI_HTML = UI_HTML.replace(
 ).replace(
     "var entry=JSON.parse(e.data);logs.push(entry);",
     "var entry=JSON.parse(e.data);if((entry.seq||0)<=logCursor)return;logCursor=entry.seq||logCursor;logs.push(entry);",
+).replace(
+    "某个账号触发 Apple 限制时会自动跳过，继续下一个账号。",
+    "某个账号触发 Apple 临时限制时会暂停 1 分钟并自动续建。",
+).replace(
+    "function exportCSV(){var filter=E('aliasFilter').value;var filtered=filter==='all'?emails:emails.filter(function(e){return e.account_id===filter});var csv='email,account,label,active\\n'+filtered.map(function(e){return e.email+','+(e.account_name||e.account_id||'')+','+(e.label||'')+','+(e.hasOwnProperty('active')?(e.active?'yes':'no'):'');}).join('\\n');var b=new Blob(['\\uFEFF'+csv],{type:'text/csv'}),a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='icloud_aliases.csv';a.click();}",
+    "function csvCell(v){v=String(v==null?'':v);if(/^[=+\\-@]/.test(v))v=\"'\"+v;return '\"'+v.replace(/\"/g,'\"\"')+'\"';}function exportCSV(){var filter=E('aliasFilter').value;var filtered=filter==='all'?emails:emails.filter(function(e){return e.account_id===filter});var csv='email,account,label,active\\n'+filtered.map(function(e){return [e.email,e.account_name||e.account_id||'',e.label||'',e.hasOwnProperty('active')?(e.active?'yes':'no'):''].map(csvCell).join(',');}).join('\\n');var b=new Blob(['\\uFEFF'+csv],{type:'text/csv'}),a=document.createElement('a'),u=URL.createObjectURL(b);a.href=u;a.download='icloud_aliases.csv';a.click();setTimeout(function(){URL.revokeObjectURL(u)},1000);}",
 )
 
 # ----- Flask Routes -----
@@ -388,7 +444,12 @@ def api_validate_account(acc_id):
 @app.route("/api/accounts/<acc_id>/create", methods=["POST"])
 def api_create_for_account(acc_id):
     data = request.get_json() or {}
-    count = min(int(data.get("count",1)),750)
+    try:
+        count = int(data.get("count", 1))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "创建数量无效"}), 400
+    if count < 1 or count > 750:
+        return jsonify({"ok": False, "error": "创建数量必须在 1 到 750 之间"}), 400
     label = data.get("label","")
     _update_state(creating=True)
     _emit_log("info",f"手动创建: 账号 {acc_id} x{count}")
@@ -413,13 +474,15 @@ def _batch_job_snapshot(job_id):
 def _create_account_with_cooldown(job, acc_id, count, label, name):
     """Create the remaining aliases, pausing after Apple's temporary throttle."""
     successful = []
-    while len(successful) < count:
-        remaining = count - len(successful)
+    with _batch_lock:
+        already_created = int(job["accounts"][acc_id].get("created", 0) or 0)
+    while already_created + len(successful) < count:
+        remaining = count - already_created - len(successful)
         results = _account_mgr.create_aliases_for_account(acc_id, remaining, label)
         successful.extend(result for result in results if result.get("ok"))
         errors = [result for result in results if not result.get("ok")]
         if not errors:
-            if len(successful) >= count:
+            if already_created + len(successful) >= count:
                 return successful
             return successful + [{
                 "ok": False,
@@ -437,21 +500,23 @@ def _create_account_with_cooldown(job, acc_id, count, label, name):
         with _batch_lock:
             entry = job["accounts"][acc_id]
             entry["status"] = "waiting"
-            entry["created"] = len(successful)
+            entry["created"] = already_created + len(successful)
             entry["retry_count"] = entry.get("retry_count", 0) + 1
             entry["retry_at"] = retry_at.isoformat()
             entry["error"] = f"Apple 临时限制，{retry_at_text} 自动继续"
             job["updated_at"] = datetime.now(_BJ_TZ).isoformat()
+            _save_batch_state_locked()
         _emit_log("warn", f"[{name}] Apple 临时限制，暂停 1 分钟后继续剩余 {remaining} 个")
 
         if _shutdown_event.wait(_BATCH_RETRY_DELAY_SECONDS):
-            return successful + errors
+            raise _BatchInterrupted()
         with _batch_lock:
             entry = job["accounts"][acc_id]
             entry["status"] = "running"
             entry["retry_at"] = None
             entry["error"] = ""
             job["updated_at"] = datetime.now(_BJ_TZ).isoformat()
+            _save_batch_state_locked()
 
     return successful
 
@@ -461,24 +526,31 @@ def _run_batch_job(job_id):
     with _batch_lock:
         job = _batch_jobs[job_id]
         job["status"] = "running"
-        job["started_at"] = datetime.now(_BJ_TZ).isoformat()
+        job["started_at"] = job.get("started_at") or datetime.now(_BJ_TZ).isoformat()
         account_ids = list(job["account_ids"])
         count = job["count_per_account"]
         label = job["label"]
         interval = job["interval"]
+        _save_batch_state_locked()
     _update_state(creating=True, round_status=f"批量创建 0/{len(account_ids)} 个账号")
     _emit_log("info", f"批量任务启动: {len(account_ids)} 个账号 x{count}")
 
     try:
         for index, acc_id in enumerate(account_ids):
             if _shutdown_event.is_set():
-                break
+                raise _BatchInterrupted()
             account = _account_mgr.get_account(acc_id)
             name = (account or {}).get("name") or acc_id
             with _batch_lock:
                 entry = job["accounts"][acc_id]
+                if entry.get("finished_at") and entry.get("status") in (
+                    "completed", "partial", "failed", "limited"
+                ):
+                    continue
+                previous_created = int(entry.get("created", 0) or 0)
                 entry["status"] = "running"
-                entry["started_at"] = datetime.now(_BJ_TZ).isoformat()
+                entry["started_at"] = entry.get("started_at") or datetime.now(_BJ_TZ).isoformat()
+                _save_batch_state_locked()
             if not account:
                 results = [{"ok": False, "error": "账号不存在", "limited": False}]
             elif account.get("status") != "active":
@@ -488,7 +560,7 @@ def _run_batch_job(job_id):
                     job, acc_id, count, label, name
                 )
 
-            created = sum(1 for result in results if result.get("ok"))
+            created = previous_created + sum(1 for result in results if result.get("ok"))
             errors = [result for result in results if not result.get("ok")]
             limited = any(result.get("limited") for result in errors)
             first_error = str(errors[0].get("error") or "")[:200] if errors else ""
@@ -510,10 +582,21 @@ def _run_batch_job(job_id):
                     "retry_at": None,
                     "finished_at": datetime.now(_BJ_TZ).isoformat(),
                 })
-                job["completed_accounts"] = index + 1
-                job["total_created"] += created
-                job["total_errors"] += len(errors)
+                job["completed_accounts"] = sum(
+                    1
+                    for account_entry in job["accounts"].values()
+                    if account_entry.get("finished_at")
+                )
+                job["total_created"] = sum(
+                    int(account_entry.get("created", 0) or 0)
+                    for account_entry in job["accounts"].values()
+                )
+                job["total_errors"] = sum(
+                    int(account_entry.get("errors", 0) or 0)
+                    for account_entry in job["accounts"].values()
+                )
                 job["updated_at"] = datetime.now(_BJ_TZ).isoformat()
+                _save_batch_state_locked()
             level = "warn" if errors else "success"
             detail = f" / {first_error}" if first_error else ""
             _emit_log(level, f"[{name}] {created} 成功 / {len(errors)} 失败{detail}")
@@ -526,22 +609,48 @@ def _run_batch_job(job_id):
             job["finished_at"] = datetime.now(_BJ_TZ).isoformat()
             total_created = job["total_created"]
             total_errors = job["total_errors"]
+            _save_batch_state_locked()
         _increment_state(today_created=total_created, total_created=total_created)
         _emit_log(
             "success" if total_created else "warn",
             f"批量任务完成: {total_created} 成功 / {total_errors} 失败",
         )
+    except _BatchInterrupted:
+        with _batch_lock:
+            job["status"] = "queued"
+            job["updated_at"] = datetime.now(_BJ_TZ).isoformat()
+            _save_batch_state_locked()
     except Exception as exc:
         with _batch_lock:
             job["status"] = "failed"
             job["error"] = str(exc)[:300]
             job["finished_at"] = datetime.now(_BJ_TZ).isoformat()
+            _save_batch_state_locked()
         _emit_log("error", f"批量任务异常: {str(exc)[:200]}")
     finally:
         with _batch_lock:
-            if _batch_active_id == job_id:
+            if _batch_active_id == job_id and job.get("status") not in ("queued", "running"):
                 _batch_active_id = None
+            _save_batch_state_locked()
         _update_state(creating=False, round_status="批量任务已完成")
+
+
+def _resume_batch_job_if_needed():
+    with _batch_lock:
+        job_id = _batch_active_id
+        job = _batch_jobs.get(job_id) if job_id else None
+        if not job or job.get("status") not in ("queued", "running"):
+            return False
+        job["status"] = "queued"
+        job["updated_at"] = datetime.now(_BJ_TZ).isoformat()
+        for entry in job.get("accounts", {}).values():
+            if not entry.get("finished_at") and entry.get("status") in ("running", "waiting"):
+                entry["status"] = "queued"
+                entry["retry_at"] = None
+        _save_batch_state_locked()
+    threading.Thread(target=_run_batch_job, args=(job_id,), daemon=True).start()
+    _emit_log("info", "已恢复未完成的批量创建任务")
+    return True
 
 
 @app.route("/api/create-batch", methods=["POST"])
@@ -557,10 +666,12 @@ def api_create_batch():
     if len(account_ids) > 100:
         return jsonify({"ok": False, "error": "单次最多选择 100 个主账号"}), 400
     try:
-        count = max(1, min(int(data.get("count_per_account", 5)), 750))
+        count = int(data.get("count_per_account", 5))
         interval = max(0.0, min(float(data.get("interval", 3.0)), 30.0))
     except (TypeError, ValueError):
         return jsonify({"ok": False, "error": "创建数量或间隔无效"}), 400
+    if count < 1 or count > 750:
+        return jsonify({"ok": False, "error": "每账号创建数量必须在 1 到 750 之间"}), 400
     label = str(data.get("label") or "")[:100]
 
     with _batch_lock:
@@ -606,6 +717,7 @@ def api_create_batch():
         while len(_batch_jobs) > _BATCH_JOB_HISTORY:
             _batch_jobs.popitem(last=False)
         _batch_active_id = job_id
+        _save_batch_state_locked()
     threading.Thread(target=_run_batch_job, args=(job_id,), daemon=True).start()
     return jsonify({"ok": True, "job_id": job_id, "job": _batch_job_snapshot(job_id)}), 202
 
@@ -631,14 +743,23 @@ def api_set_app_password(acc_id):
     icloud_email = data.get("icloud_email","").strip()
     if not pwd: return jsonify({"ok":False,"error":"密码不能为空"})
     try:
-        _account_mgr.set_app_password(acc_id, pwd)
-        if icloud_email: _account_mgr.update_account(acc_id, icloud_email=icloud_email)
-        result = _account_mgr.test_imap_connection(acc_id)
+        account = _account_mgr.get_account(acc_id)
+        if not account:
+            return jsonify({"ok": False, "error": "账号不存在"}), 404
+        target_email = icloud_email or account.get("icloud_email", "")
+        if not target_email:
+            return jsonify({"ok": False, "error": "iCloud 邮箱不能为空"}), 400
+        from icloud_mail import ICloudMail
+        result = ICloudMail(target_email, pwd).test_connection()
+        if not result.get("ok"):
+            return jsonify(result), 400
+        _account_mgr._drop_mail_client(acc_id)
+        _account_mgr.update_account(
+            acc_id, app_password=pwd, icloud_email=target_email
+        )
         return jsonify(result)
     except Exception as e:
-        # Credentials are persisted before the network test. Keep them saved when
-        # IMAP is temporarily slow or unavailable so the user can retry inbox sync.
-        return jsonify({"ok":False,"saved":True,"error":str(e)})
+        return jsonify({"ok":False,"saved":False,"error":str(e)}), 400
 
 @app.route("/api/accounts/<acc_id>/inbox")
 def api_inbox(acc_id):
@@ -919,7 +1040,8 @@ def pickup_messages(token):
             refreshing = True
             _pickup_executor.submit(_refresh_pickup_account, account_id)
         refresh_error = _pickup_refresh_errors.get(account_id)
-    return jsonify({"emails": cached, "count": len(cached), "refreshing": refreshing, "error": refresh_error}), 200, {"Cache-Control": "no-store"}
+    public_error = "邮件同步暂时失败" if refresh_error else None
+    return jsonify({"emails": cached, "count": len(cached), "refreshing": refreshing, "error": public_error}), 200, {"Cache-Control": "no-store"}
 
 @app.route("/pickup/<token>/message/<msg_id>")
 def pickup_message(token, msg_id):
@@ -1056,6 +1178,7 @@ def main():
         for a in accounts: print(f"    [OK] {a.get('name','?')} - {a.get('real_email','?')} ({a.get('alias_total',0)} aliases)")
     else: print("[*] No accounts yet")
     _emit_log("info", f"服务已启动，加载 {len(accounts)} 个主账号")
+    _resume_batch_job_if_needed()
     if args.scheduler:
         global _scheduler_thread
         _scheduler_stop_event.clear()
