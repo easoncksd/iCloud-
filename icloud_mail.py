@@ -235,7 +235,11 @@ class ICloudMail:
         if not body and html_body:
             body = _strip_html(html_body)
 
-        return {"body": body[:5000], "content_type": em.get_content_type()}
+        return {
+            "body": body[:10000],
+            "html": html_body[:200000],
+            "content_type": em.get_content_type(),
+        }
 
     @staticmethod
     def _extract_body(data: list) -> Optional[bytes]:

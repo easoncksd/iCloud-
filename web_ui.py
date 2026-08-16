@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """iCloud HME Web UI — 多账号聚合管理平台 — Flask single-page app."""
-import sys, os, json, time, queue, secrets, threading
+import sys, os, json, time, queue, secrets, threading, re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from html import escape as _html_escape
@@ -380,10 +380,10 @@ def pickup_page(token):
     token_js = json.dumps(token)
     alias_html = _html_escape(item["alias_email"])
     html = """<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>最近邮件</title><style>*{box-sizing:border-box}body{margin:0;background:#edf2f5;color:#41586b;font:14px/1.6 system-ui,-apple-system,"Microsoft YaHei",sans-serif}.top{background:#101a23;color:#fff;padding:20px 24px}.wrap{width:min(1010px,calc(100% - 32px));margin:auto}.top h1{font-size:20px;margin:0 0 2px}.alias{color:#91c1dd;font-size:15px;word-break:break-all}.main{padding:18px 0 48px}.hint{margin:0 0 12px;color:#6c8799}.status{float:right}.mailbox{background:#fff;border:1px dashed #ced9e0;min-height:126px}.empty,.loading,.error{text-align:center;padding:52px 20px;color:#6d8290}.mail{padding:18px 20px;border-bottom:1px solid #e3eaee;cursor:pointer}.mail:last-child{border-bottom:0}.subject{font-size:16px;font-weight:600;color:#203442;margin-bottom:4px}.meta{font-size:12px;color:#8397a5}.body{margin-top:12px;padding:12px;background:#f5f8fa;color:#344c5c;white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,Consolas,monospace;max-height:360px;overflow:auto}@media(max-width:600px){.top{padding:16px 0}.main{padding-top:14px}.wrap{width:calc(100% - 24px)}.mail{padding:15px}}</style></head><body>
+<title>最近邮件</title><style>*{box-sizing:border-box}body{margin:0;background:#edf2f5;color:#41586b;font:14px/1.6 system-ui,-apple-system,"Microsoft YaHei",sans-serif}.top{background:#101a23;color:#fff;padding:20px 24px}.wrap{width:min(1010px,calc(100% - 32px));margin:auto}.top h1{font-size:20px;margin:0 0 2px}.alias{color:#91c1dd;font-size:15px;word-break:break-all}.main{padding:18px 0 48px}.hint{margin:0 0 12px;color:#6c8799}.status{float:right}.mailbox{background:#fff;border:1px dashed #ced9e0;min-height:126px}.empty,.loading,.error{text-align:center;padding:52px 20px;color:#6d8290}.mail{padding:18px 20px;border-bottom:1px solid #e3eaee;cursor:pointer}.mail:last-child{border-bottom:0}.subject{font-size:16px;font-weight:600;color:#203442;margin-bottom:4px}.meta{font-size:12px;color:#8397a5}.body{margin-top:12px;background:#fff;color:#344c5c}.mail-frame{display:block;width:100%;height:520px;border:1px solid #dce5ea;background:#fff}.message-text{white-space:pre-wrap;word-break:break-word;font-size:14px;line-height:1.7;color:#526b7a;padding:14px;background:#f5f8fa}@media(max-width:600px){.top{padding:16px 0}.main{padding-top:14px}.wrap{width:calc(100% - 24px)}.mail{padding:15px}}</style></head><body>
 <header class='top'><div class='wrap'><h1>最近邮件</h1><div class='alias'>__ALIAS__</div></div></header>
 <main class='wrap main'><p class='hint'>页面打开及每 15 秒自动获取最新邮件。<span class='status' id='status'>正在读取...</span></p><section class='mailbox' id='mailbox'><div class='loading'>正在检查邮件...</div></section></main>
-<script>const token=__TOKEN__;let busy=false;let current=[];const bodies={};function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}function render(items){current=items.slice().reverse();const box=document.getElementById('mailbox');if(!current.length){box.innerHTML='<div class="empty">暂无邮件。</div>';return}box.innerHTML=current.map((m,i)=>'<article class="mail" onclick="openMessage('+i+')"><div class="subject">'+esc(m.subject||'(无主题)')+'</div><div class="meta">'+esc(m.from||'')+' · '+esc(m.date||'')+'</div><div class="body" id="body-'+i+'" style="display:none"></div></article>').join('');openMessage(0,true)}async function fetchMessages(force){const q=force?'?force=1':'';const r=await fetch('/pickup/'+encodeURIComponent(token)+'/messages'+q,{cache:'no-store'});const d=await r.json();if(!r.ok)throw new Error(d.error||'读取失败');return d}async function openMessage(i,auto){const m=current[i];if(!m||!m.id)return;const el=document.getElementById('body-'+i);if(!el)return;if(el.style.display==='block'&&!auto){el.style.display='none';return}el.style.display='block';if(bodies[m.id]){el.textContent=bodies[m.id];return}el.textContent='正在打开邮件...';for(let n=0;n<20;n++){try{const r=await fetch('/pickup/'+encodeURIComponent(token)+'/message/'+encodeURIComponent(m.id),{cache:'no-store'});const d=await r.json();if(r.ok&&d.ready){const body=(d.message&&d.message.body)||'(无正文内容)';bodies[m.id]=body;el.textContent=body;return}if(r.status===404){el.textContent=d.error||'邮件不存在';return}}catch(e){}await new Promise(r=>setTimeout(r,1000))}el.textContent='正文读取较慢，请点击邮件重试。'}async function load(){if(busy)return;busy=true;const status=document.getElementById('status');try{let d=await fetchMessages(true);render(d.emails||[]);status.textContent=d.refreshing?'正在同步最新邮件...':'刚刚刷新';if(d.refreshing){for(let i=0;i<20;i++){await new Promise(r=>setTimeout(r,1000));d=await fetchMessages(false);if(!d.refreshing){render(d.emails||[]);status.textContent='最新邮件已显示';break}}}}catch(e){status.textContent='读取失败';if(!document.querySelector('.mail'))document.getElementById('mailbox').innerHTML='<div class="error">读取失败，稍后自动重试。</div>'}finally{busy=false}}load();setInterval(load,15000);</script></body></html>"""
+<script>const token=__TOKEN__;let busy=false;let current=[];const bodies={};function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}function showBody(el,data){el.innerHTML='';if(data.html){const frame=document.createElement('iframe');frame.className='mail-frame';frame.setAttribute('sandbox','allow-same-origin');frame.setAttribute('referrerpolicy','no-referrer');const csp='<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; img-src data: cid:; style-src \'unsafe-inline\'">';frame.srcdoc=csp+data.html;frame.onload=function(){try{frame.style.height=Math.min(Math.max(frame.contentDocument.documentElement.scrollHeight+24,240),1600)+'px'}catch(e){}};el.appendChild(frame)}else{const div=document.createElement('div');div.className='message-text';div.textContent=data.body||'(无正文内容)';el.appendChild(div)}}function render(items){current=items.slice().reverse();const box=document.getElementById('mailbox');if(!current.length){box.innerHTML='<div class="empty">暂无邮件。</div>';return}box.innerHTML=current.map((m,i)=>'<article class="mail" onclick="openMessage('+i+')"><div class="subject">'+esc(m.subject||'(无主题)')+'</div><div class="meta">'+esc(m.from||'')+' · '+esc(m.date||'')+'</div><div class="body" id="body-'+i+'" style="display:none"></div></article>').join('');openMessage(0,true)}async function fetchMessages(force){const q=force?'?force=1':'';const r=await fetch('/pickup/'+encodeURIComponent(token)+'/messages'+q,{cache:'no-store'});const d=await r.json();if(!r.ok)throw new Error(d.error||'读取失败');return d}async function openMessage(i,auto){const m=current[i];if(!m||!m.id)return;const el=document.getElementById('body-'+i);if(!el)return;if(el.style.display==='block'&&!auto){el.style.display='none';return}el.style.display='block';if(bodies[m.id]){showBody(el,bodies[m.id]);return}el.textContent='正在打开邮件...';for(let n=0;n<20;n++){try{const r=await fetch('/pickup/'+encodeURIComponent(token)+'/message/'+encodeURIComponent(m.id),{cache:'no-store'});const d=await r.json();if(r.ok&&d.ready){const data=d.message||{};bodies[m.id]=data;showBody(el,data);return}if(r.status===404){el.textContent=d.error||'邮件不存在';return}}catch(e){}await new Promise(r=>setTimeout(r,1000))}el.textContent='正文读取较慢，请点击邮件重试。'}async function load(){if(busy)return;busy=true;const status=document.getElementById('status');try{let d=await fetchMessages(true);render(d.emails||[]);status.textContent=d.refreshing?'正在同步最新邮件...':'刚刚刷新';if(d.refreshing){for(let i=0;i<20;i++){await new Promise(r=>setTimeout(r,1000));d=await fetchMessages(false);if(!d.refreshing){render(d.emails||[]);status.textContent='最新邮件已显示';break}}}}catch(e){status.textContent='读取失败';if(!document.querySelector('.mail'))document.getElementById('mailbox').innerHTML='<div class="error">读取失败，稍后自动重试。</div>'}finally{busy=false}}load();setInterval(load,15000);</script></body></html>"""
     html = html.replace("__ALIAS__", alias_html).replace("__TOKEN__", token_js)
     return Response(html, mimetype="text/html", headers={"Cache-Control": "no-store"})
 
@@ -398,6 +398,25 @@ def _refresh_pickup_account(account_id):
             _pickup_refreshing_accounts.discard(account_id)
             _pickup_pending = max(0, _pickup_pending - 1)
 
+def _pickup_code(subject, body):
+    text = f"{subject}\n{body}"
+    patterns = [
+        r"(?:验证码|校验码|动态码|临时码|verification\s*code|security\s*code|passcode|otp)[^0-9]{0,40}([0-9]{4,8})",
+        r"(?<![0-9])([0-9]{6})(?![0-9])",
+        r"(?<![0-9])([0-9]{4,8})(?![0-9])",
+    ]
+    for pattern in patterns:
+        for match in re.findall(pattern, text, flags=re.IGNORECASE):
+            if not (len(match) == 4 and 1900 <= int(match) <= 2099):
+                return match
+    return ""
+
+def _clean_pickup_body(body):
+    body = re.sub(r"https?://\S+", "", body or "", flags=re.IGNORECASE)
+    body = re.sub(r"[ \t]+", " ", body)
+    body = re.sub(r"\n\s*\n\s*\n+", "\n\n", body)
+    return body.strip()[:2500]
+
 def _refresh_pickup_body(account_id, msg_id):
     global _pickup_pending
     key = (account_id, msg_id)
@@ -407,6 +426,8 @@ def _refresh_pickup_body(account_id, msg_id):
             full = mail.fetch_full(msg_id.encode() if isinstance(msg_id, str) else msg_id) or {}
         finally:
             mail.disconnect()
+        full["verification_code"] = _pickup_code(full.get("subject", ""), full.get("body", ""))
+        full["clean_body"] = _clean_pickup_body(full.get("body", ""))
         with _pickup_refresh_lock:
             _pickup_body_cache[key] = full
     except Exception:
