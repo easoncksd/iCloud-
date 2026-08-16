@@ -420,17 +420,30 @@ def test_email_api_uses_saved_and_pickup_creation_times():
     class FakePickupStore:
         def list_all(self):
             return [{
+                "account_id": "acc-current",
                 "alias_email": "old@icloud.com",
+                "token": "existing-old-token",
                 "created_at": "2026-08-01T02:03:04+00:00",
             }]
+
+        def ensure(self, account_id, alias_email):
+            return {
+                "account_id": account_id,
+                "alias_email": alias_email,
+                "token": f"token-{account_id}",
+            }
 
     class FakeExportStore:
         def status_map(self, _emails):
             return {}
 
+    class FakeAccountManager:
+        accounts = {"acc-current": {}, "acc-new": {}}
+
     original_results = web_ui.RESULTS_DIR
     original_pickup = web_ui._pickup_store
     original_export = web_ui._export_store
+    original_manager = web_ui._account_mgr
     with tempfile.TemporaryDirectory() as td:
         results_dir = Path(td)
         (results_dir / "latest_emails.txt").write_text(
@@ -441,18 +454,55 @@ def test_email_api_uses_saved_and_pickup_creation_times():
         web_ui.RESULTS_DIR = results_dir
         web_ui._pickup_store = FakePickupStore()
         web_ui._export_store = FakeExportStore()
+        web_ui._account_mgr = FakeAccountManager()
         try:
             payload = web_ui.app.test_client().get("/api/emails").get_json()
             by_email = {item["email"]: item for item in payload["emails"]}
             assert by_email["new@icloud.com"]["created_at"] == "2026-08-16T12:30:00+08:00"
             assert by_email["old@icloud.com"]["created_at"] == "2026-08-01T02:03:04+00:00"
+            assert by_email["new@icloud.com"]["pickup_url"].endswith("/pickup/token-acc-new")
+            assert by_email["old@icloud.com"]["pickup_url"].endswith("/pickup/existing-old-token")
+            assert by_email["old@icloud.com"]["account_id"] == "acc-current"
             assert "<th>创建时间</th>" in web_ui.UI_HTML
             assert "formatExportTime(e.created_at)" in web_ui.UI_HTML
+            assert "pickupLinksLoaded=true" in web_ui.UI_HTML
         finally:
             web_ui.RESULTS_DIR = original_results
             web_ui._pickup_store = original_pickup
             web_ui._export_store = original_export
+            web_ui._account_mgr = original_manager
     print("  PASS test_email_api_uses_saved_and_pickup_creation_times")
+
+
+def test_pickup_links_api_does_not_call_icloud():
+    """普通查看取件链接只能读取本地存储，不能隐式请求 Apple。"""
+    import web_ui
+
+    class OfflineManager:
+        def get_all_aliases(self):
+            raise AssertionError("不应访问 iCloud")
+
+    class FakePickupStore:
+        def list_all(self):
+            return [{
+                "account_id": "acc-1",
+                "alias_email": "one@icloud.com",
+                "token": "local-token",
+                "created_at": "2026-08-16T10:00:00+00:00",
+            }]
+
+    original_manager = web_ui._account_mgr
+    original_pickup = web_ui._pickup_store
+    web_ui._account_mgr = OfflineManager()
+    web_ui._pickup_store = FakePickupStore()
+    try:
+        payload = web_ui.app.test_client().get("/api/pickup-links").get_json()
+        assert payload["count"] == 1
+        assert payload["links"][0]["url"].endswith("/pickup/local-token")
+    finally:
+        web_ui._account_mgr = original_manager
+        web_ui._pickup_store = original_pickup
+    print("  PASS test_pickup_links_api_does_not_call_icloud")
 
 
 if __name__ == "__main__":
@@ -476,6 +526,7 @@ if __name__ == "__main__":
         ("async_batch_skips_limited_account_and_continues", test_async_batch_skips_limited_account_and_continues),
         ("async_batch_retries_temporary_limit_after_cooldown", test_async_batch_retries_temporary_limit_after_cooldown),
         ("email_api_uses_saved_and_pickup_creation_times", test_email_api_uses_saved_and_pickup_creation_times),
+        ("pickup_links_api_does_not_call_icloud", test_pickup_links_api_does_not_call_icloud),
     ]
     
     passed = 0

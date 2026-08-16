@@ -269,6 +269,12 @@ UI_HTML = UI_HTML.replace(
 ).replace(
     "e.anonymousId=apiData.anonymousId;e.account_name=",
     "e.anonymousId=apiData.anonymousId;e.created_at=apiData.createdAt||e.created_at;e.account_name=",
+).replace(
+    "async function refreshEmails(){var d=await api('/api/emails');emails=d.emails||[];emails.forEach(function(e){",
+    "async function refreshEmails(){var d=await api('/api/emails');emails=d.emails||[];pickupLinksByEmail={};emails.forEach(function(e){if(e.pickup_url)pickupLinksByEmail[String(e.email||'').toLowerCase()]=e.pickup_url;",
+).replace(
+    "e.account_email=acc?(acc.real_email||''):'';});E('emailCount').textContent=emails.length;updateEmailFilter();}",
+    "e.account_email=acc?(acc.real_email||''):'';});pickupLinksLoaded=true;E('emailCount').textContent=emails.length;updateEmailFilter();}",
 )
 
 # ----- Flask Routes -----
@@ -678,9 +684,6 @@ def api_aliases():
 def api_pickup_links():
     """Return opaque pickup URLs; the email address is never embedded in them."""
     try:
-        aliases = _account_mgr.get_all_aliases()
-        _pickup_store.list_for_aliases(aliases)
-        _pickup_store.rebind_stale_accounts(_account_mgr.accounts.keys())
         links = _pickup_store.list_all()
         base = PICKUP_BASE_URL or request.host_url.rstrip("/")
         return jsonify({"links": [
@@ -897,9 +900,13 @@ def pickup_message(token, msg_id):
 def api_emails():
     limit = request.args.get("limit",0,type=int)
     emails = []
-    pickup_created_at = {
-        item.get("alias_email", "").strip().lower(): item.get("created_at", "")
+    pickup_by_email = {
+        item.get("alias_email", "").strip().lower(): item
         for item in _pickup_store.list_all()
+    }
+    pickup_created_at = {
+        email: item.get("created_at", "")
+        for email, item in pickup_by_email.items()
     }
     f = RESULTS_DIR / "latest_emails.txt"
     if f.exists():
@@ -919,7 +926,16 @@ def api_emails():
     emails.reverse()
     history = _export_store.status_map(item["email"] for item in emails)
     exported_count = 0
+    base = PICKUP_BASE_URL or request.host_url.rstrip("/")
     for item in emails:
+        item["pickup_url"] = ""
+        pickup = pickup_by_email.get(item["email"].strip().lower())
+        if pickup:
+            item["account_id"] = pickup["account_id"]
+            item["pickup_url"] = f"{base}/pickup/{pickup['token']}"
+        elif item["account_id"] in _account_mgr.accounts and item["email"]:
+            pickup = _pickup_store.ensure(item["account_id"], item["email"])
+            item["pickup_url"] = f"{base}/pickup/{pickup['token']}"
         record = history.get(item["email"].strip().lower())
         item["exported"] = bool(record)
         item["exported_at"] = record.get("exported_at", "") if record else ""
