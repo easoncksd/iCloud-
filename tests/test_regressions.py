@@ -5,6 +5,7 @@ import sys
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent.parent
@@ -270,6 +271,85 @@ def test_icloud_hme_account_info():
     print("  PASS test_icloud_hme_account_info")
 
 
+def test_create_alias_stops_retrying_on_address_limit():
+    """Apple 明确返回地址上限时不得反复重试"""
+    from icloud_hme import ICloudHME
+
+    client = ICloudHME({}, verbose=False)
+    attempts = []
+    client.generate = lambda: "generated@icloud.com"
+
+    def limited_reserve(*_args, **_kwargs):
+        attempts.append(1)
+        raise RuntimeError("You have reached the limit of addresses you can create right now.")
+
+    client.reserve = limited_reserve
+    try:
+        client.create_alias(max_retries=5)
+        raise AssertionError("地址上限应该抛出异常")
+    except RuntimeError as exc:
+        assert "reached the limit" in str(exc)
+    assert len(attempts) == 1
+    print("  PASS test_create_alias_stops_retrying_on_address_limit")
+
+
+def test_async_batch_skips_limited_account_and_continues():
+    """某个主账号限额后应自动继续下一个账号"""
+    import web_ui
+
+    class FakeManager:
+        accounts = {
+            "limited": {"id": "limited", "name": "limited", "status": "active"},
+            "working": {"id": "working", "name": "working", "status": "active"},
+        }
+
+        def get_account(self, account_id):
+            return self.accounts.get(account_id)
+
+        def create_aliases_for_account(self, account_id, count, _label):
+            if account_id == "limited":
+                return [{"ok": False, "limited": True, "error": "address limit"}]
+            return [
+                {"ok": True, "email": f"ok-{index}@icloud.com", "account_id": account_id}
+                for index in range(count)
+            ]
+
+    original_manager = web_ui._account_mgr
+    with web_ui._batch_lock:
+        original_jobs = web_ui._batch_jobs
+        original_active = web_ui._batch_active_id
+        web_ui._batch_jobs = web_ui.OrderedDict()
+        web_ui._batch_active_id = None
+    web_ui._account_mgr = FakeManager()
+    client = web_ui.app.test_client()
+    try:
+        started = client.post("/api/create-batch", json={
+            "account_ids": ["limited", "working"],
+            "count_per_account": 2,
+            "interval": 0,
+        })
+        assert started.status_code == 202
+        job_id = started.get_json()["job_id"]
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            job = client.get(f"/api/create-batch/{job_id}").get_json()["job"]
+            if job["status"] not in ("queued", "running"):
+                break
+            time.sleep(0.02)
+        assert job["status"] == "completed"
+        assert job["total_created"] == 2
+        assert job["accounts"]["limited"]["status"] == "limited"
+        assert job["accounts"]["working"]["status"] == "completed"
+        assert "create-batch-current" in web_ui.UI_HTML
+        assert 'max="50"' in web_ui.UI_HTML
+    finally:
+        web_ui._account_mgr = original_manager
+        with web_ui._batch_lock:
+            web_ui._batch_jobs = original_jobs
+            web_ui._batch_active_id = original_active
+    print("  PASS test_async_batch_skips_limited_account_and_continues")
+
+
 if __name__ == "__main__":
     tests = [
         ("parse_cookie_header_string", test_parse_cookie_header_string),
@@ -287,6 +367,8 @@ if __name__ == "__main__":
         ("strip_html", test_strip_html),
         ("strip_html_with_link", test_strip_html_with_link),
         ("icloud_hme_account_info", test_icloud_hme_account_info),
+        ("create_alias_stops_retrying_on_address_limit", test_create_alias_stops_retrying_on_address_limit),
+        ("async_batch_skips_limited_account_and_continues", test_async_batch_skips_limited_account_and_continues),
     ]
     
     passed = 0

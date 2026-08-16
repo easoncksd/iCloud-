@@ -40,6 +40,21 @@ from mail_cache import get_cache  # noqa: E402
 class AccountManager:
     """多账号管理器"""
 
+    _CREATE_LIMIT_MARKERS = (
+        "reached the limit of addresses",
+        "maximum number of addresses",
+        "address limit",
+        "quota exceeded",
+        "too many addresses",
+        "rate limit",
+        "too many requests",
+        "429",
+        "达到上限",
+        "超过上限",
+        "创建过多",
+        "操作频繁",
+    )
+
     def __init__(self):
         self.accounts: Dict[str, Dict] = {}
         # _save() also takes this lock; use RLock for callers that update then persist.
@@ -605,6 +620,9 @@ class AccountManager:
                         f.write(f"{email}\t{acc_id}\n")
                     account["alias_total"] = account.get("alias_total", 0) + 1
                     account["alias_active"] = account.get("alias_active", 0) + 1
+                    account["create_status"] = "available"
+                    account["create_last_error"] = None
+                    account["create_limited_at"] = None
                 else:
                     results.append({
                         "email": None,
@@ -614,17 +632,19 @@ class AccountManager:
                     })
             except Exception as e:
                 err_str = str(e)
+                lower = err_str.lower()
+                limited = any(marker in lower for marker in self._CREATE_LIMIT_MARKERS)
                 results.append({
                     "email": None,
                     "account_id": acc_id,
                     "ok": False,
                     "error": err_str[:200],
+                    "limited": limited,
                 })
-                lower = err_str.lower()
-                if any(kw in lower for kw in (
-                    "limit", "exceeded", "maximum", "quota", "429",
-                    "too many", "rate", "throttle",
-                )):
+                account["create_last_error"] = err_str[:300]
+                if limited:
+                    account["create_status"] = "limited"
+                    account["create_limited_at"] = datetime.now().isoformat()
                     break
 
         self._save()

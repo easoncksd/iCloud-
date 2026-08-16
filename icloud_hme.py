@@ -413,6 +413,15 @@ class ICloudHME:
             except Exception as e:
                 last_err = str(e)
                 self._log(f"reserve 失败: {last_err}")
+                lower = last_err.lower()
+                if any(marker in lower for marker in (
+                    "reached the limit of addresses",
+                    "maximum number of addresses",
+                    "address limit",
+                    "quota exceeded",
+                    "too many addresses",
+                )):
+                    break
                 if attempt < max_retries - 1:
                     time.sleep(1)
                     continue
