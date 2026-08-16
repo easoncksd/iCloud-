@@ -341,7 +341,7 @@ def test_async_batch_skips_limited_account_and_continues():
         assert job["accounts"]["limited"]["status"] == "limited"
         assert job["accounts"]["working"]["status"] == "completed"
         assert "create-batch-current" in web_ui.UI_HTML
-        assert 'max="50"' in web_ui.UI_HTML
+        assert 'max="750"' in web_ui.UI_HTML
     finally:
         web_ui._account_mgr = original_manager
         with web_ui._batch_lock:

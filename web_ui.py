@@ -235,10 +235,10 @@ UI_HTML = UI_HTML.replace(
     ".email-table{width:100%;min-width:1100px;",
 ).replace(
     'id="batchCount" value="5" min="1" max="20"',
-    'id="batchCount" value="5" min="1" max="50"',
+    'id="batchCount" value="5" min="1" max="750"',
 ).replace(
     "Math.min(parseInt(E('batchCount').value)||5,20)",
-    "Math.min(parseInt(E('batchCount').value)||5,50)",
+    "Math.min(parseInt(E('batchCount').value)||5,750)",
 )
 
 # ----- Flask Routes -----
@@ -304,7 +304,7 @@ def api_validate_account(acc_id):
 @app.route("/api/accounts/<acc_id>/create", methods=["POST"])
 def api_create_for_account(acc_id):
     data = request.get_json() or {}
-    count = min(int(data.get("count",1)),50)
+    count = min(int(data.get("count",1)),750)
     label = data.get("label","")
     _update_state(creating=True)
     _emit_log("info",f"手动创建: 账号 {acc_id} x{count}")
@@ -424,7 +424,7 @@ def api_create_batch():
     if len(account_ids) > 100:
         return jsonify({"ok": False, "error": "单次最多选择 100 个主账号"}), 400
     try:
-        count = max(1, min(int(data.get("count_per_account", 5)), 50))
+        count = max(1, min(int(data.get("count_per_account", 5)), 750))
         interval = max(0.0, min(float(data.get("interval", 3.0)), 30.0))
     except (TypeError, ValueError):
         return jsonify({"ok": False, "error": "创建数量或间隔无效"}), 400
