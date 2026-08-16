@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """iCloud HME Web UI — 多账号聚合管理平台 — Flask single-page app."""
 import sys, os, json, time, queue, secrets, threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from html import escape as _html_escape
 from pathlib import Path
@@ -32,6 +33,9 @@ PICKUP_BASE_URL = os.environ.get("PICKUP_BASE_URL", "").rstrip("/")
 _pickup_refresh_lock = threading.Lock()
 _pickup_refreshing = set()
 _pickup_last_refresh = {}
+_pickup_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="pickup")
+_pickup_pending = 0
+_PICKUP_MAX_PENDING = 32
 
 _RATE_LIMIT_KW = ["limit","exceeded","maximum","quota","429","too many","try again","unavailable","上限","超过","过多","频繁","rate limit","throttle","blocked"]
 
@@ -380,15 +384,18 @@ def pickup_page(token):
     return Response(html, mimetype="text/html", headers={"Cache-Control": "no-store"})
 
 def _refresh_pickup_mail(token, item):
+    global _pickup_pending
     try:
         _account_mgr.check_alias_mail(item["account_id"], item["alias_email"], limit=20, days=30, force=True)
     finally:
         with _pickup_refresh_lock:
             _pickup_last_refresh[token] = time.time()
             _pickup_refreshing.discard(token)
+            _pickup_pending = max(0, _pickup_pending - 1)
 
 @app.route("/pickup/<token>/messages")
 def pickup_messages(token):
+    global _pickup_pending
     item = _pickup_store.get_by_token(token)
     if not item:
         return jsonify({"error": "取件链接无效或已撤销"}), 404
@@ -396,10 +403,11 @@ def pickup_messages(token):
     now = time.time()
     with _pickup_refresh_lock:
         refreshing = token in _pickup_refreshing
-        if not refreshing and now - _pickup_last_refresh.get(token, 0) >= 12:
+        if not refreshing and now - _pickup_last_refresh.get(token, 0) >= 12 and _pickup_pending < _PICKUP_MAX_PENDING:
             _pickup_refreshing.add(token)
+            _pickup_pending += 1
             refreshing = True
-            threading.Thread(target=_refresh_pickup_mail, args=(token, item), daemon=True).start()
+            _pickup_executor.submit(_refresh_pickup_mail, token, item)
     return jsonify({"emails": cached, "count": len(cached), "refreshing": refreshing}), 200, {"Cache-Control": "no-store"}
 
 @app.route("/api/emails")
