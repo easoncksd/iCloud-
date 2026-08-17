@@ -130,10 +130,6 @@ _BATCH_JOB_HISTORY = 20
 _BATCH_RETRY_DELAY_SECONDS = max(
     1.0, float(os.environ.get("BATCH_RETRY_DELAY_SECONDS", "60"))
 )
-_BATCH_LONG_RETRY_DELAY_SECONDS = max(
-    _BATCH_RETRY_DELAY_SECONDS,
-    float(os.environ.get("BATCH_LONG_RETRY_DELAY_SECONDS", "3600")),
-)
 
 _TEMPORARY_CREATE_LIMIT_MARKERS = (
     "right now",
@@ -397,7 +393,7 @@ UI_HTML = UI_HTML.replace(
     "var entry=JSON.parse(e.data);if((entry.seq||0)<=logCursor)return;logCursor=entry.seq||logCursor;logs.push(entry);",
 ).replace(
     "某个账号触发 Apple 限制时会自动跳过，继续下一个账号。",
-    "某个账号触发 Apple 临时限制时先等待 1 分钟；持续受限后按 60 分钟窗口自动续建。",
+    "某个账号触发 Apple 临时限制时，每次等待 1 分钟后自动续建。",
 ).replace(
     "function exportCSV(){var filter=E('aliasFilter').value;var filtered=filter==='all'?emails:emails.filter(function(e){return e.account_id===filter});var csv='email,account,label,active\\n'+filtered.map(function(e){return e.email+','+(e.account_name||e.account_id||'')+','+(e.label||'')+','+(e.hasOwnProperty('active')?(e.active?'yes':'no'):'');}).join('\\n');var b=new Blob(['\\uFEFF'+csv],{type:'text/csv'}),a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='icloud_aliases.csv';a.click();}",
     "function csvCell(v){v=String(v==null?'':v);if(/^[=+\\-@]/.test(v))v=\"'\"+v;return '\"'+v.replace(/\"/g,'\"\"')+'\"';}function exportCSV(){var filter=E('aliasFilter').value;var filtered=filter==='all'?emails:emails.filter(function(e){return e.account_id===filter});var csv='email,account,label,active\\n'+filtered.map(function(e){return [e.email,e.account_name||e.account_id||'',e.label||'',e.hasOwnProperty('active')?(e.active?'yes':'no'):''].map(csvCell).join(',');}).join('\\n');var b=new Blob(['\\uFEFF'+csv],{type:'text/csv'}),a=document.createElement('a'),u=URL.createObjectURL(b);a.href=u;a.download='icloud_aliases.csv';a.click();setTimeout(function(){URL.revokeObjectURL(u)},1000);}",
@@ -539,11 +535,7 @@ def _create_account_with_cooldown(job, acc_id, count, label, name):
         with _batch_lock:
             entry = job["accounts"][acc_id]
             previous_retries = int(entry.get("retry_count", 0) or 0)
-            retry_delay = (
-                _BATCH_RETRY_DELAY_SECONDS
-                if previous_retries == 0
-                else _BATCH_LONG_RETRY_DELAY_SECONDS
-            )
+            retry_delay = _BATCH_RETRY_DELAY_SECONDS
             retry_at = datetime.now(_BJ_TZ) + timedelta(seconds=retry_delay)
             retry_at_text = retry_at.strftime("%Y-%m-%d %H:%M:%S")
             retry_delay_text = _format_retry_delay(retry_delay)

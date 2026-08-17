@@ -412,7 +412,7 @@ def test_async_batch_retries_temporary_limit_after_cooldown():
         assert job["accounts"]["temporary"]["status"] == "completed"
         assert web_ui._account_mgr.calls == 2
         assert "等待 Apple 限制解除" in web_ui.UI_HTML
-        assert "持续受限后按 60 分钟窗口自动续建" in web_ui.UI_HTML
+        assert "每次等待 1 分钟后自动续建" in web_ui.UI_HTML
     finally:
         web_ui._account_mgr = original_manager
         web_ui._BATCH_RETRY_DELAY_SECONDS = original_delay
@@ -424,7 +424,7 @@ def test_async_batch_retries_temporary_limit_after_cooldown():
     print("  PASS test_async_batch_retries_temporary_limit_after_cooldown")
 
 
-def test_batch_uses_hourly_backoff_after_repeated_limit():
+def test_batch_retries_every_minute_after_repeated_limit():
     """首次限制短探测，连续限制后应按小时窗口等待。"""
     import web_ui
 
@@ -454,7 +454,6 @@ def test_batch_uses_hourly_backoff_after_repeated_limit():
 
     original_manager = web_ui._account_mgr
     original_short = web_ui._BATCH_RETRY_DELAY_SECONDS
-    original_long = web_ui._BATCH_LONG_RETRY_DELAY_SECONDS
     original_state_file = web_ui._BATCH_STATE_FILE
     temp_dir = tempfile.TemporaryDirectory()
     with web_ui._batch_lock:
@@ -465,7 +464,6 @@ def test_batch_uses_hourly_backoff_after_repeated_limit():
     try:
         web_ui._account_mgr = FakeManager()
         web_ui._BATCH_RETRY_DELAY_SECONDS = 0.01
-        web_ui._BATCH_LONG_RETRY_DELAY_SECONDS = 0.02
         web_ui._BATCH_STATE_FILE = Path(temp_dir.name) / "batch_jobs.json"
         client = web_ui.app.test_client()
         started = client.post("/api/create-batch", json={
@@ -483,18 +481,17 @@ def test_batch_uses_hourly_backoff_after_repeated_limit():
         assert job["status"] == "completed"
         assert job["total_created"] == 2
         assert entry["retry_count"] == 2
-        assert entry["retry_delay_seconds"] == 0.02
+        assert entry["retry_delay_seconds"] == 0.01
         assert web_ui._account_mgr.calls == 3
     finally:
         web_ui._account_mgr = original_manager
         web_ui._BATCH_RETRY_DELAY_SECONDS = original_short
-        web_ui._BATCH_LONG_RETRY_DELAY_SECONDS = original_long
         web_ui._BATCH_STATE_FILE = original_state_file
         with web_ui._batch_lock:
             web_ui._batch_jobs = original_jobs
             web_ui._batch_active_id = original_active
         temp_dir.cleanup()
-    print("  PASS test_batch_uses_hourly_backoff_after_repeated_limit")
+    print("  PASS test_batch_retries_every_minute_after_repeated_limit")
 
 
 def test_email_api_uses_saved_and_pickup_creation_times():
@@ -775,7 +772,7 @@ def test_manual_create_rejects_invalid_counts():
             json={"account_ids": ["one"], "count_per_account": value},
         )
         assert response.status_code == 400
-    assert "持续受限后按 60 分钟窗口自动续建" in web_ui.UI_HTML
+    assert "每次等待 1 分钟后自动续建" in web_ui.UI_HTML
     print("  PASS test_manual_create_rejects_invalid_counts")
 
 
@@ -945,7 +942,7 @@ if __name__ == "__main__":
         ("create_alias_stops_retrying_on_address_limit", test_create_alias_stops_retrying_on_address_limit),
         ("async_batch_skips_limited_account_and_continues", test_async_batch_skips_limited_account_and_continues),
         ("async_batch_retries_temporary_limit_after_cooldown", test_async_batch_retries_temporary_limit_after_cooldown),
-        ("batch_uses_hourly_backoff_after_repeated_limit", test_batch_uses_hourly_backoff_after_repeated_limit),
+        ("batch_retries_every_minute_after_repeated_limit", test_batch_retries_every_minute_after_repeated_limit),
         ("email_api_uses_saved_and_pickup_creation_times", test_email_api_uses_saved_and_pickup_creation_times),
         ("pickup_links_api_does_not_call_icloud", test_pickup_links_api_does_not_call_icloud),
         ("runtime_logs_persist_replay_and_resume", test_runtime_logs_persist_replay_and_resume),
