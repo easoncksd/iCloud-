@@ -108,6 +108,7 @@ _pickup_refreshing_accounts = set()
 _pickup_last_account_refresh = {}
 _pickup_refresh_errors = {}
 _pickup_error_log_state = {}
+_removed_account_ids = set()
 _pickup_executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix="pickup")
 _pickup_pending = 0
 _PICKUP_MAX_PENDING = 256
@@ -229,6 +230,8 @@ def _load_batch_state(path=_BATCH_STATE_FILE):
 
 
 _batch_jobs, _batch_active_id = _load_batch_state()
+_manual_create_lock = threading.Lock()
+_manual_creating_accounts = set()
 
 
 def _save_batch_state_locked(path=None):
@@ -457,6 +460,58 @@ UI_HTML = UI_HTML.replace(
     "function csvCell(v){v=String(v==null?'':v);if(/^[=+\\-@]/.test(v))v=\"'\"+v;return '\"'+v.replace(/\"/g,'\"\"')+'\"';}function exportCSV(){var filter=E('aliasFilter').value;var filtered=filter==='all'?emails:emails.filter(function(e){return e.account_id===filter});var csv='email,account,label,active\\n'+filtered.map(function(e){return [e.email,e.account_name||e.account_id||'',e.label||'',e.hasOwnProperty('active')?(e.active?'yes':'no'):''].map(csvCell).join(',');}).join('\\n');var b=new Blob(['\\uFEFF'+csv],{type:'text/csv'}),a=document.createElement('a'),u=URL.createObjectURL(b);a.href=u;a.download='icloud_aliases.csv';a.click();setTimeout(function(){URL.revokeObjectURL(u)},1000);}",
 )
 
+UI_HTML = UI_HTML.replace(
+    '<button class="btn btn-outline btn-sm" onclick="refreshAliases()" title="从 iCloud 云端同步标签和状态">云端同步</button>',
+    '<button class="btn btn-outline btn-sm" id="btnAliasSync" onclick="refreshAliases()" title="从 iCloud 云端同步标签和状态">云端同步</button>',
+).replace(
+    '<div style="display:flex;gap:8px;align-items:center"><select id="inboxAccount" onchange="refreshInbox()">',
+    '<div class="inbox-tools"><select id="inboxAccount" onchange="refreshInbox()">',
+).replace(
+    '<button class="btn btn-outline btn-sm" onclick="refreshInbox()">刷新</button>',
+    '<button class="btn btn-outline btn-sm" id="btnInboxRefresh" onclick="refreshInbox()">刷新</button>',
+).replace(
+    '<button class="btn btn-outline btn-sm" onclick="refreshInbox(true)"',
+    '<button class="btn btn-outline btn-sm" id="btnInboxForce" onclick="refreshInbox(true)"',
+).replace(
+    '<button class="btn btn-outline btn-sm" onclick="searchAliasMail()"',
+    '<button class="btn btn-outline btn-sm" id="btnInboxSearch" onclick="searchAliasMail()"',
+).replace(
+    '<button class="btn btn-outline btn-sm" onclick="checkAliasMail()"',
+    '<button class="btn btn-outline btn-sm" id="btnInboxAll" onclick="checkAliasMail()"',
+).replace(
+    '<a href="appleid.apple.com">appleid.apple.com</a>',
+    '<a href="https://account.apple.com/" target="_blank" rel="noopener noreferrer">account.apple.com</a>',
+).replace(
+    "</style>",
+    ".panel-header{flex-wrap:wrap;gap:10px}.panel-header>div{display:flex;flex-wrap:wrap;gap:8px;align-items:center}.inbox-tools{display:flex;gap:8px;align-items:center}@media(max-width:768px){.panel-header{align-items:flex-start}.inbox-tools{width:100%;align-items:stretch}.inbox-tools select{flex:1 1 220px;min-width:0}.inbox-tools input[type=text]{flex:1 1 220px;width:auto!important;min-width:0}.inbox-tools input[type=number]{flex:0 0 64px}.inbox-tools .btn{flex:1 1 auto}.inbox-tools #cacheStatus{flex-basis:100%;word-break:break-word}.filter-bar .segmented{margin-left:0;max-width:100%;overflow-x:auto}.panel-header>div{width:100%}}</style>",
+)
+
+UI_HTML = UI_HTML.replace(
+    "</style>",
+    "@media(max-width:768px){html,body{width:100%;max-width:100%;overflow-x:hidden}.sidebar{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));width:100%;max-width:100%;overflow-x:hidden}.sidebar .logo,.sidebar .section-label,#sidebarAccounts,.sidebar>button,.sidebar>div:last-child{grid-column:1/-1}.sidebar .logo{width:100%;margin-right:0}.sidebar .nav-item{min-width:0;justify-content:center;text-align:center;padding:8px 4px;font-size:12px;white-space:nowrap}.main,.panel,.panel-header,.panel-body,.inbox-tools{width:100%;min-width:0;max-width:100%}.main{overflow-x:hidden}.inbox-tools>*{min-width:0;max-width:100%}.inbox-tools .btn{flex:1 1 calc(33.333% - 8px);padding-left:8px;padding-right:8px}.inbox-tools #btnInboxSettings{flex-basis:calc(33.333% - 8px)}}</style>",
+)
+
+UI_HTML = UI_HTML.replace("</script></body>", r"""
+var _createBusyByAccount={};
+function setCreateBusy(accId,busy){if(busy)_createBusyByAccount[accId]=true;else delete _createBusyByAccount[accId];document.querySelectorAll('.acc-actions button').forEach(function(btn){var action=btn.getAttribute('onclick')||'';if(action.indexOf("createForAccount('"+accId+"'")>=0)btn.disabled=busy;});}
+async function createForAccount(accId,count){if(_createBusyByAccount[accId]){toast('该账号正在创建，请勿重复点击',true);return}setCreateBusy(accId,true);try{var d=await api('/api/accounts/'+encodeURIComponent(accId)+'/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({count:count})});if(d.ok)toast('成功创建 '+d.created+' 个');else toast('失败: '+(d.error||'?'),true);}finally{setCreateBusy(accId,false);await refreshAll();}}
+function copyAll(){var filtered=visibleAliases();if(!filtered.length){toast('当前筛选下没有邮箱',true);return}navigator.clipboard.writeText(filtered.map(function(e){return e.email}).join('\n')).then(function(){toast('已复制 '+filtered.length+' 个')});}
+function exportCSV(){var filtered=visibleAliases();if(!filtered.length){toast('当前筛选下没有邮箱',true);return}var csv='email,account,label,active\n'+filtered.map(function(e){return [e.email,e.account_name||e.account_id||'',e.label||'',e.hasOwnProperty('active')?(e.active?'yes':'no'):''].map(csvCell).join(',');}).join('\n');var b=new Blob(['\uFEFF'+csv],{type:'text/csv'}),a=document.createElement('a'),u=URL.createObjectURL(b);a.href=u;a.download='icloud_aliases.csv';a.click();setTimeout(function(){URL.revokeObjectURL(u)},1000);toast('已导出 '+filtered.length+' 个');}
+var _aliasesBusy=false;
+async function refreshAliases(){if(_aliasesBusy){toast('云端同步正在进行',true);return}_aliasesBusy=true;var btn=E('btnAliasSync');if(btn){btn.disabled=true;btn.textContent='同步中...'}try{var d=await api('/api/aliases',{timeout:120000});if(d.error&&d.ok===false){toast('云端同步失败: '+d.error,true);return}var apiAliases=d.aliases||[],apiMap={};apiAliases.forEach(function(a){apiMap[String(a.email||'').toLowerCase()]=a;});emails.forEach(function(e){var apiData=apiMap[String(e.email||'').toLowerCase()];if(apiData){e.label=apiData.label||'';e.active=apiData.active;e.anonymousId=apiData.anonymousId;e.created_at=apiData.createdAt||e.created_at;e.account_name=apiData.account_name||e.account_name;e.account_email=apiData.account_email||e.account_email;}});E('emailCount').textContent=emails.length;updateEmailFilter();renderAliasTable();var failed=Object.keys(d.failures||{});if(failed.length){toast('同步完成，但有 '+failed.length+' 个账号失败',true)}else{toast('云端同步完成: '+apiAliases.length+' 个邮箱')}}finally{_aliasesBusy=false;if(btn){btn.disabled=false;btn.textContent='云端同步'}}}
+var _inboxRequestSeq=0;var _inboxRenderedAccount='';
+function setInboxBusy(busy){_inboxBusy=busy;['btnInboxSearch','btnInboxAll'].forEach(function(id){var btn=E(id);if(btn)btn.disabled=busy});}
+function beginInboxRequest(){if(_inboxSse){_inboxSse.close();_inboxSse=null}_inboxStreamMsgs=[];_inboxRequestSeq+=1;setInboxBusy(true);return _inboxRequestSeq;}
+function inboxRequestCurrent(seq,accId){return seq===_inboxRequestSeq&&E('inboxAccount').value===accId;}
+function finishInboxRequest(seq){if(seq!==_inboxRequestSeq)return;setInboxBusy(false);}
+function refreshInbox(force){var accId=E('inboxAccount').value;if(!accId){beginInboxRequest();finishInboxRequest(_inboxRequestSeq);E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>请先选择账号</div>';return}var seq=beginInboxRequest();var limit=parseInt(E('inboxLimit').value)||20;if(force){E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>强制刷新中...</div>';api('/api/accounts/'+encodeURIComponent(accId)+'/inbox?limit='+limit+'&force=1',{timeout:120000}).then(function(d){if(!inboxRequestCurrent(seq,accId))return;if(d.error){E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>'+esc(d.error||'连接失败')+'</div>';finishInboxRequest(seq);return}renderInboxMsgs(d.emails||[],'收件箱 ('+(d.count||0)+' 封)',accId);updateCacheStatus(d.cached);finishInboxRequest(seq);});return}startInboxStream(accId,seq);}
+function startInboxStream(accId,seq){E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>正在逐条拉取邮件...</div>';var limit=parseInt(E('inboxLimit').value)||20;var source=new EventSource('/api/accounts/'+encodeURIComponent(accId)+'/inbox-stream?limit='+limit);_inboxSse=source;source.onmessage=function(e){if(!inboxRequestCurrent(seq,accId)||_inboxSse!==source){source.close();return}try{var d=JSON.parse(e.data);if(d.type==='email'){_inboxStreamMsgs.push(d.email);renderInboxMsgs(_inboxStreamMsgs,'收件箱 ('+d.count+' 封, 加载中...)',accId)}else if(d.type==='done'){source.close();_inboxSse=null;renderInboxMsgs(_inboxStreamMsgs,'收件箱 ('+d.count+' 封)',accId);finishInboxRequest(seq)}else if(d.type==='error'){source.close();_inboxSse=null;E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>'+esc(d.error||'连接失败')+'</div>';finishInboxRequest(seq)}}catch(_){}};source.onerror=function(){if(!inboxRequestCurrent(seq,accId)||_inboxSse!==source){source.close();return}source.close();_inboxSse=null;if(_inboxStreamMsgs.length){renderInboxMsgs(_inboxStreamMsgs,'收件箱 ('+_inboxStreamMsgs.length+' 封, 连接中断)',accId)}else{E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>连接失败</div>'}finishInboxRequest(seq);};}
+async function searchAliasMail(){var accId=E('inboxAccount').value,alias=E('aliasSearchInput').value.trim();if(!accId){toast('请先选择账号',true);return}if(!alias){toast('请输入隐私邮箱地址',true);return}var seq=beginInboxRequest();E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>查询 '+esc(alias)+' ...</div>';var d=await api('/api/accounts/'+encodeURIComponent(accId)+'/mail/'+encodeURIComponent(alias)+'?limit=30',{timeout:120000});if(!inboxRequestCurrent(seq,accId))return;if(d.error){E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>'+esc(d.error)+'</div>'}else{renderInboxMsgs(d.emails||[],esc(alias)+' ('+(d.count||0)+' 封)',accId)}finishInboxRequest(seq);}
+async function checkAliasMail(){var accId=E('inboxAccount').value;if(!accId){toast('请先选择账号',true);return}var seq=beginInboxRequest();E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>正在检查各别名的收件...</div>';var d=await api('/api/accounts/'+encodeURIComponent(accId)+'/alias-mail',{timeout:120000});if(!inboxRequestCurrent(seq,accId))return;if(d.error){E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>'+esc(d.error||'查询失败')+'</div>';finishInboxRequest(seq);return}var byAlias=d.by_alias||{},total=0,aliasKeys=Object.keys(byAlias),h='';if(!aliasKeys.length){E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>所有隐私邮箱暂无收件</div>';finishInboxRequest(seq);return}aliasKeys.forEach(function(alias){var msgs=byAlias[alias]||[];total+=msgs.length;h+='<div style="padding:8px 14px;border-bottom:1px solid var(--rule);font-weight:600;font-size:13px;background:var(--paper-dim)">'+esc(alias)+' ('+msgs.length+' 封)</div>';msgs.forEach(function(m){h+='<div style="padding:6px 20px;border-bottom:1px solid var(--rule);font-size:12px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:4px"><span><strong>'+esc(m.subject||'(无主题)')+'</strong></span><span style="color:var(--ink-soft)">'+esc(m.from||'').substring(0,30)+'</span><span style="color:var(--ink-faint);font-size:11px">'+(m.date||'').substring(0,19)+'</span></div>'});});E('inboxMsgs').innerHTML='<div style="font-size:11px;color:var(--ink-faint);padding:8px 14px;border-bottom:1px solid var(--rule)">共 '+aliasKeys.length+' 个别名收到 '+total+' 封邮件</div>'+h;finishInboxRequest(seq);}
+function renderInboxMsgs(msgs,title,accountId){_inboxRenderedAccount=accountId||E('inboxAccount').value;if(!msgs.length){E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>收件箱为空</div>';return}var h='<div style="font-size:11px;color:var(--ink-faint);padding:8px 16px;border-bottom:1px solid var(--rule)">'+esc(title)+'</div>';msgs.forEach(function(m,i){var mid=m.id||'m'+i;h+='<div class="email-item" style="border-bottom:1px solid var(--rule);cursor:pointer" onclick="toggleEmail(\''+escAttr(mid)+'\',\''+escAttr(m.id||'')+'\',\''+escAttr(_inboxRenderedAccount)+'\')"><div style="padding:12px 16px;display:flex;justify-content:space-between;align-items:flex-start;gap:12px"><div style="flex:1;min-width:0"><div style="font-weight:600;font-size:14px;margin-bottom:4px">'+esc(m.subject||'(无主题)')+'</div><div style="font-size:12px;color:var(--ink-soft)">'+esc(m.from||'')+'</div><div style="font-size:11px;color:var(--ink-faint);margin-top:2px">To: '+esc((m.to||'').substring(0,50))+'</div></div><div style="font-size:11px;color:var(--ink-faint);white-space:nowrap;text-align:right">'+(m.date||'').substring(0,19)+'</div></div><div id="'+escAttr(mid)+'_body" style="display:none;padding:0 16px 16px;font-size:13px;line-height:1.7;color:var(--ink-soft);white-space:pre-wrap;word-break:break-word;max-height:400px;overflow-y:auto;border-top:1px solid var(--rule)"></div></div>'});E('inboxMsgs').innerHTML=h;}
+async function toggleEmail(domId,msgId,accountId){var bodyEl=E(domId+'_body');if(!bodyEl)return;if(_expandedEmail&&_expandedEmail!==domId){var prev=E(_expandedEmail+'_body');if(prev)prev.style.display='none'}if(bodyEl.style.display==='block'){bodyEl.style.display='none';_expandedEmail=null;return}bodyEl.style.display='block';_expandedEmail=domId;if(bodyEl.textContent.trim()&&bodyEl.textContent!=='加载中...')return;bodyEl.textContent='加载中...';if(!msgId||!accountId){bodyEl.textContent='(无法获取邮件正文)';return}var d=await api('/api/accounts/'+encodeURIComponent(accountId)+'/message/'+encodeURIComponent(msgId),{timeout:120000});if(!d.ok||!d.message){bodyEl.textContent='(获取失败: '+(d.error||'未知')+')';return}bodyEl.textContent=d.message.body||'(无正文内容)';}
+</script></body>""")
+
 # ----- Flask Routes -----
 
 @app.route("/")
@@ -489,7 +544,8 @@ def api_add_account():
     data = request.get_json() or {}
     name = data.get("name","未命名账号")
     cookie_input = data.get("cookie_input","")
-    if not cookie_input: return jsonify({"ok":False,"error":"请提供 cookie_input"})
+    if not cookie_input:
+        return jsonify({"ok":False,"error":"请提供 cookie_input"}), 400
     try:
         account = _account_mgr.add_account(name, cookie_input)
         _emit_log("info",f"添加账号: {account.get('name','')} ({account.get('real_email','?')})")
@@ -498,13 +554,95 @@ def api_add_account():
         if not ok:
             payload["error"] = account.get("last_error") or "账号校验失败"
         return jsonify(payload), 200 if ok else 400
-    except ValueError as e: return jsonify({"ok":False,"error":str(e)})
-    except Exception as e: return jsonify({"ok":False,"error":str(e)})
+    except ValueError as e:
+        return jsonify({"ok":False,"error":str(e)}), 400
+    except Exception as e:
+        return jsonify({"ok":False,"error":str(e)}), 500
+
+
+def _batch_uses_account(acc_id):
+    with _batch_lock:
+        if not _batch_active_id:
+            return False
+        job = _batch_jobs.get(_batch_active_id) or {}
+        if job.get("status") not in ("queued", "running"):
+            return False
+        item = (job.get("accounts") or {}).get(acc_id) or {}
+        return item.get("status") in ("queued", "running", "waiting")
+
+
+def _remove_latest_emails_for_account(acc_id):
+    latest_file = RESULTS_DIR / "latest_emails.txt"
+    if not latest_file.exists():
+        return 0
+    with _account_mgr._latest_emails_lock:
+        lines = latest_file.read_text(encoding="utf-8").splitlines()
+        kept = []
+        removed = 0
+        for line in lines:
+            parts = line.split("\t")
+            if len(parts) > 1 and parts[1].strip() == acc_id:
+                removed += 1
+            else:
+                kept.append(line)
+        if removed:
+            tmp = latest_file.with_suffix(latest_file.suffix + ".tmp")
+            payload = "\n".join(kept)
+            if payload:
+                payload += "\n"
+            with open(tmp, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, latest_file)
+    return removed
+
+
+def _purge_account_data(acc_id):
+    global _pickup_body_cache_bytes
+    with _pickup_refresh_lock:
+        _removed_account_ids.add(acc_id)
+    stats = {
+        "pickup_links": _pickup_store.revoke_account(acc_id),
+        "latest_emails": _remove_latest_emails_for_account(acc_id),
+        "export_history": _export_store.delete_account(acc_id),
+    }
+    _account_mgr._cache.clear_account(acc_id)
+    _pickup_body_store.delete_account(acc_id)
+    with _pickup_refresh_lock:
+        _pickup_refreshing_accounts.discard(acc_id)
+        _pickup_last_account_refresh.pop(acc_id, None)
+        _pickup_refresh_errors.pop(acc_id, None)
+        _pickup_error_log_state.pop(acc_id, None)
+    with _pickup_refresh_lock:
+        for key in list(_pickup_body_cache):
+            if key[0] == acc_id:
+                cached = _pickup_body_cache.pop(key, None)
+                if cached:
+                    _pickup_body_cache_bytes -= cached[0]
+        for key in list(_pickup_body_refreshing):
+            if key[0] == acc_id:
+                _pickup_body_refreshing.discard(key)
+    return stats
 
 @app.route("/api/accounts/<acc_id>/remove", methods=["POST"])
 def api_remove_account(acc_id):
+    if not _account_mgr.get_account(acc_id):
+        return jsonify({"ok":False,"error":"账号不存在"}), 404
+    with _manual_create_lock:
+        manual_busy = acc_id in _manual_creating_accounts
+    if manual_busy or _batch_uses_account(acc_id):
+        return jsonify({"ok":False,"error":"账号正在创建邮箱，暂时不能删除"}), 409
+    with _pickup_refresh_lock:
+        _removed_account_ids.add(acc_id)
     ok = _account_mgr.remove_account(acc_id)
-    return jsonify({"ok":ok})
+    if not ok:
+        with _pickup_refresh_lock:
+            _removed_account_ids.discard(acc_id)
+        return jsonify({"ok":False,"error":"账号不存在"}), 404
+    cleanup = _purge_account_data(acc_id)
+    _emit_log("info", f"删除账号并清理本地数据: {acc_id}")
+    return jsonify({"ok":True,"cleanup":cleanup})
 
 @app.route("/api/accounts/<acc_id>/validate", methods=["POST"])
 def api_validate_account(acc_id):
@@ -536,6 +674,12 @@ def api_create_for_account(acc_id):
         return jsonify({"ok": False, "error": "创建数量无效"}), 400
     if count < 1 or count > 750:
         return jsonify({"ok": False, "error": "创建数量必须在 1 到 750 之间"}), 400
+    if not _account_mgr.get_account(acc_id):
+        return jsonify({"ok": False, "error": "账号不存在"}), 404
+    with _manual_create_lock:
+        if acc_id in _manual_creating_accounts or _batch_uses_account(acc_id):
+            return jsonify({"ok": False, "error": "该账号已有创建任务正在运行"}), 409
+        _manual_creating_accounts.add(acc_id)
     label = data.get("label","")
     _update_state(creating=True)
     _emit_log("info",f"手动创建: 账号 {acc_id} x{count}")
@@ -545,13 +689,16 @@ def api_create_for_account(acc_id):
         )
         created = [r["email"] for r in results if r.get("ok")]
         errors = [r["error"] for r in results if not r.get("ok")]
-        _update_state(creating=False)
         _increment_state(today_created=len(created), total_created=len(created))
         if created: _emit_log("success",f"创建完成: {len(created)} 个")
-        return jsonify({"ok":len(created)>0,"emails":created,"created":len(created),"errors":len(errors),"error":errors[0] if errors else None})
+        status = 200 if created else 400
+        return jsonify({"ok":len(created)>0,"emails":created,"created":len(created),"errors":len(errors),"error":errors[0] if errors else None}), status
     except Exception as e:
+        return jsonify({"ok":False,"error":str(e)}), 500
+    finally:
+        with _manual_create_lock:
+            _manual_creating_accounts.discard(acc_id)
         _update_state(creating=False)
-        return jsonify({"ok":False,"error":str(e)})
 
 def _batch_job_snapshot(job_id):
     with _batch_lock:
@@ -819,6 +966,15 @@ def api_create_batch():
         return jsonify({"ok": False, "error": "每账号创建数量必须在 1 到 750 之间"}), 400
     label = str(data.get("label") or "")[:100]
 
+    with _manual_create_lock:
+        busy_ids = [acc_id for acc_id in account_ids if acc_id in _manual_creating_accounts]
+    if busy_ids:
+        return jsonify({
+            "ok": False,
+            "error": "所选账号中已有手动创建任务正在运行",
+            "account_ids": busy_ids,
+        }), 409
+
     with _batch_lock:
         if _batch_active_id:
             active = _batch_jobs.get(_batch_active_id)
@@ -887,7 +1043,8 @@ def api_set_app_password(acc_id):
     data = request.get_json() or {}
     pwd = data.get("app_password","").strip()
     icloud_email = data.get("icloud_email","").strip()
-    if not pwd: return jsonify({"ok":False,"error":"密码不能为空"})
+    if not pwd:
+        return jsonify({"ok":False,"error":"密码不能为空"}), 400
     try:
         account = _account_mgr.get_account(acc_id)
         if not account:
@@ -991,9 +1148,20 @@ def api_alias_mail(acc_id):
 @app.route("/api/aliases")
 def api_aliases():
     try:
-        aliases = _account_mgr.get_all_aliases()
-        return jsonify({"aliases":aliases,"count":len(aliases)})
-    except Exception as e: return jsonify({"aliases":[],"count":0,"error":str(e)})
+        aliases, accounts = _account_mgr.get_all_aliases_with_status(max_workers=5)
+        failures = {
+            acc_id: status for acc_id, status in accounts.items()
+            if not status.get("ok")
+        }
+        return jsonify({
+            "ok": not failures,
+            "aliases": aliases,
+            "count": len(aliases),
+            "accounts": accounts,
+            "failures": failures,
+        })
+    except Exception as e:
+        return jsonify({"ok":False,"aliases":[],"count":0,"error":str(e)}), 500
 
 @app.route("/api/pickup-links")
 def api_pickup_links():
@@ -1095,6 +1263,9 @@ def _prepare_pickup_message(message):
 
 def _store_pickup_body(account_id, msg_id, message):
     prepared = _prepare_pickup_message(message)
+    with _pickup_refresh_lock:
+        if account_id in _removed_account_ids:
+            return prepared
     _pickup_body_store.put(account_id, str(msg_id), prepared)
     with _pickup_refresh_lock:
         _cache_pickup_body_locked((account_id, str(msg_id)), prepared)
@@ -1104,11 +1275,20 @@ def _store_pickup_body(account_id, msg_id, message):
 def _refresh_pickup_account(account_id):
     global _pickup_pending
     try:
+        with _pickup_refresh_lock:
+            if account_id in _removed_account_ids:
+                return
         # Pickup links already contain the alias mapping. Avoid the iCloud HME
         # API here so an expired browser cookie cannot block IMAP delivery.
         links = _pickup_store.list_for_account(account_id)
         aliases = [item.get("alias_email", "") for item in links]
         synced = _account_mgr.sync_pickup_mail(account_id, aliases, scan_limit=100, days=30)
+        with _pickup_refresh_lock:
+            removed = account_id in _removed_account_ids
+        if removed:
+            _account_mgr._cache.clear_account(account_id)
+            _pickup_body_store.delete_account(account_id)
+            return
         for msg_id, message in synced.get("bodies", {}).items():
             _store_pickup_body(account_id, msg_id, message)
 
@@ -1172,6 +1352,8 @@ def _schedule_pickup_account_refresh(account_id):
     global _pickup_pending
     now = time.time()
     with _pickup_refresh_lock:
+        if account_id in _removed_account_ids:
+            return False
         if account_id in _pickup_refreshing_accounts:
             return True
         if now - _pickup_last_account_refresh.get(account_id, 0) < _PICKUP_SYNC_INTERVAL_SECONDS:

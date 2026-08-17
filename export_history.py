@@ -94,6 +94,20 @@ class ExportHistoryStore:
                 self._save()
         return restored
 
+    def delete_account(self, account_id):
+        """Delete export records that belong to a removed account."""
+        account_id = str(account_id or "")
+        with self._lock:
+            emails = [
+                email for email, record in self._records.items()
+                if str(record.get("account_id") or "") == account_id
+            ]
+            for email in emails:
+                del self._records[email]
+            if emails:
+                self._save()
+            return len(emails)
+
     def rebind_accounts(self, account_mapping, alias_accounts=None):
         """Update export ownership after account IDs change."""
         alias_accounts = alias_accounts or {}

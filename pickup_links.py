@@ -115,6 +115,23 @@ class PickupLinkStore:
             self._reindex()
             return True
 
+    def revoke_account(self, account_id):
+        """Revoke every public pickup URL owned by an account."""
+        account_id = str(account_id or "").strip()
+        if not account_id:
+            return 0
+        with self._lock:
+            keys = [
+                key for key, item in self._links.items()
+                if item.get("account_id") == account_id
+            ]
+            for key in keys:
+                del self._links[key]
+            if keys:
+                self._save()
+                self._reindex()
+            return len(keys)
+
     def list_for_aliases(self, aliases):
         return [self.ensure(a["account_id"], a["email"]) for a in aliases if a.get("account_id") and a.get("email")]
 

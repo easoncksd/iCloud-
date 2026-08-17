@@ -1073,6 +1073,198 @@ def test_pickup_page_uses_adaptive_refresh():
     print("  PASS test_pickup_page_uses_adaptive_refresh")
 
 
+def test_export_actions_respect_visible_filter_and_mobile_controls():
+    import web_ui
+
+    html = web_ui.UI_HTML
+    assert "function copyAll(){var filtered=visibleAliases();" in html
+    assert "function exportCSV(){var filtered=visibleAliases();" in html
+    assert 'class="inbox-tools"' in html
+    assert "inboxRequestCurrent(seq,accId)" in html
+    assert "toggleEmail(domId,msgId,accountId)" in html
+    assert 'href="https://account.apple.com/"' in html
+    assert 'id="btnAliasSync"' in html
+    print("  PASS test_export_actions_respect_visible_filter_and_mobile_controls")
+
+
+def test_account_alias_sync_is_parallel_and_reports_failures():
+    from account_manager import AccountManager
+
+    manager = object.__new__(AccountManager)
+    manager.accounts = {
+        "one": {"name": "One", "real_email": "one@icloud.com"},
+        "two": {"name": "Two", "real_email": "two@icloud.com"},
+        "bad": {"name": "Bad", "real_email": "bad@icloud.com"},
+    }
+
+    def fetch(acc_id, raise_errors=False):
+        time.sleep(0.15)
+        if acc_id == "bad":
+            raise RuntimeError("expired session")
+        return [{"email": f"{acc_id}@icloud.com"}]
+
+    manager.get_aliases_for_account = fetch
+    started = time.monotonic()
+    aliases, statuses = manager.get_all_aliases_with_status(max_workers=5)
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.35
+    assert {item["account_id"] for item in aliases} == {"one", "two"}
+    assert statuses["one"]["ok"] is True
+    assert statuses["bad"]["ok"] is False
+    assert "expired session" in statuses["bad"]["error"]
+    print("  PASS test_account_alias_sync_is_parallel_and_reports_failures")
+
+
+def test_manual_create_conflict_and_input_status_codes():
+    import web_ui
+
+    class FakeManager:
+        def get_account(self, acc_id):
+            return {"id": acc_id} if acc_id == "busy" else None
+
+    original_manager = web_ui._account_mgr
+    original_busy = set(web_ui._manual_creating_accounts)
+    try:
+        web_ui._account_mgr = FakeManager()
+        web_ui._manual_creating_accounts.clear()
+        web_ui._manual_creating_accounts.add("busy")
+        client = web_ui.app.test_client()
+        response = client.post("/api/accounts/busy/create", json={"count": 1})
+        assert response.status_code == 409
+        assert response.get_json()["ok"] is False
+        assert client.post("/api/accounts/add", json={}).status_code == 400
+        assert client.post(
+            "/api/accounts/busy/app-password", json={"app_password": ""}
+        ).status_code == 400
+        assert client.post("/api/accounts/missing/remove").status_code == 404
+    finally:
+        web_ui._account_mgr = original_manager
+        web_ui._manual_creating_accounts.clear()
+        web_ui._manual_creating_accounts.update(original_busy)
+    print("  PASS test_manual_create_conflict_and_input_status_codes")
+
+
+def test_remove_account_purges_all_local_data():
+    import web_ui
+
+    class FakeCache:
+        def __init__(self):
+            self.cleared = []
+
+        def clear_account(self, acc_id):
+            self.cleared.append(acc_id)
+
+    class FakeManager:
+        def __init__(self):
+            import threading
+            self._latest_emails_lock = threading.Lock()
+            self._cache = FakeCache()
+            self.removed = []
+
+        def get_account(self, acc_id):
+            return {"id": acc_id} if acc_id == "one" else None
+
+        def remove_account(self, acc_id):
+            self.removed.append(acc_id)
+            return True
+
+    class FakePickup:
+        def __init__(self):
+            self.revoked = []
+
+        def revoke_account(self, acc_id):
+            self.revoked.append(acc_id)
+            return 2
+
+    class FakeExports:
+        def __init__(self):
+            self.deleted = []
+
+        def delete_account(self, acc_id):
+            self.deleted.append(acc_id)
+            return 2
+
+    class FakeBodies:
+        def __init__(self):
+            self.deleted = []
+
+        def delete_account(self, acc_id):
+            self.deleted.append(acc_id)
+
+    originals = (
+        web_ui._account_mgr, web_ui._pickup_store, web_ui._export_store,
+        web_ui._pickup_body_store, web_ui.RESULTS_DIR, web_ui._emit_log,
+        set(web_ui._removed_account_ids),
+    )
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            manager = FakeManager()
+            pickup = FakePickup()
+            exports = FakeExports()
+            bodies = FakeBodies()
+            web_ui._account_mgr = manager
+            web_ui._pickup_store = pickup
+            web_ui._export_store = exports
+            web_ui._pickup_body_store = bodies
+            web_ui.RESULTS_DIR = Path(td)
+            web_ui._emit_log = lambda *_args: None
+            web_ui._removed_account_ids.clear()
+            (Path(td) / "latest_emails.txt").write_text(
+                "a@icloud.com\tone\t2026-08-17\n"
+                "b@icloud.com\ttwo\t2026-08-17\n",
+                encoding="utf-8",
+            )
+            response = web_ui.app.test_client().post("/api/accounts/one/remove")
+            payload = response.get_json()
+            assert response.status_code == 200
+            assert payload["cleanup"] == {
+                "pickup_links": 2,
+                "latest_emails": 1,
+                "export_history": 2,
+            }
+            assert pickup.revoked == ["one"]
+            assert exports.deleted == ["one"]
+            assert bodies.deleted == ["one"]
+            assert manager._cache.cleared == ["one"]
+            remaining = (Path(td) / "latest_emails.txt").read_text(encoding="utf-8")
+            assert "\tone\t" not in remaining
+            assert "\ttwo\t" in remaining
+        finally:
+            (
+                web_ui._account_mgr, web_ui._pickup_store, web_ui._export_store,
+                web_ui._pickup_body_store, web_ui.RESULTS_DIR, web_ui._emit_log,
+                removed_ids,
+            ) = originals
+            web_ui._removed_account_ids.clear()
+            web_ui._removed_account_ids.update(removed_ids)
+    print("  PASS test_remove_account_purges_all_local_data")
+
+
+def test_alias_api_returns_partial_failure_details():
+    import web_ui
+
+    class FakeManager:
+        def get_all_aliases_with_status(self, max_workers=5):
+            assert max_workers == 5
+            return ([{"email": "ok@icloud.com"}], {
+                "one": {"ok": True, "count": 1},
+                "two": {"ok": False, "count": 0, "error": "expired"},
+            })
+
+    original = web_ui._account_mgr
+    try:
+        web_ui._account_mgr = FakeManager()
+        response = web_ui.app.test_client().get("/api/aliases")
+        payload = response.get_json()
+        assert response.status_code == 200
+        assert payload["ok"] is False
+        assert payload["count"] == 1
+        assert payload["failures"]["two"]["error"] == "expired"
+    finally:
+        web_ui._account_mgr = original
+    print("  PASS test_alias_api_returns_partial_failure_details")
+
+
 if __name__ == "__main__":
     tests = [
         ("parse_cookie_header_string", test_parse_cookie_header_string),
@@ -1107,6 +1299,11 @@ if __name__ == "__main__":
         ("batch_runs_accounts_in_parallel_and_creates_pickup_links", test_batch_runs_accounts_in_parallel_and_creates_pickup_links),
         ("stale_account_storage_rebinds_without_duplicates", test_stale_account_storage_rebinds_without_duplicates),
         ("pickup_page_uses_adaptive_refresh", test_pickup_page_uses_adaptive_refresh),
+        ("export_actions_respect_visible_filter_and_mobile_controls", test_export_actions_respect_visible_filter_and_mobile_controls),
+        ("account_alias_sync_is_parallel_and_reports_failures", test_account_alias_sync_is_parallel_and_reports_failures),
+        ("manual_create_conflict_and_input_status_codes", test_manual_create_conflict_and_input_status_codes),
+        ("remove_account_purges_all_local_data", test_remove_account_purges_all_local_data),
+        ("alias_api_returns_partial_failure_details", test_alias_api_returns_partial_failure_details),
     ]
     
     passed = 0

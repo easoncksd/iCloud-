@@ -25,6 +25,7 @@ import random
 import time
 import uuid
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Any
@@ -742,22 +743,62 @@ class AccountManager:
 
         return all_results
 
-    def get_aliases_for_account(self, acc_id: str) -> List[Dict]:
+    def get_aliases_for_account(
+        self, acc_id: str, raise_errors: bool = False
+    ) -> List[Dict]:
         try:
-            client = self.get_client(acc_id, verbose=False)
-            return client.list_aliases()
+            with self._operation_lock(acc_id):
+                client = self.get_client(acc_id, verbose=False)
+                return client.list_aliases()
         except Exception:
+            if raise_errors:
+                raise
             return []
 
-    def get_all_aliases(self) -> List[Dict]:
+    def get_all_aliases_with_status(self, max_workers: int = 5):
+        """Fetch accounts concurrently and retain per-account failures."""
         all_aliases: List[Dict] = []
-        for acc_id, account in self.accounts.items():
-            for alias in self.get_aliases_for_account(acc_id):
-                alias["account_id"] = acc_id
-                alias["account_name"] = account.get("name", "")
-                alias["account_email"] = account.get("real_email", "")
-                all_aliases.append(alias)
-        return all_aliases
+        statuses: Dict[str, Dict] = {}
+        accounts = list(self.accounts.items())
+        if not accounts:
+            return all_aliases, statuses
+
+        workers = max(1, min(int(max_workers or 1), 5, len(accounts)))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(
+                    self.get_aliases_for_account, acc_id, True
+                ): (acc_id, account)
+                for acc_id, account in accounts
+            }
+            for future in as_completed(futures):
+                acc_id, account = futures[future]
+                try:
+                    aliases = future.result()
+                    statuses[acc_id] = {
+                        "ok": True,
+                        "count": len(aliases),
+                        "name": account.get("name", ""),
+                    }
+                except Exception as exc:
+                    statuses[acc_id] = {
+                        "ok": False,
+                        "count": 0,
+                        "name": account.get("name", ""),
+                        "error": str(exc)[:200],
+                    }
+                    continue
+                for alias in aliases:
+                    alias = dict(alias)
+                    alias["account_id"] = acc_id
+                    alias["account_name"] = account.get("name", "")
+                    alias["account_email"] = account.get("real_email", "")
+                    all_aliases.append(alias)
+        return all_aliases, statuses
+
+    def get_all_aliases(self) -> List[Dict]:
+        aliases, _statuses = self.get_all_aliases_with_status()
+        return aliases
 
     def get_summary(self) -> Dict:
         total_aliases = sum(
