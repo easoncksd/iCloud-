@@ -130,6 +130,43 @@ class MailBodyStore:
             )
             self._conn.commit()
 
+    def rebind_accounts(self, account_mapping):
+        """Move persisted bodies to replacement account IDs without losing newer rows."""
+        moved = 0
+        with self._lock:
+            for old_id, new_id in account_mapping.items():
+                old_key, new_key = self._key(old_id), self._key(new_id)
+                if not old_key or not new_key or old_key == new_key:
+                    continue
+                rows = self._conn.execute(
+                    "SELECT message_id, payload, payload_bytes, updated_ns "
+                    "FROM message_bodies WHERE account_id=?",
+                    (old_key,),
+                ).fetchall()
+                for message_id, payload, payload_bytes, updated_ns in rows:
+                    self._conn.execute(
+                        """
+                        INSERT INTO message_bodies(
+                            account_id, message_id, payload, payload_bytes, updated_ns
+                        ) VALUES(?,?,?,?,?)
+                        ON CONFLICT(account_id, message_id) DO UPDATE SET
+                            payload=excluded.payload,
+                            payload_bytes=excluded.payload_bytes,
+                            updated_ns=excluded.updated_ns
+                        WHERE excluded.updated_ns > message_bodies.updated_ns
+                        """,
+                        (new_key, message_id, payload, payload_bytes, updated_ns),
+                    )
+                if rows:
+                    self._conn.execute(
+                        "DELETE FROM message_bodies WHERE account_id=?", (old_key,)
+                    )
+                    moved += len(rows)
+            if moved:
+                self._prune_locked()
+                self._conn.commit()
+        return moved
+
     def stats(self):
         with self._lock:
             count, total = self._conn.execute(

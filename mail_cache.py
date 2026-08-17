@@ -159,6 +159,46 @@ class MailCache:
             self._data = {}
             self._save()
 
+    def rebind_accounts(self, account_mapping: Dict[str, str]) -> int:
+        """Merge cache partitions after an account is re-imported with a new ID."""
+        moved = 0
+        with self._lock:
+            for old_id, new_id in account_mapping.items():
+                if not old_id or not new_id or old_id == new_id or old_id not in self._data:
+                    continue
+                source = self._data.pop(old_id)
+                self._ensure_account(new_id)
+                target = self._data[new_id]
+
+                existing_ids = {
+                    str(message.get("id"))
+                    for message in target.get("inbox_emails", [])
+                }
+                for message in source.get("inbox_emails", []):
+                    message_id = str(message.get("id"))
+                    if message_id not in existing_ids:
+                        target["inbox_emails"].append(message)
+                        existing_ids.add(message_id)
+                target["inbox_emails"] = target["inbox_emails"][-MAX_INBOX_MESSAGES:]
+
+                for alias, messages in source.get("alias_emails", {}).items():
+                    target_messages = target["alias_emails"].setdefault(alias, [])
+                    alias_ids = {str(message.get("id")) for message in target_messages}
+                    for message in messages:
+                        message_id = str(message.get("id"))
+                        if message_id not in alias_ids:
+                            target_messages.append(message)
+                            alias_ids.add(message_id)
+                    target["alias_emails"][alias] = target_messages[-MAX_ALIAS_MESSAGES:]
+
+                old_checked = source.get("last_checked") or ""
+                new_checked = target.get("last_checked") or ""
+                target["last_checked"] = max(old_checked, new_checked) or None
+                moved += 1
+            if moved:
+                self._save()
+        return moved
+
     def get_stats(self, acc_id: str) -> Dict:
         with self._lock:
             self._ensure_account(acc_id)

@@ -93,3 +93,18 @@ class ExportHistoryStore:
             if restored:
                 self._save()
         return restored
+
+    def rebind_accounts(self, account_mapping, alias_accounts=None):
+        """Update export ownership after account IDs change."""
+        alias_accounts = alias_accounts or {}
+        changed = 0
+        with self._lock:
+            for email, record in self._records.items():
+                old_id = str(record.get("account_id") or "")
+                new_id = alias_accounts.get(email) or account_mapping.get(old_id)
+                if new_id and new_id != old_id:
+                    record["account_id"] = new_id
+                    changed += 1
+            if changed:
+                self._save()
+        return changed

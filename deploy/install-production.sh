@@ -30,6 +30,18 @@ cp -a /www/wwwlogs/icloud-mail-access.log "$BACKUP_DIR/" 2>/dev/null || true
 cp -a /www/wwwlogs/icloud-mail-error.log "$BACKUP_DIR/" 2>/dev/null || true
 chmod -R go-rwx "$BACKUP_DIR"
 
+# Deployment snapshots are only for fast rollback. Daily backups have their
+# own retention policy, so keep the newest ten deployment snapshots here.
+mapfile -t OLD_DEPLOY_BACKUPS < <(
+    find /root -maxdepth 1 -mindepth 1 -type d \
+        -name 'icloud-production-backup-*' -printf '%T@ %p\n' \
+        | sort -nr | tail -n +11 | cut -d' ' -f2-
+)
+for old_backup in "${OLD_DEPLOY_BACKUPS[@]}"; do
+    [[ "$old_backup" == /root/icloud-production-backup-* ]] || continue
+    rm -rf -- "$old_backup"
+done
+
 rollback() {
     trap - ERR
     echo "deployment failed; restoring $BACKUP_DIR" >&2

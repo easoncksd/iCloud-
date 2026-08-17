@@ -912,7 +912,9 @@ def test_pickup_uses_persistent_body_and_deduplicates_sync():
         assert body.get_json()["ready"] is True
         assert body.get_json()["message"]["body"] == "persisted body"
         page = client.get("/pickup/valid")
-        assert "2500+Math.random()*1500" in page.get_data(as_text=True)
+        page_html = page.get_data(as_text=True)
+        assert "idlePolls" in page_html
+        assert "document.hidden?15000" in page_html
     finally:
         (
             web_ui._pickup_store, web_ui._account_mgr, web_ui._pickup_body_store,
@@ -920,6 +922,155 @@ def test_pickup_uses_persistent_body_and_deduplicates_sync():
             web_ui._pickup_last_account_refresh, web_ui._pickup_pending,
         ) = originals
     print("  PASS test_pickup_uses_persistent_body_and_deduplicates_sync")
+
+
+def test_batch_runs_accounts_in_parallel_and_creates_pickup_links():
+    import web_ui
+
+    class FakeManager:
+        accounts = {
+            "one": {"id": "one", "name": "one", "status": "active"},
+            "two": {"id": "two", "name": "two", "status": "active"},
+        }
+        active = 0
+        max_active = 0
+
+        def get_account(self, account_id):
+            return self.accounts.get(account_id)
+
+        def create_aliases_for_account(self, account_id, count, _label, progress_callback=None):
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            try:
+                time.sleep(0.12)
+                result = {
+                    "ok": True,
+                    "email": f"{account_id}@icloud.com",
+                    "account_id": account_id,
+                }
+                if progress_callback:
+                    progress_callback(result)
+                return [result]
+            finally:
+                self.active -= 1
+
+    class FakePickupStore:
+        def __init__(self):
+            self.created = []
+
+        def ensure(self, account_id, email):
+            self.created.append((account_id, email))
+            return {"account_id": account_id, "alias_email": email, "token": "token"}
+
+    original_manager = web_ui._account_mgr
+    original_pickup = web_ui._pickup_store
+    original_jobs = web_ui._batch_jobs
+    original_active = web_ui._batch_active_id
+    original_state_file = web_ui._BATCH_STATE_FILE
+    original_workers = web_ui._BATCH_MAX_ACCOUNT_WORKERS
+    with tempfile.TemporaryDirectory() as td:
+        now = "2026-08-17T00:00:00+08:00"
+        job = {
+            "id": "parallel", "status": "queued",
+            "account_ids": ["one", "two"], "count_per_account": 1,
+            "interval": 0, "label": "", "total_accounts": 2,
+            "completed_accounts": 0, "total_created": 0, "total_errors": 0,
+            "created_at": now, "updated_at": now,
+            "accounts": {
+                account_id: {
+                    "account_id": account_id, "name": account_id,
+                    "status": "queued", "created": 0, "errors": 0,
+                    "limited": False, "error": "", "retry_count": 0,
+                    "retry_delay_seconds": 0, "retry_at": None,
+                }
+                for account_id in ("one", "two")
+            },
+        }
+        try:
+            manager = FakeManager()
+            pickup = FakePickupStore()
+            web_ui._account_mgr = manager
+            web_ui._pickup_store = pickup
+            web_ui._batch_jobs = web_ui.OrderedDict([("parallel", job)])
+            web_ui._batch_active_id = "parallel"
+            web_ui._BATCH_STATE_FILE = Path(td) / "batch_jobs.json"
+            web_ui._BATCH_MAX_ACCOUNT_WORKERS = 2
+            started = time.monotonic()
+            web_ui._run_batch_job("parallel")
+            elapsed = time.monotonic() - started
+            assert manager.max_active == 2
+            assert elapsed < 0.22
+            assert job["status"] == "completed"
+            assert job["total_created"] == 2
+            assert sorted(pickup.created) == [
+                ("one", "one@icloud.com"), ("two", "two@icloud.com")
+            ]
+        finally:
+            web_ui._account_mgr = original_manager
+            web_ui._pickup_store = original_pickup
+            web_ui._batch_jobs = original_jobs
+            web_ui._batch_active_id = original_active
+            web_ui._BATCH_STATE_FILE = original_state_file
+            web_ui._BATCH_MAX_ACCOUNT_WORKERS = original_workers
+    print("  PASS test_batch_runs_accounts_in_parallel_and_creates_pickup_links")
+
+
+def test_stale_account_storage_rebinds_without_duplicates():
+    import mail_cache
+    from export_history import ExportHistoryStore
+    from mail_body_store import MailBodyStore
+
+    original_cache_file = mail_cache.CACHE_FILE
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        try:
+            mail_cache.CACHE_FILE = root / "mail_cache.json"
+            cache = mail_cache.MailCache()
+            message = {"id": "7", "subject": "code"}
+            cache.set_inbox("old", [message])
+            cache.set_alias_mail("old", "alias@icloud.com", [message])
+            assert cache.rebind_accounts({"old": "new"}) == 1
+            assert cache.get_inbox("old") == []
+            assert cache.get_inbox("new") == [message]
+            assert cache.get_alias_mail("new", "alias@icloud.com") == [message]
+
+            bodies = MailBodyStore(root / "bodies.sqlite3")
+            bodies.put("old", "7", {"body": "hello"})
+            assert bodies.rebind_accounts({"old": "new"}) == 1
+            assert bodies.get("old", "7") is None
+            assert bodies.get("new", "7")["body"] == "hello"
+            bodies.close()
+
+            exports = ExportHistoryStore(root / "exports.json")
+            exports.claim([{"email": "alias@icloud.com", "account_id": "old"}])
+            assert exports.rebind_accounts(
+                {"old": "new"}, {"alias@icloud.com": "new"}
+            ) == 1
+            assert exports.get("alias@icloud.com")["account_id"] == "new"
+        finally:
+            mail_cache.CACHE_FILE = original_cache_file
+    print("  PASS test_stale_account_storage_rebinds_without_duplicates")
+
+
+def test_pickup_page_uses_adaptive_refresh():
+    import web_ui
+
+    class FakePickupStore:
+        def get_by_token(self, _token):
+            return {"account_id": "one", "alias_email": "alias@icloud.com"}
+
+    original_pickup = web_ui._pickup_store
+    try:
+        web_ui._pickup_store = FakePickupStore()
+        response = web_ui.app.test_client().get("/pickup/test-token")
+        html = response.get_data(as_text=True)
+        assert response.status_code == 200
+        assert "idlePolls" in html
+        assert "document.hidden?15000" in html
+        assert "visibilitychange" in html
+    finally:
+        web_ui._pickup_store = original_pickup
+    print("  PASS test_pickup_page_uses_adaptive_refresh")
 
 
 if __name__ == "__main__":
@@ -953,6 +1104,9 @@ if __name__ == "__main__":
         ("mail_body_store_persists_and_prunes", test_mail_body_store_persists_and_prunes),
         ("account_creation_is_paced_between_aliases", test_account_creation_is_paced_between_aliases),
         ("pickup_uses_persistent_body_and_deduplicates_sync", test_pickup_uses_persistent_body_and_deduplicates_sync),
+        ("batch_runs_accounts_in_parallel_and_creates_pickup_links", test_batch_runs_accounts_in_parallel_and_creates_pickup_links),
+        ("stale_account_storage_rebinds_without_duplicates", test_stale_account_storage_rebinds_without_duplicates),
+        ("pickup_page_uses_adaptive_refresh", test_pickup_page_uses_adaptive_refresh),
     ]
     
     passed = 0

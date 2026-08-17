@@ -2,7 +2,7 @@
 """iCloud HME Web UI — 多账号聚合管理平台 — Flask single-page app."""
 import sys, os, json, time, queue, secrets, threading, re, hashlib
 from collections import OrderedDict, deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from html import escape as _html_escape
 from pathlib import Path
@@ -124,11 +124,69 @@ _pickup_body_store = MailBodyStore(
     max_items=5000,
     max_bytes=_PICKUP_BODY_MAX_BYTES,
 )
+
+
+def _migrate_stale_account_data():
+    """Rebind local records after the same Apple account is imported again."""
+    valid_ids = set(_account_mgr.accounts)
+    alias_accounts = {
+        str(item.get("alias_email") or "").strip().lower(): item.get("account_id")
+        for item in _pickup_store.list_all()
+        if item.get("account_id") in valid_ids and item.get("alias_email")
+    }
+    latest_file = RESULTS_DIR / "latest_emails.txt"
+    old_targets = {}
+    rewritten = 0
+    if latest_file.exists():
+        output = []
+        for raw_line in latest_file.read_text(encoding="utf-8").splitlines():
+            parts = raw_line.split("\t")
+            if not parts or not parts[0].strip():
+                output.append(raw_line)
+                continue
+            email = parts[0].strip().lower()
+            old_id = parts[1].strip() if len(parts) > 1 else ""
+            new_id = alias_accounts.get(email)
+            if old_id and old_id not in valid_ids and new_id in valid_ids:
+                while len(parts) < 2:
+                    parts.append("")
+                parts[1] = new_id
+                old_targets.setdefault(old_id, set()).add(new_id)
+                rewritten += 1
+            output.append("\t".join(parts))
+        if rewritten:
+            tmp = latest_file.with_suffix(latest_file.suffix + ".tmp")
+            payload = "\n".join(output) + "\n"
+            with open(tmp, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, latest_file)
+
+    account_mapping = {
+        old_id: next(iter(targets))
+        for old_id, targets in old_targets.items()
+        if len(targets) == 1
+    }
+    return {
+        "latest_emails": rewritten,
+        "mail_cache_accounts": _account_mgr._cache.rebind_accounts(account_mapping),
+        "mail_bodies": _pickup_body_store.rebind_accounts(account_mapping),
+        "export_history": _export_store.rebind_accounts(
+            account_mapping, alias_accounts
+        ),
+    }
+
+
+_DATA_MIGRATION_STATS = _migrate_stale_account_data()
 _batch_lock = threading.RLock()
 _BATCH_STATE_FILE = RESULTS_DIR / "batch_jobs.json"
 _BATCH_JOB_HISTORY = 20
 _BATCH_RETRY_DELAY_SECONDS = max(
     1.0, float(os.environ.get("BATCH_RETRY_DELAY_SECONDS", "60"))
+)
+_BATCH_MAX_ACCOUNT_WORKERS = max(
+    1, min(20, int(os.environ.get("BATCH_MAX_ACCOUNT_WORKERS", "5")))
 )
 
 _TEMPORARY_CREATE_LIMIT_MARKERS = (
@@ -393,7 +451,7 @@ UI_HTML = UI_HTML.replace(
     "var entry=JSON.parse(e.data);if((entry.seq||0)<=logCursor)return;logCursor=entry.seq||logCursor;logs.push(entry);",
 ).replace(
     "某个账号触发 Apple 限制时会自动跳过，继续下一个账号。",
-    "某个账号触发 Apple 临时限制时，每次等待 1 分钟后自动续建。",
+    "不同主账号最多 5 个并行；同一账号仍逐个创建，触发 Apple 临时限制时每次等待 1 分钟后自动续建。",
 ).replace(
     "function exportCSV(){var filter=E('aliasFilter').value;var filtered=filter==='all'?emails:emails.filter(function(e){return e.account_id===filter});var csv='email,account,label,active\\n'+filtered.map(function(e){return e.email+','+(e.account_name||e.account_id||'')+','+(e.label||'')+','+(e.hasOwnProperty('active')?(e.active?'yes':'no'):'');}).join('\\n');var b=new Blob(['\\uFEFF'+csv],{type:'text/csv'}),a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='icloud_aliases.csv';a.click();}",
     "function csvCell(v){v=String(v==null?'':v);if(/^[=+\\-@]/.test(v))v=\"'\"+v;return '\"'+v.replace(/\"/g,'\"\"')+'\"';}function exportCSV(){var filter=E('aliasFilter').value;var filtered=filter==='all'?emails:emails.filter(function(e){return e.account_id===filter});var csv='email,account,label,active\\n'+filtered.map(function(e){return [e.email,e.account_name||e.account_id||'',e.label||'',e.hasOwnProperty('active')?(e.active?'yes':'no'):''].map(csvCell).join(',');}).join('\\n');var b=new Blob(['\\uFEFF'+csv],{type:'text/csv'}),a=document.createElement('a'),u=URL.createObjectURL(b);a.href=u;a.download='icloud_aliases.csv';a.click();setTimeout(function(){URL.revokeObjectURL(u)},1000);}",
@@ -459,6 +517,16 @@ def api_validate_account(acc_id):
         return jsonify(payload), 200 if ok else 400
     except Exception as e: return jsonify({"ok":False,"error":str(e)})
 
+def _ensure_pickup_for_created(result):
+    if not result or not result.get("ok"):
+        return None
+    account_id = str(result.get("account_id") or "")
+    email = str(result.get("email") or "").strip().lower()
+    if not account_id or not email:
+        return None
+    return _pickup_store.ensure(account_id, email)
+
+
 @app.route("/api/accounts/<acc_id>/create", methods=["POST"])
 def api_create_for_account(acc_id):
     data = request.get_json() or {}
@@ -472,7 +540,9 @@ def api_create_for_account(acc_id):
     _update_state(creating=True)
     _emit_log("info",f"手动创建: 账号 {acc_id} x{count}")
     try:
-        results = _account_mgr.create_aliases_for_account(acc_id, count, label)
+        results = _account_mgr.create_aliases_for_account(
+            acc_id, count, label, progress_callback=_ensure_pickup_for_created
+        )
         created = [r["email"] for r in results if r.get("ok")]
         errors = [r["error"] for r in results if not r.get("ok")]
         _update_state(creating=False)
@@ -498,6 +568,7 @@ def _create_account_with_cooldown(job, acc_id, count, label, name):
 
     def record_progress(_result):
         nonlocal progress_created
+        _ensure_pickup_for_created(_result)
         progress_created += 1
         with _batch_lock:
             entry = job["accounts"][acc_id]
@@ -568,88 +639,114 @@ def _create_account_with_cooldown(job, acc_id, count, label, name):
     return successful
 
 
+def _run_batch_account(job, acc_id, count, label):
+    if _shutdown_event.is_set():
+        raise _BatchInterrupted()
+    account = _account_mgr.get_account(acc_id)
+    name = (account or {}).get("name") or acc_id
+    with _batch_lock:
+        entry = job["accounts"][acc_id]
+        previous_created = int(entry.get("created", 0) or 0)
+        entry["status"] = "running"
+        entry["started_at"] = entry.get("started_at") or datetime.now(_BJ_TZ).isoformat()
+        _save_batch_state_locked()
+    try:
+        if not account:
+            results = [{"ok": False, "error": "账号不存在", "limited": False}]
+        elif account.get("status") != "active":
+            results = [{"ok": False, "error": "账号不可用", "limited": False}]
+        else:
+            results = _create_account_with_cooldown(job, acc_id, count, label, name)
+    except _BatchInterrupted:
+        raise
+    except Exception as exc:
+        results = [{"ok": False, "error": str(exc)[:200], "limited": False}]
+
+    created = previous_created + sum(1 for result in results if result.get("ok"))
+    errors = [result for result in results if not result.get("ok")]
+    limited = any(result.get("limited") for result in errors)
+    first_error = str(errors[0].get("error") or "")[:200] if errors else ""
+    if limited:
+        status = "limited"
+    elif created and errors:
+        status = "partial"
+    elif created:
+        status = "completed"
+    else:
+        status = "failed"
+    with _batch_lock:
+        entry.update({
+            "status": status,
+            "created": created,
+            "errors": len(errors),
+            "limited": limited,
+            "error": first_error,
+            "retry_at": None,
+            "finished_at": datetime.now(_BJ_TZ).isoformat(),
+        })
+        job["completed_accounts"] = sum(
+            1 for account_entry in job["accounts"].values()
+            if account_entry.get("finished_at")
+        )
+        job["total_created"] = sum(
+            int(account_entry.get("created", 0) or 0)
+            for account_entry in job["accounts"].values()
+        )
+        job["total_errors"] = sum(
+            int(account_entry.get("errors", 0) or 0)
+            for account_entry in job["accounts"].values()
+        )
+        job["updated_at"] = datetime.now(_BJ_TZ).isoformat()
+        completed_accounts = job["completed_accounts"]
+        _save_batch_state_locked()
+    level = "warn" if errors else "success"
+    detail = f" / {first_error}" if first_error else ""
+    _emit_log(level, f"[{name}] {created} 成功 / {len(errors)} 失败{detail}")
+    return completed_accounts
+
+
 def _run_batch_job(job_id):
     global _batch_active_id
     with _batch_lock:
         job = _batch_jobs[job_id]
         job["status"] = "running"
         job["started_at"] = job.get("started_at") or datetime.now(_BJ_TZ).isoformat()
-        account_ids = list(job["account_ids"])
+        account_ids = [
+            acc_id for acc_id in job["account_ids"]
+            if not (
+                job["accounts"][acc_id].get("finished_at")
+                and job["accounts"][acc_id].get("status") in (
+                    "completed", "partial", "failed", "limited"
+                )
+            )
+        ]
         count = job["count_per_account"]
         label = job["label"]
-        interval = job["interval"]
         _save_batch_state_locked()
-    _update_state(creating=True, round_status=f"批量创建 0/{len(account_ids)} 个账号")
-    _emit_log("info", f"批量任务启动: {len(account_ids)} 个账号 x{count}")
+    total_accounts = len(job["account_ids"])
+    workers = min(_BATCH_MAX_ACCOUNT_WORKERS, max(1, len(account_ids)))
+    _update_state(
+        creating=True,
+        round_status=f"批量创建 {job.get('completed_accounts', 0)}/{total_accounts} 个账号",
+    )
+    _emit_log(
+        "info", f"批量任务启动: {total_accounts} 个账号 x{count}，并行账号数 {workers}"
+    )
 
     try:
-        for index, acc_id in enumerate(account_ids):
-            if _shutdown_event.is_set():
-                raise _BatchInterrupted()
-            account = _account_mgr.get_account(acc_id)
-            name = (account or {}).get("name") or acc_id
-            with _batch_lock:
-                entry = job["accounts"][acc_id]
-                if entry.get("finished_at") and entry.get("status") in (
-                    "completed", "partial", "failed", "limited"
-                ):
-                    continue
-                previous_created = int(entry.get("created", 0) or 0)
-                entry["status"] = "running"
-                entry["started_at"] = entry.get("started_at") or datetime.now(_BJ_TZ).isoformat()
-                _save_batch_state_locked()
-            if not account:
-                results = [{"ok": False, "error": "账号不存在", "limited": False}]
-            elif account.get("status") != "active":
-                results = [{"ok": False, "error": "账号不可用", "limited": False}]
-            else:
-                results = _create_account_with_cooldown(
-                    job, acc_id, count, label, name
-                )
-
-            created = previous_created + sum(1 for result in results if result.get("ok"))
-            errors = [result for result in results if not result.get("ok")]
-            limited = any(result.get("limited") for result in errors)
-            first_error = str(errors[0].get("error") or "")[:200] if errors else ""
-            if limited:
-                status = "limited"
-            elif created and errors:
-                status = "partial"
-            elif created:
-                status = "completed"
-            else:
-                status = "failed"
-            with _batch_lock:
-                entry.update({
-                    "status": status,
-                    "created": created,
-                    "errors": len(errors),
-                    "limited": limited,
-                    "error": first_error,
-                    "retry_at": None,
-                    "finished_at": datetime.now(_BJ_TZ).isoformat(),
-                })
-                job["completed_accounts"] = sum(
-                    1
-                    for account_entry in job["accounts"].values()
-                    if account_entry.get("finished_at")
-                )
-                job["total_created"] = sum(
-                    int(account_entry.get("created", 0) or 0)
-                    for account_entry in job["accounts"].values()
-                )
-                job["total_errors"] = sum(
-                    int(account_entry.get("errors", 0) or 0)
-                    for account_entry in job["accounts"].values()
-                )
-                job["updated_at"] = datetime.now(_BJ_TZ).isoformat()
-                _save_batch_state_locked()
-            level = "warn" if errors else "success"
-            detail = f" / {first_error}" if first_error else ""
-            _emit_log(level, f"[{name}] {created} 成功 / {len(errors)} 失败{detail}")
-            _update_state(round_status=f"批量创建 {index + 1}/{len(account_ids)} 个账号")
-            if index < len(account_ids) - 1 and interval > 0:
-                _shutdown_event.wait(interval)
+        if account_ids:
+            with ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="batch-account"
+            ) as executor:
+                futures = {
+                    executor.submit(_run_batch_account, job, acc_id, count, label): acc_id
+                    for acc_id in account_ids
+                }
+                for future in as_completed(futures):
+                    completed_accounts = future.result()
+                    _update_state(
+                        round_status=f"批量创建 {completed_accounts}/{total_accounts} 个账号"
+                    )
 
         with _batch_lock:
             job["status"] = "completed" if job["total_created"] else "failed"
@@ -679,7 +776,8 @@ def _run_batch_job(job_id):
             if _batch_active_id == job_id and job.get("status") not in ("queued", "running"):
                 _batch_active_id = None
             _save_batch_state_locked()
-        _update_state(creating=False, round_status="批量任务已完成")
+        final_text = "批量任务等待恢复" if job.get("status") == "queued" else "批量任务已完成"
+        _update_state(creating=False, round_status=final_text)
 
 
 def _resume_batch_job_if_needed():
@@ -978,6 +1076,10 @@ def pickup_page(token):
     html = (
         html.replace("__ALIAS__", alias_html)
         .replace("__TOKEN__", token_js)
+        .replace(
+            "sync();(function schedule(){setTimeout(async function(){await sync();schedule()},4000+Math.random()*2000)})();",
+            "let idlePolls=0;async function scheduledSync(){const before=currentId;await sync();idlePolls=currentId&&currentId!==before?0:Math.min(idlePolls+1,5)}scheduledSync();(function schedule(){const base=document.hidden?15000:Math.min(3000+idlePolls*1800,12000);setTimeout(async function(){await scheduledSync();schedule()},base+Math.random()*1500)})();document.addEventListener('visibilitychange',function(){if(!document.hidden)scheduledSync()});window.addEventListener('pageshow',function(e){if(e.persisted)scheduledSync()});",
+        )
         .replace("4000+Math.random()*2000", "2500+Math.random()*1500")
     )
     return Response(html, mimetype="text/html", headers={"Cache-Control": "no-store"})
@@ -1324,6 +1426,17 @@ def main():
         for a in accounts: print(f"    [OK] {a.get('name','?')} - {a.get('real_email','?')} ({a.get('alias_total',0)} aliases)")
     else: print("[*] No accounts yet")
     _emit_log("info", f"服务已启动，加载 {len(accounts)} 个主账号")
+    migrated = sum(_DATA_MIGRATION_STATS.values())
+    if migrated:
+        _emit_log(
+            "info",
+            "旧账号数据迁移完成: "
+            + ", ".join(
+                f"{key}={value}"
+                for key, value in _DATA_MIGRATION_STATS.items()
+                if value
+            ),
+        )
     threading.Thread(
         target=_pickup_sync_loop, daemon=True, name="pickup-sync"
     ).start()
