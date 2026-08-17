@@ -306,7 +306,7 @@ def test_async_batch_skips_limited_account_and_continues():
         def get_account(self, account_id):
             return self.accounts.get(account_id)
 
-        def create_aliases_for_account(self, account_id, count, _label):
+        def create_aliases_for_account(self, account_id, count, _label, **_kwargs):
             if account_id == "limited":
                 return [{"ok": False, "limited": True, "error": "address limit"}]
             return [
@@ -365,7 +365,7 @@ def test_async_batch_retries_temporary_limit_after_cooldown():
         def get_account(self, _account_id):
             return {"id": "temporary", "name": "temporary", "status": "active"}
 
-        def create_aliases_for_account(self, account_id, count, _label):
+        def create_aliases_for_account(self, account_id, count, _label, **_kwargs):
             self.calls += 1
             if self.calls == 1:
                 return [{
@@ -411,7 +411,8 @@ def test_async_batch_retries_temporary_limit_after_cooldown():
         assert job["accounts"]["temporary"]["retry_count"] == 1
         assert job["accounts"]["temporary"]["status"] == "completed"
         assert web_ui._account_mgr.calls == 2
-        assert "暂停 1 分钟" in web_ui.UI_HTML
+        assert "等待 Apple 限制解除" in web_ui.UI_HTML
+        assert "持续受限后按 60 分钟窗口自动续建" in web_ui.UI_HTML
     finally:
         web_ui._account_mgr = original_manager
         web_ui._BATCH_RETRY_DELAY_SECONDS = original_delay
@@ -421,6 +422,79 @@ def test_async_batch_retries_temporary_limit_after_cooldown():
         web_ui._BATCH_STATE_FILE = original_state_file
         temp_dir.cleanup()
     print("  PASS test_async_batch_retries_temporary_limit_after_cooldown")
+
+
+def test_batch_uses_hourly_backoff_after_repeated_limit():
+    """首次限制短探测，连续限制后应按小时窗口等待。"""
+    import web_ui
+
+    class FakeManager:
+        calls = 0
+
+        def get_account(self, _account_id):
+            return {"id": "paced", "name": "paced", "status": "active"}
+
+        def create_aliases_for_account(self, account_id, count, _label, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return [{
+                    "ok": False, "limited": True, "retryable": True,
+                    "error": "rate limit",
+                }]
+            if self.calls == 2:
+                return [
+                    {"ok": True, "email": "one@icloud.com", "account_id": account_id},
+                    {"ok": False, "limited": True, "retryable": True,
+                     "error": "rate limit"},
+                ]
+            return [
+                {"ok": True, "email": "two@icloud.com", "account_id": account_id}
+                for _ in range(count)
+            ]
+
+    original_manager = web_ui._account_mgr
+    original_short = web_ui._BATCH_RETRY_DELAY_SECONDS
+    original_long = web_ui._BATCH_LONG_RETRY_DELAY_SECONDS
+    original_state_file = web_ui._BATCH_STATE_FILE
+    temp_dir = tempfile.TemporaryDirectory()
+    with web_ui._batch_lock:
+        original_jobs = web_ui._batch_jobs
+        original_active = web_ui._batch_active_id
+        web_ui._batch_jobs = web_ui.OrderedDict()
+        web_ui._batch_active_id = None
+    try:
+        web_ui._account_mgr = FakeManager()
+        web_ui._BATCH_RETRY_DELAY_SECONDS = 0.01
+        web_ui._BATCH_LONG_RETRY_DELAY_SECONDS = 0.02
+        web_ui._BATCH_STATE_FILE = Path(temp_dir.name) / "batch_jobs.json"
+        client = web_ui.app.test_client()
+        started = client.post("/api/create-batch", json={
+            "account_ids": ["paced"], "count_per_account": 2, "interval": 0,
+        })
+        assert started.status_code == 202
+        job_id = started.get_json()["job_id"]
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            job = client.get(f"/api/create-batch/{job_id}").get_json()["job"]
+            if job["status"] not in ("queued", "running"):
+                break
+            time.sleep(0.01)
+        entry = job["accounts"]["paced"]
+        assert job["status"] == "completed"
+        assert job["total_created"] == 2
+        assert entry["retry_count"] == 2
+        assert entry["retry_delay_seconds"] == 0.02
+        assert web_ui._account_mgr.calls == 3
+    finally:
+        web_ui._account_mgr = original_manager
+        web_ui._BATCH_RETRY_DELAY_SECONDS = original_short
+        web_ui._BATCH_LONG_RETRY_DELAY_SECONDS = original_long
+        web_ui._BATCH_STATE_FILE = original_state_file
+        with web_ui._batch_lock:
+            web_ui._batch_jobs = original_jobs
+            web_ui._batch_active_id = original_active
+        temp_dir.cleanup()
+    print("  PASS test_batch_uses_hourly_backoff_after_repeated_limit")
 
 
 def test_email_api_uses_saved_and_pickup_creation_times():
@@ -561,7 +635,7 @@ def test_batch_state_persists_and_resumes_remaining_count():
         def get_account(self, _account_id):
             return {"id": "one", "name": "one", "status": "active"}
 
-        def create_aliases_for_account(self, account_id, count, _label):
+        def create_aliases_for_account(self, account_id, count, _label, **_kwargs):
             self.requested.append(count)
             return [
                 {"ok": True, "email": f"new-{i}@icloud.com", "account_id": account_id}
@@ -701,7 +775,7 @@ def test_manual_create_rejects_invalid_counts():
             json={"account_ids": ["one"], "count_per_account": value},
         )
         assert response.status_code == 400
-    assert "Apple 临时限制时会暂停 1 分钟并自动续建" in web_ui.UI_HTML
+    assert "持续受限后按 60 分钟窗口自动续建" in web_ui.UI_HTML
     print("  PASS test_manual_create_rejects_invalid_counts")
 
 
@@ -724,6 +798,68 @@ def test_mail_body_store_persists_and_prunes():
         assert reopened.get("acc", "3")["body"] == "three"
         reopened.close()
     print("  PASS test_mail_body_store_persists_and_prunes")
+
+
+def test_account_creation_is_paced_between_aliases():
+    import account_manager
+    import icloud_hme
+
+    class FakeHME:
+        counter = 0
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def create_alias(self, **_kwargs):
+            self.counter += 1
+            return {"email": f"paced-{self.counter}@icloud.com"}
+
+    originals = (
+        account_manager.ACCOUNTS_FILE,
+        account_manager.LATEST_EMAILS,
+        account_manager.CREATE_ALIAS_INTERVAL_SECONDS,
+        account_manager.CREATE_ALIAS_JITTER_SECONDS,
+        account_manager.time.sleep,
+        account_manager.random.uniform,
+        icloud_hme.ICloudHME,
+    )
+    sleeps = []
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            account_manager.ACCOUNTS_FILE = Path(td) / "accounts.json"
+            account_manager.LATEST_EMAILS = Path(td) / "latest_emails.txt"
+            account_manager.CREATE_ALIAS_INTERVAL_SECONDS = 3
+            account_manager.CREATE_ALIAS_JITTER_SECONDS = 2
+            account_manager.time.sleep = lambda seconds: sleeps.append(seconds)
+            account_manager.random.uniform = lambda _start, _end: 1
+            icloud_hme.ICloudHME = FakeHME
+            manager = account_manager.AccountManager()
+            manager.accounts["acc"] = {
+                "id": "acc", "name": "acc", "status": "active",
+                "cookies": {}, "host": "icloud.com",
+                "alias_total": 0, "alias_active": 0,
+            }
+            progress = []
+            results = manager.create_aliases_for_account(
+                "acc", count=3,
+                progress_callback=lambda item: progress.append(item["email"]),
+            )
+            assert len([item for item in results if item.get("ok")]) == 3
+            assert sleeps == [4, 4]
+            assert progress == [
+                "paced-1@icloud.com", "paced-2@icloud.com", "paced-3@icloud.com"
+            ]
+        finally:
+            (
+                account_manager.ACCOUNTS_FILE,
+                account_manager.LATEST_EMAILS,
+                account_manager.CREATE_ALIAS_INTERVAL_SECONDS,
+                account_manager.CREATE_ALIAS_JITTER_SECONDS,
+                account_manager.time.sleep,
+                account_manager.random.uniform,
+                icloud_hme.ICloudHME,
+            ) = originals
+    print("  PASS test_account_creation_is_paced_between_aliases")
 
 
 def test_pickup_uses_persistent_body_and_deduplicates_sync():
@@ -809,6 +945,7 @@ if __name__ == "__main__":
         ("create_alias_stops_retrying_on_address_limit", test_create_alias_stops_retrying_on_address_limit),
         ("async_batch_skips_limited_account_and_continues", test_async_batch_skips_limited_account_and_continues),
         ("async_batch_retries_temporary_limit_after_cooldown", test_async_batch_retries_temporary_limit_after_cooldown),
+        ("batch_uses_hourly_backoff_after_repeated_limit", test_batch_uses_hourly_backoff_after_repeated_limit),
         ("email_api_uses_saved_and_pickup_creation_times", test_email_api_uses_saved_and_pickup_creation_times),
         ("pickup_links_api_does_not_call_icloud", test_pickup_links_api_does_not_call_icloud),
         ("runtime_logs_persist_replay_and_resume", test_runtime_logs_persist_replay_and_resume),
@@ -817,6 +954,7 @@ if __name__ == "__main__":
         ("fetch_full_uses_single_imap_fetch", test_fetch_full_uses_single_imap_fetch),
         ("manual_create_rejects_invalid_counts", test_manual_create_rejects_invalid_counts),
         ("mail_body_store_persists_and_prunes", test_mail_body_store_persists_and_prunes),
+        ("account_creation_is_paced_between_aliases", test_account_creation_is_paced_between_aliases),
         ("pickup_uses_persistent_body_and_deduplicates_sync", test_pickup_uses_persistent_body_and_deduplicates_sync),
     ]
     

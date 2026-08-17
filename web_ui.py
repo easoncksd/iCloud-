@@ -130,6 +130,10 @@ _BATCH_JOB_HISTORY = 20
 _BATCH_RETRY_DELAY_SECONDS = max(
     1.0, float(os.environ.get("BATCH_RETRY_DELAY_SECONDS", "60"))
 )
+_BATCH_LONG_RETRY_DELAY_SECONDS = max(
+    _BATCH_RETRY_DELAY_SECONDS,
+    float(os.environ.get("BATCH_LONG_RETRY_DELAY_SECONDS", "3600")),
+)
 
 _TEMPORARY_CREATE_LIMIT_MARKERS = (
     "right now",
@@ -191,6 +195,14 @@ def _save_batch_state_locked(path=None):
 
 class _BatchInterrupted(Exception):
     pass
+
+
+def _format_retry_delay(seconds):
+    seconds = max(1, int(round(seconds)))
+    if seconds < 60:
+        return f"{seconds} 秒"
+    minutes = max(1, int(round(seconds / 60)))
+    return f"{minutes} 分钟"
 
 
 def _is_temporary_create_limit(error):
@@ -358,7 +370,7 @@ UI_HTML = UI_HTML.replace(
     "Math.min(parseInt(E('batchCount').value)||5,750)",
 ).replace(
     "var labels={queued:",
-    "var labels={waiting:'暂停 1 分钟',queued:",
+    "var labels={waiting:'等待 Apple 限制解除',queued:",
 ).replace(
     "<th>标签</th><th>导出状态</th>",
     "<th>标签</th><th>创建时间</th><th>导出状态</th>",
@@ -385,7 +397,7 @@ UI_HTML = UI_HTML.replace(
     "var entry=JSON.parse(e.data);if((entry.seq||0)<=logCursor)return;logCursor=entry.seq||logCursor;logs.push(entry);",
 ).replace(
     "某个账号触发 Apple 限制时会自动跳过，继续下一个账号。",
-    "某个账号触发 Apple 临时限制时会暂停 1 分钟并自动续建。",
+    "某个账号触发 Apple 临时限制时先等待 1 分钟；持续受限后按 60 分钟窗口自动续建。",
 ).replace(
     "function exportCSV(){var filter=E('aliasFilter').value;var filtered=filter==='all'?emails:emails.filter(function(e){return e.account_id===filter});var csv='email,account,label,active\\n'+filtered.map(function(e){return e.email+','+(e.account_name||e.account_id||'')+','+(e.label||'')+','+(e.hasOwnProperty('active')?(e.active?'yes':'no'):'');}).join('\\n');var b=new Blob(['\\uFEFF'+csv],{type:'text/csv'}),a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='icloud_aliases.csv';a.click();}",
     "function csvCell(v){v=String(v==null?'':v);if(/^[=+\\-@]/.test(v))v=\"'\"+v;return '\"'+v.replace(/\"/g,'\"\"')+'\"';}function exportCSV(){var filter=E('aliasFilter').value;var filtered=filter==='all'?emails:emails.filter(function(e){return e.account_id===filter});var csv='email,account,label,active\\n'+filtered.map(function(e){return [e.email,e.account_name||e.account_id||'',e.label||'',e.hasOwnProperty('active')?(e.active?'yes':'no'):''].map(csvCell).join(',');}).join('\\n');var b=new Blob(['\\uFEFF'+csv],{type:'text/csv'}),a=document.createElement('a'),u=URL.createObjectURL(b);a.href=u;a.download='icloud_aliases.csv';a.click();setTimeout(function(){URL.revokeObjectURL(u)},1000);}",
@@ -486,9 +498,26 @@ def _create_account_with_cooldown(job, acc_id, count, label, name):
     successful = []
     with _batch_lock:
         already_created = int(job["accounts"][acc_id].get("created", 0) or 0)
+    progress_created = 0
+
+    def record_progress(_result):
+        nonlocal progress_created
+        progress_created += 1
+        with _batch_lock:
+            entry = job["accounts"][acc_id]
+            entry["created"] = already_created + progress_created
+            job["total_created"] = sum(
+                int(account_entry.get("created", 0) or 0)
+                for account_entry in job["accounts"].values()
+            )
+            job["updated_at"] = datetime.now(_BJ_TZ).isoformat()
+            _save_batch_state_locked()
+
     while already_created + len(successful) < count:
         remaining = count - already_created - len(successful)
-        results = _account_mgr.create_aliases_for_account(acc_id, remaining, label)
+        results = _account_mgr.create_aliases_for_account(
+            acc_id, remaining, label, progress_callback=record_progress
+        )
         successful.extend(result for result in results if result.get("ok"))
         errors = [result for result in results if not result.get("ok")]
         if not errors:
@@ -505,20 +534,36 @@ def _create_account_with_cooldown(job, acc_id, count, label, name):
         if not retryable and not _is_temporary_create_limit(first_error):
             return successful + errors
 
-        retry_at = datetime.now(_BJ_TZ) + timedelta(seconds=_BATCH_RETRY_DELAY_SECONDS)
-        retry_at_text = retry_at.strftime("%Y-%m-%d %H:%M:%S")
+        remaining_after_limit = count - already_created - len(successful)
+
         with _batch_lock:
             entry = job["accounts"][acc_id]
+            previous_retries = int(entry.get("retry_count", 0) or 0)
+            retry_delay = (
+                _BATCH_RETRY_DELAY_SECONDS
+                if previous_retries == 0
+                else _BATCH_LONG_RETRY_DELAY_SECONDS
+            )
+            retry_at = datetime.now(_BJ_TZ) + timedelta(seconds=retry_delay)
+            retry_at_text = retry_at.strftime("%Y-%m-%d %H:%M:%S")
+            retry_delay_text = _format_retry_delay(retry_delay)
             entry["status"] = "waiting"
             entry["created"] = already_created + len(successful)
-            entry["retry_count"] = entry.get("retry_count", 0) + 1
+            entry["retry_count"] = previous_retries + 1
+            entry["retry_delay_seconds"] = retry_delay
             entry["retry_at"] = retry_at.isoformat()
-            entry["error"] = f"Apple 临时限制，{retry_at_text} 自动继续"
+            entry["error"] = (
+                f"Apple 临时限制，等待 {retry_delay_text}，"
+                f"{retry_at_text} 自动继续"
+            )
             job["updated_at"] = datetime.now(_BJ_TZ).isoformat()
             _save_batch_state_locked()
-        _emit_log("warn", f"[{name}] Apple 临时限制，暂停 1 分钟后继续剩余 {remaining} 个")
+        _emit_log(
+            "warn",
+            f"[{name}] Apple 临时限制，等待 {retry_delay_text} 后继续剩余 {remaining_after_limit} 个",
+        )
 
-        if _shutdown_event.wait(_BATCH_RETRY_DELAY_SECONDS):
+        if _shutdown_event.wait(retry_delay):
             raise _BatchInterrupted()
         with _batch_lock:
             entry = job["accounts"][acc_id]
@@ -718,6 +763,7 @@ def api_create_batch():
                     "limited": False,
                     "error": "",
                     "retry_count": 0,
+                    "retry_delay_seconds": 0,
                     "retry_at": None,
                 }
                 for acc_id in account_ids

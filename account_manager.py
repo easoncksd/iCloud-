@@ -21,6 +21,7 @@ iCloud HME — 多账号管理器
 
 import json
 import os
+import random
 import time
 import uuid
 import threading
@@ -33,6 +34,12 @@ ACCOUNTS_FILE = HERE / "accounts.json"
 OLD_COOKIES_FILE = HERE / "cookies.json"
 RESULTS_DIR = HERE / "results"
 LATEST_EMAILS = RESULTS_DIR / "latest_emails.txt"
+CREATE_ALIAS_INTERVAL_SECONDS = max(
+    0.0, float(os.environ.get("CREATE_ALIAS_INTERVAL_SECONDS", "3"))
+)
+CREATE_ALIAS_JITTER_SECONDS = max(
+    0.0, float(os.environ.get("CREATE_ALIAS_JITTER_SECONDS", "2"))
+)
 
 from mail_cache import get_cache  # noqa: E402
 
@@ -608,13 +615,17 @@ class AccountManager:
             return {"ok": False, "error": str(e)[:200]}
 
     def create_aliases_for_account(
-        self, acc_id: str, count: int = 1, label: str = ""
+        self, acc_id: str, count: int = 1, label: str = "",
+        progress_callback=None,
     ) -> List[Dict]:
         with self._operation_lock(acc_id):
-            return self._create_aliases_for_account_unlocked(acc_id, count, label)
+            return self._create_aliases_for_account_unlocked(
+                acc_id, count, label, progress_callback
+            )
 
     def _create_aliases_for_account_unlocked(
-        self, acc_id: str, count: int = 1, label: str = ""
+        self, acc_id: str, count: int = 1, label: str = "",
+        progress_callback=None,
     ) -> List[Dict]:
         from icloud_hme import ICloudHME
 
@@ -656,6 +667,16 @@ class AccountManager:
                     account["create_status"] = "available"
                     account["create_last_error"] = None
                     account["create_limited_at"] = None
+                    if progress_callback:
+                        try:
+                            progress_callback(dict(results[-1]))
+                        except Exception:
+                            pass
+                    if i < count - 1 and CREATE_ALIAS_INTERVAL_SECONDS > 0:
+                        time.sleep(
+                            CREATE_ALIAS_INTERVAL_SECONDS
+                            + random.uniform(0, CREATE_ALIAS_JITTER_SECONDS)
+                        )
                 else:
                     results.append({
                         "email": None,
