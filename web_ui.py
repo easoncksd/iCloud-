@@ -33,6 +33,15 @@ _ADMIN_COOKIE_VALUE = (
 )
 
 
+
+def _is_wildcard_host(host: str) -> bool:
+    return (host or "").strip().lower() in {"0.0.0.0", "::", "[::]", "*"}
+
+
+def _public_bind_blocked(host: str, token: str = "") -> bool:
+    return _is_wildcard_host(host) and not (token or "").strip()
+
+
 @app.before_request
 def _require_admin_access():
     if request.path.startswith("/pickup/") or request.path == "/healthz":
@@ -329,51 +338,61 @@ def _increment_state(**kw):
         for k, delta in kw.items(): _global_state[k] = _global_state.get(k,0) + delta
 
 def _scheduler_loop():
-    """后台调度器：北京时间 7:00-20:00，随机间隔 60-90min，每账号随机 3-5 个。"""
+    """Beijing 7:00-20:00, every 60-90 minutes, create 3-5 aliases per active account."""
     import random as _random
-    from icloud_hme import ICloudHME
     _update_state(running=True, round_status="等待触发窗口")
     _emit_log("info", "调度器已启动 (BJ 7-20h, 间隔 60-90min, 每轮 3-5 个)")
-    def _bj_hour() -> int: return _now().hour
+    def _bj_hour() -> int:
+        return _now().hour
     while not _scheduler_stop_event.is_set() and not _shutdown_event.is_set():
         h = _bj_hour()
-        if h < 7 or h >= 20: _update_state(round_status=f"非窗口时段 (BJ {h}:00)，等待..."); _scheduler_stop_event.wait(1800); continue
+        if h < 7 or h >= 20:
+            _update_state(round_status=f"非窗口时段 (BJ {h}:00)，等待...")
+            _scheduler_stop_event.wait(1800)
+            continue
         active_accounts = [a for a in _account_mgr.list_accounts() if a.get("status") == "active"]
-        if not active_accounts: _update_state(creating=False, round_status="无活跃账号，跳过"); _scheduler_stop_event.wait(1800); continue
+        if not active_accounts:
+            _update_state(creating=False, round_status="无活跃账号，跳过")
+            _scheduler_stop_event.wait(1800)
+            continue
         round_total = 0
         for i, account in enumerate(active_accounts):
-            if _scheduler_stop_event.is_set() or _shutdown_event.is_set(): break
-            acc_id = account["id"]; acc_name = account.get("name", acc_id)
+            if _scheduler_stop_event.is_set() or _shutdown_event.is_set():
+                break
+            acc_id = account["id"]
+            acc_name = account.get("name", acc_id)
+            if _account_create_in_progress(acc_id):
+                _emit_log("info", f"[{acc_name}] 已有创建任务，本轮跳过")
+                continue
             target_count = _random.randint(3, 5)
             _emit_log("info", f"[{acc_name}] 本轮目标 {target_count} 个")
-            client = ICloudHME(account["cookies"], host=account.get("host","icloud.com"), verbose=False)
-            created = 0; errors = 0
-            while created < target_count and errors < 3 and not _scheduler_stop_event.is_set() and not _shutdown_event.is_set():
-                try:
-                    result = client.create_alias(label=f"{acc_name} {_now().strftime('%m%d%H%M')}", max_retries=2)
-                    email = result.get("email","")
-                    if email:
-                        created += 1; round_total += 1
-                        _emit_log("success", f"[{acc_name}] ({created}/{target_count}) {email}")
-                        _increment_state(today_created=1, total_created=1)
-                        with open(str(RESULTS_DIR/"latest_emails.txt"),"a",encoding="utf-8") as f: f.write(f"{email}\t{acc_id}\n")
-                        _account_mgr.update_account(acc_id, alias_total=account.get("alias_total",0)+1)
-                        account["alias_total"] = account.get("alias_total",0)+1
-                        errors = 0; time.sleep(_random.uniform(15,45))
-                    else: errors += 1
-                except Exception as e:
-                    err_str = str(e)
-                    if _is_limit_error(err_str): _emit_log("info",f"[{acc_name}] 触达上限: {err_str[:60]}"); break
-                    errors += 1; _emit_log("warn",f"[{acc_name}] 失败: {err_str[:80]}")
-            if i < len(active_accounts)-1: time.sleep(_random.uniform(120,300))
+            _update_state(creating=True, round_status=f"{acc_name} 自动创建中")
+            try:
+                results = _account_mgr.create_aliases_for_account(
+                    acc_id, target_count, "", progress_callback=_ensure_pickup_for_created
+                )
+            except Exception as e:
+                _emit_log("warn", f"[{acc_name}] 失败: {str(e)[:80]}")
+                continue
+            created = [r for r in results if r.get("ok")]
+            errors = [r for r in results if not r.get("ok")]
+            if created:
+                round_total += len(created)
+                _increment_state(today_created=len(created), total_created=len(created))
+                _emit_log("success", f"[{acc_name}] 创建完成: {len(created)} 个")
+            if errors:
+                _emit_log("warn", f"[{acc_name}] 失败: {str(errors[0].get('error', ''))[:80]}")
+            if i < len(active_accounts) - 1:
+                _scheduler_stop_event.wait(_random.uniform(120, 300))
         _update_state(creating=False, current_round_created=round_total, round_status=f"本轮创建 {round_total} 个")
-        interval_sec = _random.randint(3600,5400)
+        interval_sec = _random.randint(3600, 5400)
         target = _now() + timedelta(seconds=interval_sec)
         _update_state(next_trigger=target.timestamp())
-        _emit_log("info", f"下轮 {target.strftime('%H:%M')} (间隔 {interval_sec//60}min)")
+        _emit_log("info", f"下轮 {target.strftime('%H:%M')} (间隔 {interval_sec // 60}min)")
         _scheduler_stop_event.wait(interval_sec)
     _update_state(running=False, next_trigger=None, round_status="已停止")
     _emit_log("info", "调度器已停止")
+
 
 def _health_loop():
     _error_reported = set()
@@ -681,7 +700,7 @@ textarea{width:100%;min-height:140px}
       <div class="panel">
         <div class="settings-section">
           <h3>自动创建</h3>
-          <p>每小时自动给未满的账号创建邮箱。</p>
+          <p>北京时间 7:00 到 20:00，每隔 60 到 90 分钟给每个有效账号创建 3 到 5 个邮箱。正在批量创建的账号会自动跳过。</p>
           <div class="toolbar">
             <span class="status-dot" id="schedDotSettings"></span>
             <span id="schedLabelSettings">已停止</span>
@@ -721,7 +740,7 @@ var state={running:false,creating:false,round_status:'',total_created:0,today_cr
 var accounts=[],emails=[],logs=[],logCursor=0;
 var curTab='emails',sseConn=null;
 var pickupLinksByEmail={};var pickupLinksLoaded=false;var pickupSelected={};var exportFilter='unexported';var aliasPage=1;var aliasPageSize=50;
-var batchJob=null;var batchPollTimer=null;
+var batchJob=null;var batchPollTimer=null;var pendingBatchAccountId=null;
 var _refreshBusy=false;var _createBusyByAccount={};var _aliasesBusy=false;
 var _inboxBusy=false;var _inboxSse=null;var _inboxStreamMsgs=[];
 var _inboxRequestSeq=0;var _inboxRenderedAccount='';var _expandedEmail=null;
@@ -747,8 +766,9 @@ function showTab(tab){
   if(curTab==='settings'){renderBatchPanel();renderLogs();}
   if(curTab==='inbox')updateInboxAccountSelect();
 }
-function handlePrimaryAction(){
+function handlePrimaryAction(accId){
   if(!accounts.length){showAddAccountModal();return;}
+  pendingBatchAccountId=accId||null;
   showTab('settings');
   var box=E('btnBatchExec');if(box)box.scrollIntoView({behavior:'smooth',block:'center'});
 }
@@ -824,7 +844,7 @@ function renderDashboard(){
     var jobBusy=job&&(job.status==='queued'||job.status==='running'||job.status==='waiting');
     var jobHtml='';
     if(jobBusy){var accTarget=parseInt(batchJob.count_per_account,10)||0,accCreated=job.created||0,accErrors=job.errors||0,mode=job.status==='waiting'?'is-wait':'is-run';jobHtml='<div class="acc-job"><div class="progress-head"><strong>'+esc(batchStatusText(job.status))+'</strong><span>'+accCreated+(accTarget?(' / '+accTarget):'')+'</span></div>'+progressBarHtml(accCreated,accErrors,accTarget||Math.max(accCreated+accErrors,1),mode)+'</div>';}
-    return '<div class="acc-card'+(jobBusy?' is-busy':'')+'"><div class="acc-top"><div><div class="acc-title">'+esc(a.name||'未命名')+'</div><div class="acc-email">'+esc(email)+'</div></div><span class="status-badge '+stCls+'">'+esc(stText.substring(0,24))+'</span></div><div class="acc-usage"><div class="progress-head"><span>邮箱容量</span><span>'+used+' / '+limit+'</span></div><div class="progress-bar"><div class="fill ok" style="width:'+pct+'%"></div></div></div><div class="acc-stats"><div>'+esc(mailReady)+'</div></div>'+jobHtml+'<div class="acc-actions"><button class="btn btn-primary btn-xs" onclick="createForAccount(\''+escAttr(a.id)+'\',5)">创建邮箱</button><button class="btn btn-outline btn-xs" onclick="validateAccount(\''+escAttr(a.id)+'\')">检查登录</button><button class="btn btn-outline btn-xs" onclick="showAppPwdModal(\''+escAttr(a.id)+'\')">设置收信</button><button class="btn btn-outline btn-xs" onclick="removeAccount(\''+escAttr(a.id)+'\')">删除</button></div></div>';
+    return '<div class="acc-card'+(jobBusy?' is-busy':'')+'"><div class="acc-top"><div><div class="acc-title">'+esc(a.name||'未命名')+'</div><div class="acc-email">'+esc(email)+'</div></div><span class="status-badge '+stCls+'">'+esc(stText.substring(0,24))+'</span></div><div class="acc-usage"><div class="progress-head"><span>邮箱容量</span><span>'+used+' / '+limit+'</span></div><div class="progress-bar"><div class="fill ok" style="width:'+pct+'%"></div></div></div><div class="acc-stats"><div>'+esc(mailReady)+'</div></div>'+jobHtml+'<div class="acc-actions"><button class="btn btn-primary btn-xs" onclick="handlePrimaryAction(\''+escAttr(a.id)+'\')">创建邮箱</button><button class="btn btn-outline btn-xs" onclick="validateAccount(\''+escAttr(a.id)+'\')">检查登录</button><button class="btn btn-outline btn-xs" onclick="showAppPwdModal(\''+escAttr(a.id)+'\')">设置收信</button><button class="btn btn-outline btn-xs" onclick="removeAccount(\''+escAttr(a.id)+'\')">删除</button></div></div>';
   }).join('');
 }
 function updateEmailFilter(){var sel=E('aliasFilter');if(!sel)return;var old=sel.value;sel.innerHTML='<option value="all">全部账号 ('+emails.length+')</option>';var byAcc={};emails.forEach(function(e){var ak=e.account_id||'?';byAcc[ak]=(byAcc[ak]||0)+1;});Object.keys(byAcc).forEach(function(ak){var acc=accounts.find(function(x){return x.id===ak});var label=acc?(acc.name||acc.real_email||ak):ak;sel.innerHTML+='<option value="'+escAttr(ak)+'">'+esc(label)+' ('+byAcc[ak]+')</option>';});sel.value=old||'all';}
@@ -835,14 +855,15 @@ function updateAliasPager(total){var pages=Math.max(1,Math.ceil((total||0)/alias
 function setExportFilter(value){exportFilter=value;aliasPage=1;document.querySelectorAll('[data-export-filter]').forEach(function(btn){btn.classList.toggle('active',btn.dataset.exportFilter===value)});renderAliasTable();}
 function togglePickupSelected(email,checked){var key=String(email||'').toLowerCase();if(checked)pickupSelected[key]=true;else delete pickupSelected[key];}
 function toggleAllPickup(){var checks=document.querySelectorAll('#aliasTableContainer input.pickup-check:not(:disabled)');var shouldCheck=Array.from(checks).some(function(c){return !c.checked});checks.forEach(function(c){c.checked=shouldCheck;togglePickupSelected(c.dataset.email,shouldCheck);});}
-function copyPickup(url){if(!url){toast('取件链接尚未生成',true);return}navigator.clipboard.writeText(url).then(function(){toast('取件链接已复制')});}
+function copyText(text,okMsg){text=String(text||'');if(!text){toast('没有可复制的内容',true);return}function fallback(){var ta=document.createElement('textarea');ta.value=text;ta.setAttribute('readonly','');ta.style.position='fixed';ta.style.left='-9999px';document.body.appendChild(ta);ta.select();var ok=false;try{ok=document.execCommand('copy')}catch(_){ok=false}document.body.removeChild(ta);if(ok)toast(okMsg);else toast('复制失败，请手动复制',true);}if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(text).then(function(){toast(okMsg)}).catch(fallback);return;}fallback();}
+function copyPickup(url){if(!url){toast('取件链接尚未生成',true);return}copyText(url,'取件链接已复制');}
 function visibleAliases(){var accountFilter=E('aliasFilter').value;return emails.filter(function(e){if(accountFilter!=='all'&&e.account_id!==accountFilter)return false;if(exportFilter==='exported')return !!e.exported;if(exportFilter==='unexported')return !e.exported;return true;});}
 function formatExportTime(value){if(!value)return '--';try{return new Date(value).toLocaleString('zh-CN',{hour12:false})}catch(_){return value}}
 async function exportSelectedPickupTxt(){var selected=emails.filter(function(e){return !e.exported&&pickupSelected[String(e.email||'').toLowerCase()]}).map(function(e){return e.email});if(!selected.length){toast('请先勾选未导出的邮箱',true);return}var d=await apiSlow('/api/pickup-links/export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({emails:selected})});if(!d.ok){toast('导出失败: '+(d.error||'未知错误'),true);return}if(!(d.lines||[]).length){toast('所选邮箱均已导出，未重复生成文件',true);await refreshEmails();renderAliasTable();return}var b=new Blob(['\uFEFF'+d.lines.join('\n')],{type:'text/plain;charset=utf-8'}),a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='icloud_mail_pickup_links_'+new Date().toISOString().slice(0,10)+'.txt';a.click();setTimeout(function(){URL.revokeObjectURL(a.href)},1000);selected.forEach(function(email){delete pickupSelected[String(email).toLowerCase()]});await refreshEmails();renderAliasTable();toast('已导出 '+d.count+' 条');}
 async function restoreExportedEmail(email){if(!confirm('确认将 '+email+' 恢复为未导出？'))return;var d=await api('/api/export-history/restore',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({emails:[email]})});if(!d.ok){toast('恢复失败: '+(d.error||'未知错误'),true);return}await refreshEmails();renderAliasTable();toast('已恢复为未导出');}
 function renderAliasTable(){updateEmailFilter();var filtered=visibleAliases();var exportedCount=emails.filter(function(e){return e.exported}).length;var unexportedCount=emails.length-exportedCount;E('exportCountUnexported').textContent='未导出 '+unexportedCount;E('exportCountExported').textContent='已导出 '+exportedCount;E('exportCountAll').textContent='全部 '+emails.length;E('emailCount').textContent=filtered.length+' / '+emails.length;updateAliasPager(filtered.length);var c=E('aliasTableContainer');if(!filtered.length){c.innerHTML='<div class="empty"><div class="icon"></div>'+(emails.length?'当前筛选下没有邮箱':'还没有邮箱。请先添加账号，再点击「创建邮箱」。')+'</div>';return;}if(!pickupLinksLoaded){c.innerHTML='<div class="empty">正在生成取件链接...</div>';loadPickupLinks().then(renderAliasTable);return;}var start=(aliasPage-1)*aliasPageSize;var pageItems=filtered.slice(start,start+aliasPageSize);var pages=Math.max(1,Math.ceil(filtered.length/aliasPageSize));var h='<table class="email-table"><thead><tr><th style="width:42px"><input type="checkbox" title="全选本页" onclick="toggleAllPickup()"></th><th>#</th><th>邮箱地址</th><th>取件链接</th><th>所属账号</th><th>标签</th><th>创建时间</th><th>导出状态</th><th>邮箱状态</th></tr></thead><tbody>';pageItems.forEach(function(e,i){var key=String(e.email||'').toLowerCase();var url=pickupLinksByEmail[key]||'';var checked=pickupSelected[key]&&!e.exported?' checked':'';var disabled=e.exported?' disabled':'';var accName=e.account_name||e.account_email||e.account_id||'--';var activeHtml=e.hasOwnProperty('active')?(e.active?'<span style="color:var(--green)">可用</span>':'<span style="color:var(--red)">停用</span>'):'<span style="color:var(--muted)">--</span>';var exportHtml=e.exported?'<span style="color:var(--green)">已导出</span><div class="hint">'+esc(formatExportTime(e.exported_at))+'</div><button class="copy-btn" onclick="restoreExportedEmail(\''+escAttr(e.email||'')+'\')" title="恢复后可再次导出">恢复</button>':'<span style="color:var(--muted)">未导出</span>';h+='<tr><td><input class="pickup-check" type="checkbox" data-email="'+escAttr(e.email||'')+'"'+checked+disabled+' onchange="togglePickupSelected(this.dataset.email,this.checked)"></td><td class="hint">'+(start+i+1)+'</td><td class="mono">'+esc(e.email||'')+'</td><td class="pickup-cell">'+(url?'<button class="copy-btn" onclick="copyPickup(\''+escAttr(url)+'\')" title="'+escAttr(url)+'">复制链接</button>':'<span class="hint">生成失败</span>')+'</td><td>'+esc(accName)+'</td><td class="hint">'+esc((e.label||'').substring(0,30))+'</td><td style="white-space:nowrap">'+esc(formatExportTime(e.created_at))+'</td><td>'+exportHtml+'</td><td>'+activeHtml+'</td></tr>';});h+='</tbody></table>';h+='<div class="pager pager-bottom"><span class="hint">'+(start+1)+'-'+(start+pageItems.length)+' / '+filtered.length+'</span><button class="btn btn-outline btn-sm" onclick="setAliasPage(aliasPage-1)"'+(aliasPage<=1?' disabled':'')+'>上一页</button><button class="btn btn-outline btn-sm" onclick="setAliasPage(aliasPage+1)"'+(aliasPage>=pages?' disabled':'')+'>下一页</button></div>';c.innerHTML=h;}
 function batchStatusText(status){var labels={waiting:'等待 Apple 限制解除',queued:'等待中',running:'创建中',completed:'已完成',partial:'部分成功',limited:'Apple 已限制',failed:'失败'};return labels[status]||status||'--';}
-function renderBatchPanel(){var activeAccs=accounts.filter(function(a){return a.status==='active'});E('batchAccCount').textContent=activeAccs.length+' 个可用账号';var g=E('batchChkGroup');if(!activeAccs.length){g.innerHTML='<span class="hint">没有可用账号，请先添加</span>';E('btnBatchExec').disabled=true;}else{g.innerHTML=activeAccs.map(function(a){var email=a.real_email||a.name||a.id;var limited=a.create_status==='limited';var note=limited?'<span style="color:var(--red);font-size:12px">上次触发限制，本次会再试一次</span>':'';return'<label class="chk-item"><input type="checkbox" value="'+escAttr(a.id)+'" checked><span><strong>'+esc(a.name||email.substring(0,20))+'</strong> '+note+'</span></label>';}).join('');E('btnBatchExec').disabled=!!(batchJob&&(batchJob.status==='queued'||batchJob.status==='running'));}if(batchJob)renderBatchJob(batchJob);else loadCurrentBatchJob();}
+function renderBatchPanel(){var activeAccs=accounts.filter(function(a){return a.status==='active'});E('batchAccCount').textContent=activeAccs.length+' 个可用账号';var g=E('batchChkGroup');if(!activeAccs.length){g.innerHTML='<span class="hint">没有可用账号，请先添加</span>';E('btnBatchExec').disabled=true;}else{g.innerHTML=activeAccs.map(function(a){var email=a.real_email||a.name||a.id;var limited=a.create_status==='limited';var note=limited?'<span style="color:var(--red);font-size:12px">上次触发限制，本次会再试一次</span>':'';var selected=!pendingBatchAccountId||pendingBatchAccountId===a.id;return'<label class="chk-item"><input type="checkbox" value="'+escAttr(a.id)+'"'+(selected?' checked':'')+'><span><strong>'+esc(a.name||email.substring(0,20))+'</strong> '+note+'</span></label>';}).join('');E('btnBatchExec').disabled=!!(batchJob&&(batchJob.status==='queued'||batchJob.status==='running'));}pendingBatchAccountId=null;if(batchJob)renderBatchJob(batchJob);else loadCurrentBatchJob();}
 async function loadCurrentBatchJob(){var d=await api('/api/create-batch-current');if(d.ok&&d.job){batchJob=d.job;renderBatchJob(batchJob);if(batchJob.status==='queued'||batchJob.status==='running')scheduleBatchPoll();}}
 function jobDisplayStatus(job){var waiting=false,runningAcc=false;Object.keys(job.accounts||{}).forEach(function(id){var st=(job.accounts[id]||{}).status;if(st==='waiting')waiting=true;if(st==='running')runningAcc=true;});if((job.status==='queued'||job.status==='running')&&waiting&&!runningAcc)return 'waiting';return job.status;}
 function batchTargetCount(job){var per=parseInt(job.count_per_account,10)||0;var accs=job.total_accounts||Object.keys(job.accounts||{}).length||0;var target=per*accs;return target||((job.total_created||0)+(job.total_errors||0));}
@@ -902,8 +923,8 @@ async function createForAccount(accId,count){if(_createBusyByAccount[accId]){toa
 async function validateAccount(accId){var d=await api('/api/accounts/'+encodeURIComponent(accId)+'/validate',{method:'POST'});if(d.ok)toast('登录有效: '+d.real_email);else toast('登录已过期，请重新导入 Cookie',true);refreshAll();}
 async function removeAccount(accId){if(!confirm('确认删除该账号？'))return;var d=await api('/api/accounts/'+encodeURIComponent(accId)+'/remove',{method:'POST'});if(d.ok)toast('已删除');refreshAll();}
 async function toggleScheduler(){var act=state.running?'stop':'start';var d=await api('/api/scheduler/'+act,{method:'POST'});if(d.ok)toast(state.running?'自动创建已停止':'自动创建已启动');refreshAll();}
-function copyOne(email){navigator.clipboard.writeText(email).then(function(){toast('已复制: '+email)});}
-function copyAll(){var filtered=visibleAliases();if(!filtered.length){toast('当前筛选下没有邮箱',true);return}navigator.clipboard.writeText(filtered.map(function(e){return e.email}).join('\n')).then(function(){toast('已复制 '+filtered.length+' 个')});}
+function copyOne(email){copyText(email,'已复制: '+email);}
+function copyAll(){var filtered=visibleAliases();if(!filtered.length){toast('当前筛选下没有邮箱',true);return}copyText(filtered.map(function(e){return e.email}).join('\n'),'已复制 '+filtered.length+' 个');}
 function csvCell(v){v=String(v==null?'':v);if(/^[=+\-@]/.test(v))v="'"+v;return '"'+v.replace(/"/g,'""')+'"';}
 function exportCSV(){var filtered=visibleAliases();if(!filtered.length){toast('当前筛选下没有邮箱',true);return}var csv='email,account,label,active\n'+filtered.map(function(e){return [e.email,e.account_name||e.account_id||'',e.label||'',e.hasOwnProperty('active')?(e.active?'yes':'no'):''].map(csvCell).join(',');}).join('\n');var b=new Blob(['\uFEFF'+csv],{type:'text/csv'}),a=document.createElement('a'),u=URL.createObjectURL(b);a.href=u;a.download='icloud_mail_aliases.csv';a.click();setTimeout(function(){URL.revokeObjectURL(u)},1000);toast('已导出 '+filtered.length+' 个');}
 function clearLogs(){logs=[];E('logFeed').innerHTML=''}
@@ -980,6 +1001,17 @@ def _batch_uses_account(acc_id):
             return False
         item = (job.get("accounts") or {}).get(acc_id) or {}
         return item.get("status") in ("queued", "running", "waiting")
+
+
+
+def _account_create_in_progress(acc_id) -> bool:
+    acc_id = str(acc_id or "")
+    if not acc_id:
+        return False
+    with _manual_create_lock:
+        if acc_id in _manual_creating_accounts:
+            return True
+    return _batch_uses_account(acc_id)
 
 
 def _remove_latest_emails_for_account(acc_id):
@@ -2005,10 +2037,14 @@ def main():
     import argparse, os, signal as _signal
     parser = argparse.ArgumentParser(description="iCloud HME Web UI")
     parser.add_argument("--port",type=int,default=int(os.environ.get("PORT",5050)))
-    parser.add_argument("--host",type=str,default=os.environ.get("HOST","0.0.0.0"))
+    parser.add_argument("--host",type=str,default=os.environ.get("HOST","127.0.0.1"))
     parser.add_argument("--scheduler",action="store_true",help="启动时自动运行调度器")
     parser.add_argument("--no-sync",action="store_true",help="跳过时间校准")
     args = parser.parse_args()
+    if _public_bind_blocked(args.host, ADMIN_ACCESS_TOKEN):
+        print("[!] Refusing to bind", args.host, "without ADMIN_ACCESS_TOKEN")
+        print("    Use --host 127.0.0.1, or set ADMIN_ACCESS_TOKEN first")
+        raise SystemExit(2)
     if not args.no_sync:
         offset = _sync_time()
         if abs(offset)>0.5: print(f"[*] Time sync: offset {offset:.1f}s")

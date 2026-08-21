@@ -1265,6 +1265,47 @@ def test_alias_api_returns_partial_failure_details():
     print("  PASS test_alias_api_returns_partial_failure_details")
 
 
+
+def test_public_bind_requires_admin_token():
+    import web_ui
+    assert web_ui._public_bind_blocked("0.0.0.0", "") is True
+    assert web_ui._public_bind_blocked("::", "") is True
+    assert web_ui._public_bind_blocked("127.0.0.1", "") is False
+    assert web_ui._public_bind_blocked("0.0.0.0", "secret") is False
+    source = Path(web_ui.__file__).read_text(encoding="utf-8")
+    assert 'os.environ.get("HOST","127.0.0.1")' in source
+    print("  PASS test_public_bind_requires_admin_token")
+
+
+def test_scheduler_skips_accounts_with_active_create():
+    import web_ui
+    original_busy = set(web_ui._manual_creating_accounts)
+    try:
+        web_ui._manual_creating_accounts.clear()
+        web_ui._manual_creating_accounts.add("busy")
+        assert web_ui._account_create_in_progress("busy") is True
+        assert web_ui._account_create_in_progress("free") is False
+        source = Path(web_ui.__file__).read_text(encoding="utf-8")
+        assert "if _account_create_in_progress(acc_id):" in source
+        assert "create_aliases_for_account(" in source
+    finally:
+        web_ui._manual_creating_accounts.clear()
+        web_ui._manual_creating_accounts.update(original_busy)
+    print("  PASS test_scheduler_skips_accounts_with_active_create")
+
+
+def test_ui_create_entry_and_scheduler_copy():
+    import web_ui
+    html = web_ui.UI_HTML
+    assert "pendingBatchAccountId=accId||null" in html
+    assert "function copyText(" in html
+    assert "function copyAll(){var filtered=visibleAliases();" in html
+    assert ",5)\">创建邮箱" not in html
+    assert "北京时间 7:00 到 20:00" in html
+    assert "正在批量创建的账号会自动跳过" in html
+    print("  PASS test_ui_create_entry_and_scheduler_copy")
+
+
 if __name__ == "__main__":
     tests = [
         ("parse_cookie_header_string", test_parse_cookie_header_string),
@@ -1304,6 +1345,9 @@ if __name__ == "__main__":
         ("manual_create_conflict_and_input_status_codes", test_manual_create_conflict_and_input_status_codes),
         ("remove_account_purges_all_local_data", test_remove_account_purges_all_local_data),
         ("alias_api_returns_partial_failure_details", test_alias_api_returns_partial_failure_details),
+        ("public_bind_requires_admin_token", test_public_bind_requires_admin_token),
+        ("scheduler_skips_accounts_with_active_create", test_scheduler_skips_accounts_with_active_create),
+        ("ui_create_entry_and_scheduler_copy", test_ui_create_entry_and_scheduler_copy),
     ]
     
     passed = 0
