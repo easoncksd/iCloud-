@@ -1,4 +1,4 @@
-# iCloud HME — 多账号聚合管理平台
+# iCloud mail
 
 基于 iCloud Hide My Email 协议，批量创建 `@icloud.com` 隐私邮箱的商用聚合平台。
 
