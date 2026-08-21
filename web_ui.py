@@ -386,132 +386,543 @@ def _health_loop():
                 if account["id"] not in _error_reported: _emit_log("warn",f"健康检查失败 [{account.get('name','?')}]: {str(e)[:100]}"); _error_reported.add(account["id"])
 
 # ----- HTML -----
-UI_HTML = r"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>iCloud HME — 多账号管理</title><style>:root{--paper:#f3efe4;--paper-dim:#e8e2d4;--ink:#0f0e0c;--ink-soft:#5c564e;--ink-faint:#9a938a;--rule:rgba(15,14,12,.12);--rule-strong:rgba(15,14,12,.22);--red:#b7392d;--green:#1f8b4c;--mono:"SF Mono","Fira Code","Cascadia Code",Consolas,monospace;--sans:"PingFang SC","Microsoft YaHei","Noto Sans SC",system-ui,sans-serif}*{margin:0;padding:0;box-sizing:border-box}html{background:var(--paper);font-size:16px}body{color:var(--ink);font-family:var(--sans);min-height:100vh;display:flex;background:radial-gradient(circle at 10% 8%,rgba(183,57,45,.03),transparent 26%),radial-gradient(circle at 78% 42%,rgba(15,14,12,.025),transparent 30%),linear-gradient(90deg,rgba(15,14,12,.018) 1px,transparent 1px),linear-gradient(rgba(15,14,12,.018) 1px,transparent 1px),var(--paper);background-size:auto,auto,64px 64px,64px 64px,auto}.sidebar{width:260px;background:var(--paper);border-right:1px solid var(--rule-strong);padding:28px 22px;display:flex;flex-direction:column;gap:3px;flex-shrink:0;overflow-y:auto}.sidebar .logo{font-family:var(--mono);font-size:15px;letter-spacing:.28em;text-transform:uppercase;color:var(--ink-faint);margin-bottom:24px;display:flex;align-items:center;gap:14px}.sidebar .logo .icon{width:16px;height:16px;background:var(--red);transform:rotate(45deg);flex-shrink:0}.sidebar .nav-item{padding:10px 0;color:var(--ink-soft);font-size:15px;cursor:pointer;user-select:none;display:flex;align-items:center;gap:10px;border-bottom:1px solid transparent;transition:border-color .2s,color .2s;font-family:var(--mono);letter-spacing:.03em}.sidebar .nav-item:hover{color:var(--ink);border-bottom-color:var(--rule)}.sidebar .nav-item.active{color:var(--ink);border-bottom-color:var(--red);font-weight:600}.sidebar .section-label{font-family:var(--mono);font-size:11px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:.3em;padding:22px 0 10px}.sidebar .account-item{padding:9px 0;font-size:13px;cursor:pointer;display:flex;align-items:center;gap:10px;border-left:2px solid transparent;padding-left:10px;transition:all .15s;font-family:var(--mono)}.sidebar .account-item:hover{color:var(--ink)}.sidebar .account-item.selected{border-left-color:var(--red);font-weight:600}.sidebar .account-item .acc-dot{width:7px;height:7px;transform:rotate(45deg);flex-shrink:0}.sidebar .account-item .acc-dot.active{background:var(--green)}.sidebar .account-item .acc-dot.error{background:var(--red)}.sidebar .account-item .acc-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.sidebar .account-item .acc-del{opacity:0;color:var(--red);cursor:pointer;font-size:16px;line-height:1}.sidebar .account-item:hover .acc-del{opacity:.5}.sidebar .account-item .acc-del:hover{opacity:1}#sidebarAccounts{max-height:340px;overflow-y:auto}.status-dot{display:inline-block;width:7px;height:7px;transform:rotate(45deg);margin-right:8px;vertical-align:middle}.status-dot.online{background:var(--green)}.status-dot.offline{background:var(--ink-faint)}.main{flex:1;padding:32px 44px;overflow-y:auto;display:flex;flex-direction:column;gap:24px}.header{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:16px}.header h1{font-family:var(--mono);font-size:14px;color:var(--ink-faint);letter-spacing:.28em;text-transform:uppercase;font-weight:400}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1px;background:var(--rule-strong);border:1px solid var(--rule-strong)}.card{background:var(--paper);padding:22px 24px;transition:background .15s}.card:hover{background:var(--paper-dim)}.card .label{font-family:var(--mono);font-size:11px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:.3em;margin-bottom:10px}.card .value{font-size:38px;font-weight:800;letter-spacing:-1px;font-family:var(--mono)}.card .value.accent{color:var(--red)}.card .value.green{color:var(--green)}.card .value.orange{color:var(--ink-soft)}.card .value.blue{color:var(--ink)}.card .sub{font-size:13px;color:var(--ink-faint);margin-top:6px;font-family:var(--mono)}.acc-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:1px;background:var(--rule-strong);border:1px solid var(--rule-strong);margin-top:2px}.acc-card{background:var(--paper);padding:22px 24px;transition:background .15s}.acc-card:hover{background:var(--paper-dim)}.acc-card .acc-header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px}.acc-card .acc-title{font-weight:700;font-size:16px;font-family:var(--mono)}.acc-card .acc-email{font-size:13px;color:var(--ink-faint);font-family:var(--mono);margin-top:4px}.acc-card .acc-stats{display:flex;gap:24px;margin-top:12px}.acc-card .acc-stat{font-size:13px;font-family:var(--mono);color:var(--ink-soft)}.acc-card .acc-stat .n{font-weight:700;color:var(--ink)}.acc-card .acc-actions{margin-top:14px;display:flex;gap:8px}.acc-card .status-badge{font-family:var(--mono);font-size:11px;padding:2px 0;letter-spacing:.08em;text-transform:uppercase}.acc-card .status-badge.ok{color:var(--green);border-bottom:1px solid var(--green)}.acc-card .status-badge.err{color:var(--red);border-bottom:1px solid var(--red)}.panel{background:var(--paper);border:1px solid var(--rule-strong);overflow:hidden}.panel-header{padding:14px 20px;border-bottom:1px solid var(--rule);display:flex;justify-content:space-between;align-items:center;font-family:var(--mono);font-size:12px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:.16em}.panel-body{padding:0}.btn{padding:9px 22px;font-size:13px;cursor:pointer;border:none;font-family:var(--mono);transition:all .15s;letter-spacing:.03em;background:var(--ink);color:var(--paper)}.btn:hover{opacity:.78}.btn:disabled{opacity:.28;cursor:not-allowed}.btn-primary{background:var(--ink);color:var(--paper)}.btn-outline{background:transparent;border:1px solid var(--rule-strong);color:var(--ink)}.btn-outline:hover{background:var(--ink);color:var(--paper);border-color:var(--ink);opacity:1}.btn-danger{background:transparent;color:var(--red);border:1px solid var(--red)}.btn-danger:hover{background:var(--red);color:var(--paper);opacity:1}.btn-sm{padding:5px 14px;font-size:12px}.btn-xs{padding:3px 10px;font-size:11px}.btn-group{display:flex;gap:10px}.chk-group{display:flex;flex-wrap:wrap;gap:10px;padding:10px 0}.chk-item{display:flex;align-items:center;gap:8px;font-size:14px;cursor:pointer;font-family:var(--mono)}.chk-item input{margin:0;accent-color:var(--red);width:16px;height:16px}.email-table{width:100%;border-collapse:collapse;font-family:var(--mono)}.email-table th{text-align:left;padding:10px 18px;font-size:11px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:.3em;border-bottom:1px solid var(--rule-strong);font-weight:400}.email-table td{padding:12px 18px;font-size:14px;border-bottom:1px solid var(--rule)}.email-table tr:hover td{background:var(--paper-dim)}.email-item:hover{background:var(--paper-dim)}.email-table .copy-btn{background:none;border:none;color:var(--ink-faint);cursor:pointer;font-size:15px;padding:3px 8px}.email-table .copy-btn:hover{color:var(--red)}.filter-bar{display:flex;gap:12px;align-items:center;padding:10px 18px;border-bottom:1px solid var(--rule)}.filter-bar select{padding:6px 10px;border:1px solid var(--rule-strong);font-family:var(--mono);font-size:13px;background:var(--paper);color:var(--ink)}.filter-bar select:focus{outline:none;border-color:var(--red)}.segmented{display:inline-flex;border:1px solid var(--rule-strong);margin-left:auto}.segmented button{border:0;border-right:1px solid var(--rule-strong);background:transparent;color:var(--ink-soft);padding:6px 12px;font-family:var(--mono);font-size:11px;cursor:pointer}.segmented button:last-child{border-right:0}.segmented button.active{background:var(--ink);color:var(--paper)}.copy-toast{position:fixed;top:24px;right:24px;background:var(--ink);color:var(--paper);padding:12px 24px;font-family:var(--mono);font-size:13px;letter-spacing:.03em;opacity:0;transform:translateY(-8px);transition:all .2s;pointer-events:none;z-index:999}.copy-toast.show{opacity:1;transform:translateY(0)}.log-feed{max-height:320px;overflow-y:auto;padding:14px 20px;font-family:var(--mono);font-size:13px;line-height:1.8}.log-feed .log-line{white-space:pre-wrap;word-break:break-all}.log-line.info{color:var(--ink-soft)}.log-line.success{color:var(--green)}.log-line.warn{color:var(--red)}.log-line.error{color:var(--red);font-weight:600}.log-time{color:var(--ink-faint);margin-right:10px}.empty{text-align:center;padding:56px 20px;color:var(--ink-faint);font-family:var(--mono);font-size:13px;letter-spacing:.03em}.empty .icon{font-size:42px;margin-bottom:14px;opacity:.5}.modal-overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(15,14,12,.7);z-index:999;display:flex;align-items:center;justify-content:center}.modal-box{background:var(--paper);border:1px solid var(--ink);padding:32px;width:90%;max-width:560px;box-shadow:8px 8px 0 rgba(15,14,12,.12)}.modal-box h3{font-family:var(--mono);font-size:15px;letter-spacing:.16em;text-transform:uppercase;margin-bottom:10px;font-weight:400}.modal-box p{font-size:14px;color:var(--ink-soft);margin-bottom:16px;line-height:1.6}.modal-box input,.modal-box textarea{width:100%;background:var(--paper);color:var(--ink);border:1px solid var(--rule-strong);padding:12px 14px;font-family:var(--mono);font-size:14px;margin-bottom:14px}.modal-box textarea{height:130px;font-size:13px;resize:vertical}.modal-box input:focus,.modal-box textarea:focus{outline:none;border-color:var(--ink)}.modal-actions{display:flex;gap:12px;margin-top:16px;justify-content:flex-end}.modal-msg{margin-top:12px;font-family:var(--mono);font-size:13px}.diamond{display:inline-block;width:12px;height:12px;background:var(--red);transform:rotate(45deg);vertical-align:-2px;margin-right:4px}code{font-family:var(--mono);font-size:12px;background:var(--paper-dim);padding:1px 6px}.progress-bar{height:3px;background:var(--rule);margin-top:10px;overflow:hidden}.progress-bar .fill{height:100%;background:var(--ink);transition:width .3s}select,input[type=text],input[type=number],input[type=password]{font-family:var(--mono);font-size:13px;padding:6px 10px;border:1px solid var(--rule-strong);background:var(--paper);color:var(--ink)}select:focus,input:focus{outline:none;border-color:var(--ink)}@media(max-width:768px){body{flex-direction:column}.sidebar{width:100%;flex-direction:row;flex-wrap:wrap;padding:14px 18px;gap:6px}.sidebar .logo{margin-bottom:0;margin-right:auto}.main{padding:16px}.cards{grid-template-columns:repeat(2,1fr)}.acc-cards{grid-template-columns:1fr}}</style></head><body><aside class="sidebar"><div class="logo"><div class="icon"></div>iCloud HME</div><a class="nav-item active" data-tab="dashboard">仪表盘</a><a class="nav-item" data-tab="emails">邮箱列表</a><a class="nav-item" data-tab="batch">批量创建</a><a class="nav-item" data-tab="inbox">收件箱</a><a class="nav-item" data-tab="docs">API 文档</a><a class="nav-item" data-tab="logs">运行日志</a><div class="section-label">账号列表</div><div id="sidebarAccounts"></div><button class="btn btn-outline btn-sm" onclick="showAddAccountModal()" style="margin:8px 0">+ 添加账号</button><div style="margin-top:auto;padding-top:14px;border-top:1px solid var(--rule-strong);font-family:var(--mono);font-size:12px;color:var(--ink-faint)"><div style="margin-bottom:6px"><span class="status-dot" id="schedDot"></span><span id="schedLabel">调度器: 就绪</span></div><button class="btn btn-sm" id="btnSched" onclick="toggleScheduler()" style="width:100%;margin-top:6px">启动调度器</button></div></aside><main class="main"><div class="header"><h1 id="tabTitle">仪表盘</h1><div class="btn-group"><button class="btn btn-outline btn-sm" onclick="refreshAll()">刷新</button><button class="btn btn-primary btn-sm" onclick="showAddAccountModal()">+ 添加账号</button></div></div><div id="view-dashboard"><div class="cards" id="summaryCards"></div><div class="acc-cards" id="accCards"></div></div><div id="view-emails" style="display:none"><div class="panel"><div class="panel-header"><span>隐私邮箱列表</span><div style="display:flex;gap:8px;align-items:center"><span style="font-size:11px;color:var(--ink-faint)" id="emailCount">0</span><button class="btn btn-outline btn-sm" onclick="refreshEmails().then(renderAliasTable)">刷新</button><button class="btn btn-outline btn-sm" onclick="refreshAliases()" title="从 iCloud 云端同步标签和状态">云端同步</button><button class="btn btn-outline btn-sm" onclick="copyAll()">复制全部</button><button class="btn btn-outline btn-sm" onclick="exportCSV()">CSV</button><button class="btn btn-primary btn-sm" onclick="exportSelectedPickupTxt()">导出已选 TXT</button></div></div><div class="filter-bar"><span style="font-size:11px;color:var(--ink-faint)">筛选账号:</span><select id="aliasFilter" onchange="renderAliasTable()"><option value="all">全部账号</option></select><div class="segmented" aria-label="导出状态筛选"><button type="button" class="active" data-export-filter="unexported" onclick="setExportFilter('unexported')" id="exportCountUnexported">未导出 0</button><button type="button" data-export-filter="exported" onclick="setExportFilter('exported')" id="exportCountExported">已导出 0</button><button type="button" data-export-filter="all" onclick="setExportFilter('all')" id="exportCountAll">全部 0</button></div></div><div class="panel-body"><div id="aliasTableContainer" class="empty"><div class="icon"></div>暂无创建记录 — 请先通过仪表盘或批量创建生成邮箱</div></div></div></div><div id="view-batch" style="display:none"><div class="panel"><div class="panel-header"><span>跨账号批量创建</span><span style="font-size:11px;color:var(--ink-faint)" id="batchAccCount">0 个可用账号</span></div><div class="panel-body" style="padding:14px"><p style="font-size:12px;color:var(--ink-faint);margin-bottom:10px">勾选多个主账号后一次启动。某个账号触发 Apple 限制时会自动跳过，继续下一个账号。</p><div class="chk-group" id="batchChkGroup"></div><div style="display:flex;gap:10px;align-items:center;margin-top:12px;flex-wrap:wrap"><label style="font-size:12px">每账号创建数量:</label><input type="number" id="batchCount" value="5" min="1" max="20" style="width:70px"><label style="font-size:13px;font-family:var(--mono)">标签前缀:</label><input type="text" id="batchLabel" placeholder="可选" style="width:150px"><button class="btn btn-primary" id="btnBatchExec" onclick="execBatchCreate()">开始创建</button></div><div id="batchProgress" style="margin-top:14px"></div></div></div></div><div id="view-inbox" style="display:none"><div class="panel"><div class="panel-header"><span>收件箱检查</span><div style="display:flex;gap:8px;align-items:center"><select id="inboxAccount" onchange="refreshInbox()"></select><input type="number" id="inboxLimit" value="20" min="1" max="100" style="width:60px" title="邮件数量"><input type="text" id="aliasSearchInput" placeholder="指定邮箱查件..." style="width:200px" title="输入隐私邮箱地址查件"><button class="btn btn-outline btn-sm" onclick="refreshInbox()">刷新</button><button class="btn btn-outline btn-sm" onclick="refreshInbox(true)" title="跳过缓存，从 iCloud 重新拉取">强制刷新</button><button class="btn btn-outline btn-sm" onclick="searchAliasMail()" title="查询指定邮箱的收件">查件</button><button class="btn btn-outline btn-sm" onclick="checkAliasMail()" title="检查所有隐私别名的收件">全部</button><button class="btn btn-outline btn-sm" id="btnInboxSettings" onclick="openInboxSettings()" title="修改 iCloud 邮箱或应用密码">设置</button><span style="font-size:10px;color:var(--ink-faint);font-family:var(--mono)" id="cacheStatus"></span></div></div><div class="panel-body"><div id="inboxMsgs" class="empty"><div class="icon"></div>选择账号后点击刷新查看收件箱</div></div></div></div><div id="view-docs" style="display:none"><div class="panel" style="font-family:var(--mono);font-size:13px;line-height:1.8"><div class="panel-header"><span>API 文档</span></div><div class="panel-body" style="padding:20px 24px" id="docsContent"></div></div></div><div id="view-logs" style="display:none"><div class="panel"><div class="panel-header"><span>实时日志</span><button class="btn btn-outline btn-sm" onclick="clearLogs()">清屏</button></div><div class="panel-body"><div class="log-feed" id="logFeed"></div></div></div></div></main><div class="copy-toast" id="toast"></div><script>var E=function(id){return document.getElementById(id)};var state={running:false,creating:false,round_status:'',total_created:0,today_created:0,current_round_created:0,next_trigger:null};var accounts=[],emails=[],logs=[];var curTab='dashboard',sseConn=null;document.querySelectorAll('.nav-item').forEach(function(el){el.addEventListener('click',function(){curTab=this.dataset.tab;document.querySelectorAll('.nav-item').forEach(function(n){n.classList.remove('active')});this.classList.add('active');E('view-dashboard').style.display=curTab==='dashboard'?'block':'none';E('view-emails').style.display=curTab==='emails'?'block':'none';E('view-batch').style.display=curTab==='batch'?'block':'none';E('view-inbox').style.display=curTab==='inbox'?'block':'none';E('view-docs').style.display=curTab==='docs'?'block':'none';E('view-logs').style.display=curTab==='logs'?'block':'none';var titles={dashboard:'仪表盘',emails:'邮箱列表',batch:'批量创建',inbox:'收件箱',docs:'API 文档',logs:'运行日志'};E('tabTitle').textContent=titles[curTab]||curTab;if(curTab==='emails'){refreshEmails();renderAliasTable();}if(curTab==='batch')renderBatchPanel();if(curTab==='inbox')updateInboxAccountSelect();if(curTab==='docs')renderDocs();if(curTab==='logs')renderLogs();});});async function api(path,opts){var timeout=(opts||{}).timeout||60000;if(opts)delete opts.timeout;var ctrl=new AbortController();var t=setTimeout(function(){ctrl.abort()},timeout);try{var r=await fetch(path,Object.assign({signal:ctrl.signal},opts||{}));clearTimeout(t);return r.json();}catch(e){clearTimeout(t);var msg=(e.name==='AbortError')?('请求超时 ('+(timeout/1000)+'s)'):(e.message||'网络错误');return{ok:false,error:msg};}}async function apiSlow(path,opts){return api(path,Object.assign({timeout:60000},opts||{}));}var _refreshBusy=false;async function refreshAll(){if(_refreshBusy)return;_refreshBusy=true;try{var _a=api('/api/accounts'),_s=api('/api/state');var a=await _a,s=await _s;accounts=a.accounts||[];state=s;renderSidebar();renderDashboard();if(curTab==='emails'){await refreshEmails();renderAliasTable();}if(curTab==='batch')renderBatchPanel();updateInboxAccountSelect();}finally{_refreshBusy=false;}}async function refreshLight(){if(_refreshBusy)return;var s=await api('/api/state');state=s;var sd=E('schedDot');var running=state.running;sd.className='status-dot '+(running?'online':'offline');E('schedLabel').textContent='调度器: '+(running?(state.creating?'创建中...':'等待下轮'):'已停止');E('btnSched').textContent=running?'停止调度器':'启动调度器';E('btnSched').className='btn btn-sm '+(running?'btn-danger':'btn-primary');}async function refreshEmails(){var d=await api('/api/emails');emails=d.emails||[];emails.forEach(function(e){var acc=accounts.find(function(a){return a.id===e.account_id});e.account_name=acc?(acc.name||acc.real_email||''):(e.account_id||'');e.account_email=acc?(acc.real_email||''):'';});E('emailCount').textContent=emails.length;updateEmailFilter();}async function refreshAliases(){var d=await api('/api/aliases');var apiAliases=d.aliases||[];if(apiAliases.length){var apiMap={};apiAliases.forEach(function(a){apiMap[a.email]=a;});emails.forEach(function(e){var apiData=apiMap[e.email];if(apiData){e.label=apiData.label||'';e.active=apiData.active;e.anonymousId=apiData.anonymousId;e.account_name=apiData.account_name||e.account_name;e.account_email=apiData.account_email||e.account_email;}});}E('emailCount').textContent=emails.length;updateEmailFilter();renderAliasTable();}function renderSidebar(){var c=E('sidebarAccounts');if(!accounts.length){c.innerHTML='<div style="padding:8px 14px;font-size:11px;color:var(--ink-faint)">暂无账号</div>';}else{c.innerHTML=accounts.map(function(a,i){var cls=a.status==='active'?'active':'error';var nm=esc(a.name||'未命名');return'<div class="account-item" data-accid="'+escAttr(a.id)+'"><span class="acc-dot '+cls+'"></span><span class="acc-name" title="'+(escAttr(a.real_email)||'')+'">'+nm+'</span><span class="acc-del" title="删除" onclick="event.stopPropagation();removeAccount(\''+escAttr(a.id)+'\')">&times;</span></div>';}).join('');}var sd=E('schedDot');sd.className='status-dot '+(state.running?'online':'offline');var sm=state.running?(state.creating?'创建中...':'等待下轮'):'已停止';E('schedLabel').textContent='调度器: '+sm;var bs=E('btnSched');bs.textContent=state.running?'停止调度器':'启动调度器';bs.className='btn btn-sm '+(state.running?'btn-danger':'btn-primary');}function renderDashboard(){var summary={account_count:accounts.length,active_accounts:0,error_accounts:0,total_aliases:0,total_active_aliases:0};accounts.forEach(function(a){if(a.status==='active')summary.active_accounts++;else if(a.status==='error')summary.error_accounts++;summary.total_aliases+=(a.alias_total||0);summary.total_active_aliases+=(a.alias_active||0);});E('summaryCards').innerHTML='<div class="card"><div class="label">账号总数</div><div class="value blue">'+summary.account_count+'</div><div class="sub">活跃 '+summary.active_accounts+' / 异常 '+summary.error_accounts+'</div></div><div class="card"><div class="label">隐私邮箱总数</div><div class="value accent">'+summary.total_aliases+'</div><div class="sub">活跃 '+summary.total_active_aliases+'</div></div><div class="card"><div class="label">累计创建</div><div class="value">'+(state.total_created||0)+'</div><div class="sub">历史总计</div></div><div class="card"><div class="label">今日创建</div><div class="value green">'+(state.today_created||0)+'</div><div class="sub" id="schedInfo">'+esc(state.round_status||'--')+'</div></div>';if(!accounts.length){E('accCards').innerHTML='<div class="empty"><div class="icon"></div>还没有添加账号<br><span style="font-size:12px">点击右上角 "+ 添加账号" 开始</span></div>';}else{E('accCards').innerHTML=accounts.map(function(a){var stCls=a.status==='active'?'ok':'err';var stText=a.status==='active'?'正常':(a.last_error||'异常');var email=a.real_email||'?';return'<div class="acc-card"><div class="acc-header"><div><div class="acc-title">'+esc(a.name||'未命名')+'</div><div class="acc-email">'+esc(email)+'</div></div><span class="status-badge '+stCls+'">'+esc(stText.substring(0,20))+'</span></div><div class="acc-stats"><div class="acc-stat">别名: <span class="n">'+(a.alias_total||0)+'</span></div><div class="acc-stat">活跃: <span class="n" style="color:var(--green)">'+(a.alias_active||0)+'</span></div></div><div class="acc-actions"><button class="btn btn-outline btn-xs" onclick="createForAccount(\''+escAttr(a.id)+'\',1)">创建 1 个</button><button class="btn btn-outline btn-xs" onclick="createForAccount(\''+escAttr(a.id)+'\',5)">创建 5 个</button><button class="btn btn-outline btn-xs" onclick="validateAccount(\''+escAttr(a.id)+'\')">校验</button></div></div>';}).join('');}}function updateEmailFilter(){var sel=E('aliasFilter'),old=sel.value;sel.innerHTML='<option value="all">全部账号 ('+emails.length+')</option>';var byAcc={};emails.forEach(function(e){var ak=e.account_id||'?';byAcc[ak]=(byAcc[ak]||0)+1;});Object.keys(byAcc).forEach(function(ak){var acc=accounts.find(function(x){return x.id===ak});var label=acc?(acc.name||acc.real_email||ak):ak;sel.innerHTML+='<option value="'+escAttr(ak)+'">'+esc(label)+' ('+byAcc[ak]+')</option>';});sel.value=old||'all';}var pickupLinksByEmail={};var pickupLinksLoaded=false;var pickupSelected={};var exportFilter='unexported';
+UI_HTML = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>HideMail</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%23f4f5f7'/%3E%3Cpath fill='%231f8b4c' d='M19.2 10.15C18.55 7.05 15.85 4.75 12.55 4.75c-2.52 0-4.72 1.38-5.9 3.42C4.35 8.42 2.5 10.55 2.5 13.15c0 2.82 2.28 5.1 5.1 5.1h10.95c2.42 0 4.4-1.98 4.4-4.4 0-2.28-1.74-4.16-3.95-4.35z'/%3E%3Cpath fill='%23ffffff' d='M6.85 12.2h10.3c.58 0 1.05.47 1.05 1.05v4.85c0 .58-.47 1.05-1.05 1.05H6.85c-.58 0-1.05-.47-1.05-1.05v-4.85c0-.58.47-1.05 1.05-1.05z'/%3E%3Cpath fill='%231f8b4c' d='M5.8 12.2 12 16.25l6.2-4.05v1.12L12 17.48 5.8 13.32V12.2z'/%3E%3C/svg%3E">
+<style>:root{
+  --bg:#f4f5f7;--panel:#fff;--ink:#1a1d21;--muted:#6b7280;--line:#e5e7eb;
+  --green:#1f8b4c;--green-soft:#e8f6ee;--red:#c2413b;--red-soft:#fdecec;
+  --shadow:0 1px 2px rgba(16,24,40,.06);
+  --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:14px;letter-spacing:0}
+body{display:flex;min-height:100vh}
+button,input,select,textarea{font:inherit}
+a{color:var(--green)}
+.mono{font-family:var(--mono)}
+.app{display:flex;width:100%;min-height:100vh}
+.sidebar{width:240px;background:#eef1f4;border-right:1px solid var(--line);padding:18px 14px;display:flex;flex-direction:column;gap:6px;flex-shrink:0}
+.nav-ico{width:16px;height:16px;flex-shrink:0}
+.side-overview{margin-top:16px;padding:12px;border:1px solid var(--line);border-radius:8px;background:#fff}
+.side-kicker{font-size:12px;color:var(--muted);font-weight:600;margin-bottom:4px}
+.side-stat{display:flex;justify-content:space-between;gap:8px;align-items:baseline;padding:7px 0;border-bottom:1px solid var(--line);font-size:13px;color:var(--muted)}
+.side-stat:last-of-type{border-bottom:0}
+.side-stat b{color:var(--ink);font-weight:700}
+.side-task{display:flex;align-items:center;gap:8px;margin-top:10px;font-size:12px;color:var(--muted);line-height:1.4}
+@keyframes pulse-dot{0%,100%{opacity:1}50%{opacity:.35}}
+.status-dot.busy{animation:pulse-dot 1.2s ease-in-out infinite}
+
+.logo{display:flex;align-items:center;gap:10px;margin:0 8px 22px;color:var(--ink);font-weight:700;font-size:15px}
+.logo .icon{width:28px;height:28px;color:var(--green);flex-shrink:0;display:block}
+.nav-item{display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:8px;color:var(--muted);cursor:pointer;user-select:none;border:0;background:transparent;width:100%;text-align:left;transition:background .16s,color .16s}
+.nav-item:hover{background:#e4e7eb;color:var(--ink)}
+.nav-item.active{background:#fff;color:var(--ink);font-weight:600;box-shadow:var(--shadow);outline:1px solid var(--line)}
+.sidebar-foot{margin-top:auto;padding:12px;border-top:1px solid var(--line);color:var(--muted);font-size:12px}
+.main{flex:1;min-width:0;display:flex;flex-direction:column}
+.topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:18px 28px 12px;border-bottom:1px solid var(--line);background:var(--bg);position:sticky;top:0;z-index:5}
+.topbar h1{font-size:22px;font-weight:700;letter-spacing:0}
+.topbar-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.task-pill{display:flex;align-items:center;gap:8px;background:#fff;border:1px solid var(--line);border-radius:999px;padding:6px 12px;font-size:12px;color:var(--muted)}
+.task-pill b{color:var(--ink);font-weight:600}
+.status-dot{width:8px;height:8px;border-radius:50%;background:#d1d5db;display:inline-block}
+.status-dot.online{background:var(--green)}
+.status-dot.offline{background:#d1d5db}
+.page{padding:20px 28px 40px;flex:1;min-width:0}
+.hero-empty{background:#fff;border:1px solid var(--line);border-radius:8px;padding:48px 28px;text-align:center;box-shadow:var(--shadow)}
+.hero-empty h2{font-size:20px;margin-bottom:8px}
+.hero-empty p{color:var(--muted);margin-bottom:18px}
+.toolbar,.filter-bar{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:0 0 12px}
+.pager{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.filter-bar .pager{margin-left:auto}
+.pager-bottom{padding:10px 16px;border-top:1px solid var(--line);justify-content:flex-end}
+.segmented{display:flex;background:#fff;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.segmented button{border:0;background:transparent;padding:8px 12px;color:var(--muted);cursor:pointer;transition:background .16s ease,color .16s ease}
+.segmented button.active{background:var(--green-soft);color:var(--green);font-weight:600}
+.panel{background:#fff;border:1px solid var(--line);border-radius:8px;box-shadow:var(--shadow);min-width:0}
+.panel-header{display:flex;justify-content:space-between;align-items:center;padding:14px 16px;border-bottom:1px solid var(--line);font-weight:600;flex-wrap:wrap;gap:10px}
+.panel-header>div{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.panel-body{padding:0}#aliasTableContainer{overflow-x:auto}
+.inbox-tools{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.email-table{width:100%;min-width:920px;border-collapse:collapse}
+.pickup-cell{white-space:nowrap}
+.email-table th,.email-table td{padding:10px 12px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+.email-table th{font-size:12px;color:var(--muted);font-weight:600;background:#fafafa;position:sticky;top:0}
+.email-table td{transition:background .16s ease}
+.email-table tr:hover td{background:#f8faf9}
+.btn{border:1px solid var(--line);background:#fff;color:var(--ink);border-radius:8px;padding:8px 12px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;gap:6px;transition:background .16s ease,color .16s ease,border-color .16s ease,transform .16s ease,box-shadow .16s ease}
+.btn:hover{background:#f8faf9}
+.btn:active{transform:scale(.98)}
+.btn-primary{background:var(--green);border-color:var(--green);color:#fff}
+.btn-danger{background:var(--red);border-color:var(--red);color:#fff}
+.btn-outline{background:#fff}
+.btn-sm{padding:6px 10px;font-size:13px}
+.btn-xs{padding:4px 8px;font-size:12px}
+.btn:disabled{opacity:.55;cursor:not-allowed;transform:none}
+.copy-btn{border:0;background:transparent;color:var(--green);cursor:pointer;font-size:12px}
+input[type=text],input[type=number],input[type=password],select,textarea{border:1px solid var(--line);border-radius:8px;padding:8px 10px;background:#fff;min-width:0}
+textarea{width:100%;min-height:140px}
+.work-strip{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:16px}
+.work-stat{background:#fff;border:1px solid var(--line);border-radius:8px;padding:12px 14px;box-shadow:var(--shadow);min-width:0;transition:border-color .16s ease,box-shadow .16s ease,transform .16s ease}
+.work-stat span{display:block;color:var(--muted);font-size:12px;margin-bottom:4px}
+.work-stat b{display:block;font-size:18px;font-weight:700;letter-spacing:0;word-break:break-word;line-height:1.3}
+.work-stat.is-live b{color:var(--green)}
+.account-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:12px}
+.acc-card{background:#fff;border:1px solid var(--line);border-radius:8px;padding:16px;box-shadow:var(--shadow);transition:border-color .16s ease,box-shadow .16s ease,transform .16s ease}
+.acc-card.is-busy{border-color:#b7dcc5}
+.acc-top{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}
+.acc-title{font-weight:700;margin-bottom:4px}
+.acc-email{color:var(--muted);font-size:12px;font-family:var(--mono)}
+.acc-usage,.acc-job{margin:12px 0 8px}
+.acc-usage .progress-bar,.acc-job .progress-bar{height:8px;margin-top:6px}
+.acc-stats{display:flex;gap:16px;margin:8px 0 12px;color:var(--muted);font-size:13px}
+.acc-actions{display:flex;gap:8px;flex-wrap:wrap}
+.status-badge{font-size:12px;padding:3px 8px;border-radius:999px}
+.status-badge.ok{background:var(--green-soft);color:var(--green)}
+.status-badge.err{background:var(--red-soft);color:var(--red)}
+.empty{padding:36px 16px;text-align:center;color:var(--muted)}
+.empty .icon{width:28px;height:28px;border:2px solid var(--line);border-radius:8px;margin:0 auto 10px}
+.empty-title{color:var(--ink);font-weight:700;margin:0 0 8px}
+.empty p{margin:0 auto 14px;max-width:380px;line-height:1.6}
+.empty-steps{list-style:decimal;padding-left:22px;margin:0 auto 16px;max-width:320px;text-align:left;line-height:1.8}
+.empty .btn{margin-top:4px}
+.chk-group{display:flex;flex-direction:column;gap:8px}
+.chk-item{display:flex;gap:8px;align-items:center}
+.progress-card{padding-top:14px}
+.progress-head{display:flex;justify-content:space-between;gap:12px;align-items:baseline;font-size:13px}
+.progress-head span{color:var(--muted);white-space:nowrap}
+.progress-meta{display:flex;justify-content:space-between;gap:12px;margin-top:8px;color:var(--muted);font-size:12px}
+.progress-bar{height:12px;background:#eef1f4;border-radius:99px;overflow:hidden;margin-top:8px;display:flex}
+.progress-bar .fill{height:100%;background:var(--green);width:0;flex:0 0 auto;transition:width .32s ease}
+.progress-bar .fill.err{background:var(--red)}
+.progress-bar.is-run .fill.ok{background-color:var(--green);background-image:linear-gradient(90deg,rgba(255,255,255,0),rgba(255,255,255,.34),rgba(255,255,255,0));background-size:42px 100%;animation:progress-sheen 1.1s linear infinite}
+@keyframes progress-sheen{to{background-position:42px 0}}
+.progress-item{padding:12px 0 4px;border-bottom:1px solid var(--line)}
+.progress-item:last-child{border-bottom:0}
+.progress-item .progress-bar{height:8px;margin-top:6px}
+.progress-note{margin-top:6px;font-size:12px;line-height:1.5}
+.log-feed{font-family:var(--mono);font-size:12px;max-height:420px;overflow:auto;padding:12px}
+.log-line{padding:4px 0;border-bottom:1px solid var(--line)}
+.log-time{color:var(--muted);margin-right:8px}
+.modal-overlay{position:fixed;inset:0;background:rgba(16,24,40,.28);display:flex;align-items:center;justify-content:center;padding:24px;z-index:20;animation:overlay-in .16s ease}
+.modal-box{background:#fff;width:min(520px,100%);border-radius:8px;border:1px solid var(--line);box-shadow:0 16px 40px rgba(16,24,40,.18);padding:22px;overflow:auto;animation:modal-in .16s ease}
+.modal-box h3{font-size:18px;margin-bottom:8px}
+.modal-box p{color:var(--muted);margin-bottom:14px;line-height:1.6}
+.modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
+.modal-msg{margin-top:10px;font-size:13px}
+.copy-toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%) translateY(12px);background:var(--ink);color:#fff;padding:10px 14px;border-radius:8px;opacity:0;pointer-events:none;transition:opacity .16s ease,transform .16s ease}
+.copy-toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+.hint{font-size:12px;color:var(--muted)}
+.settings-section{padding:16px;border-bottom:1px solid var(--line)}
+.settings-section h3{font-size:15px;margin-bottom:6px}
+.settings-section p{color:var(--muted);margin-bottom:10px}
+
+.is-enter{animation:view-in .16s ease both}
+@keyframes view-in{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+@keyframes overlay-in{from{opacity:0}to{opacity:1}}
+@keyframes modal-in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+@media (hover:hover) and (pointer:fine){
+  .acc-card:hover{border-color:#d5d9de;box-shadow:0 6px 16px rgba(16,24,40,.08);transform:translateY(-1px)}
+  .work-stat:hover{border-color:#d5d9de;box-shadow:0 4px 12px rgba(16,24,40,.07);transform:translateY(-1px)}
+  .btn-primary:hover{filter:brightness(1.04)}
+  .nav-item{transition:background .16s ease,color .16s ease,transform .16s ease}
+}
+@media (prefers-reduced-motion:reduce){
+  .is-enter,.modal-overlay,.modal-box{animation:none}
+  .btn,.acc-card,.work-stat,.nav-item,.copy-toast,.progress-bar .fill,.email-table td,.segmented button{transition:none}
+  .btn:active,.acc-card:hover,.work-stat:hover{transform:none}
+  .progress-bar.is-run .fill.ok,.status-dot.busy{animation:none}
+}
+@media(max-width:768px){
+  html,body{width:100%;max-width:100%;overflow-x:hidden}
+  body,.app{flex-direction:column}
+  .sidebar{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));width:100%;max-width:100%;overflow-x:hidden;padding:10px}
+  .sidebar .logo,.sidebar-foot{grid-column:1/-1}
+  .side-overview{display:none}
+  .sidebar .logo{margin:4px}
+  .nav-item{min-width:0;justify-content:center;padding:8px 4px;font-size:12px;white-space:nowrap}
+  .main,.panel,.panel-header,.panel-body,.inbox-tools,.page{width:100%;min-width:0;max-width:100%}
+  .topbar,.page{padding:12px}
+  .inbox-tools{width:100%;align-items:stretch}
+  .inbox-tools select,.inbox-tools input[type=text]{flex:1 1 220px;width:auto!important;min-width:0}
+  .inbox-tools input[type=number]{flex:0 0 64px}
+  .inbox-tools .btn{flex:1 1 calc(33.333% - 8px);padding-left:8px;padding-right:8px}
+  .inbox-tools #btnInboxSettings{flex-basis:calc(33.333% - 8px)}
+  .inbox-tools #cacheStatus{flex-basis:100%;word-break:break-word}
+  .filter-bar .segmented{margin-left:0;max-width:100%;overflow-x:auto}
+  .filter-bar .pager{margin-left:0;width:100%}
+  .work-strip{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+  .work-stat{padding:10px 12px}
+  .work-stat b{font-size:16px}
+  .account-grid{grid-template-columns:1fr}
+}
+</style>
+</head>
+<body>
+<div class="app">
+<aside class="sidebar">
+  <div class="logo">
+    <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path fill="currentColor" d="M19.2 10.15C18.55 7.05 15.85 4.75 12.55 4.75c-2.52 0-4.72 1.38-5.9 3.42C4.35 8.42 2.5 10.55 2.5 13.15c0 2.82 2.28 5.1 5.1 5.1h10.95c2.42 0 4.4-1.98 4.4-4.4 0-2.28-1.74-4.16-3.95-4.35z"/>
+      <path fill="#ffffff" d="M6.85 12.2h10.3c.58 0 1.05.47 1.05 1.05v4.85c0 .58-.47 1.05-1.05 1.05H6.85c-.58 0-1.05-.47-1.05-1.05v-4.85c0-.58.47-1.05 1.05-1.05z"/>
+      <path fill="currentColor" d="M5.8 12.2 12 16.25l6.2-4.05v1.12L12 17.48 5.8 13.32V12.2z"/>
+    </svg>
+    HideMail
+  </div>
+  <a class="nav-item" data-tab="accounts"><svg class="nav-ico" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 12a4 4 0 1 0-4-4 4 4 0 0 0 4 4zm0 2c-3.4 0-8 1.7-8 5v1h16v-1c0-3.3-4.6-5-8-5z"/></svg>账号</a>
+  <a class="nav-item active" data-tab="emails"><svg class="nav-ico" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M20 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2zm0 4-8 5L4 8V6l8 5 8-5z"/></svg>邮箱</a>
+  <a class="nav-item" data-tab="inbox"><svg class="nav-ico" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M19 3H5a2 2 0 0 0-2 2v3h6l1 2h4l1-2h6V5a2 2 0 0 0-2-2zm3 7h-6.4l-1 2H9.4l-1-2H2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2z"/></svg>收件箱</a>
+  <a class="nav-item" data-tab="settings"><svg class="nav-ico" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M19.4 13a7.7 7.7 0 0 0 .1-1 7.7 7.7 0 0 0-.1-1l2.1-1.6-2-3.5-2.5 1a7 7 0 0 0-1.7-1L14.8 2h-4l-.5 2.9A7 7 0 0 0 8.6 6L6.1 5l-2 3.5L6.2 10a7.7 7.7 0 0 0-.1 1 7.7 7.7 0 0 0 .1 1L4.1 13.6l2 3.5 2.5-1a7 7 0 0 0 1.7 1l.5 2.9h4l.5-2.9a7 7 0 0 0 1.7-1l2.5 1 2-3.5zM12 15.5A3.5 3.5 0 1 1 15.5 12 3.5 3.5 0 0 1 12 15.5z"/></svg>设置</a>
+  <a class="nav-item" data-tab="batch" style="display:none">任务</a>
+  <a class="nav-item" data-tab="logs" style="display:none">日志</a>
+  <div class="side-overview" id="sideOverview">
+    <div class="side-kicker">概况</div>
+    <div class="side-stat"><span>账号</span><b id="sideStatAccounts">0</b></div>
+    <div class="side-stat"><span>邮箱</span><b id="sideStatEmails">0</b></div>
+    <div class="side-stat"><span>可收信</span><b id="sideStatReady">0</b></div>
+    <div class="side-task"><span class="status-dot" id="sideTaskDot"></span><span id="sideTaskText">任务空闲</span></div>
+  </div>
+  <div class="sidebar-foot">
+    <div>先加账号，再创建邮箱，然后看信或导出。</div>
+  </div>
+</aside>
+<main class="main">
+  <div class="topbar">
+    <h1 id="tabTitle">邮箱</h1>
+    <div class="topbar-actions">
+      <div class="task-pill" id="taskPill"><span class="status-dot" id="schedDot"></span><span id="schedLabel">任务空闲</span></div>
+      <button class="btn btn-outline btn-sm" onclick="refreshAll()">刷新</button>
+      <button class="btn btn-primary btn-sm" id="topPrimaryBtn" onclick="handlePrimaryAction()">添加账号</button>
+    </div>
+  </div>
+  <div class="page">
+    <div id="emptyState" class="hero-empty" style="display:none">
+      <h2 id="emptyTitle">先添加账号</h2>
+      <p id="emptyText">导入 Cookie 后，就可以创建隐私邮箱。</p>
+      <button class="btn btn-primary" id="emptyActionBtn" onclick="handlePrimaryAction()">添加账号</button>
+    </div>
+    <div id="view-accounts" style="display:none">
+      <div class="work-strip" id="accStrip">
+        <div class="work-stat"><span>账号</span><b id="accStripAccounts">0</b></div>
+        <div class="work-stat"><span>邮箱</span><b id="accStripEmails">0</b></div>
+        <div class="work-stat"><span>今日新建</span><b id="accStripToday">0</b></div>
+        <div class="work-stat"><span>当前任务</span><b id="accStripTask">空闲</b></div>
+      </div>
+      <div class="toolbar">
+        <button class="btn btn-primary" onclick="showAddAccountModal()">添加账号</button>
+      </div>
+      <div class="account-grid" id="accCards"></div>
+    </div>
+    <div id="view-emails">
+      <div class="panel">
+        <div class="panel-header">
+          <span>邮箱列表</span>
+          <div>
+            <span class="hint" id="emailCount">0</span>
+            <button class="btn btn-outline btn-sm" onclick="refreshEmails().then(renderAliasTable)">刷新</button>
+            <button class="btn btn-outline btn-sm" id="btnAliasSync" onclick="refreshAliases()" title="从云端同步标签和状态">云端同步</button>
+            <button class="btn btn-outline btn-sm" onclick="copyAll()">复制全部</button>
+            <button class="btn btn-outline btn-sm" onclick="exportCSV()">CSV</button>
+            <button class="btn btn-primary btn-sm" onclick="exportSelectedPickupTxt()">导出已选 TXT</button>
+            <button class="btn btn-primary btn-sm" onclick="showCreateDrawer()">创建邮箱</button>
+          </div>
+        </div>
+        <div class="filter-bar">
+          <span class="hint">筛选账号:</span>
+          <select id="aliasFilter" onchange="aliasPage=1;renderAliasTable()"><option value="all">全部账号</option></select>
+          <div class="segmented" aria-label="导出状态筛选">
+            <button type="button" class="active" data-export-filter="unexported" onclick="setExportFilter('unexported')" id="exportCountUnexported">未导出 0</button>
+            <button type="button" data-export-filter="exported" onclick="setExportFilter('exported')" id="exportCountExported">已导出 0</button>
+            <button type="button" data-export-filter="all" onclick="setExportFilter('all')" id="exportCountAll">全部 0</button>
+          </div>
+          <div class="pager" id="aliasPager">
+            <span class="hint">每页</span>
+            <div class="segmented" aria-label="每页数量">
+              <button type="button" data-page-size="20" onclick="setAliasPageSize(20)">20</button>
+              <button type="button" data-page-size="50" class="active" onclick="setAliasPageSize(50)">50</button>
+            </div>
+            <span class="hint" id="aliasPageInfo"></span>
+            <button class="btn btn-outline btn-sm" id="btnAliasPrev" onclick="setAliasPage(aliasPage-1)">上一页</button>
+            <button class="btn btn-outline btn-sm" id="btnAliasNext" onclick="setAliasPage(aliasPage+1)">下一页</button>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div id="aliasTableContainer" class="empty"><div class="icon"></div>还没有邮箱。请先添加账号，再点击「创建邮箱」。</div>
+        </div>
+      </div>
+    </div>
+    <div id="view-inbox" style="display:none">
+      <div class="panel">
+        <div class="panel-header">
+          <span>收件箱</span>
+          <div class="inbox-tools">
+            <select id="inboxAccount" onchange="refreshInbox()"></select>
+            <input type="number" id="inboxLimit" value="20" min="1" max="100" title="邮件数量">
+            <input type="text" id="aliasSearchInput" placeholder="输入邮箱地址查件..." title="输入隐私邮箱地址查件">
+            <button class="btn btn-outline btn-sm" id="btnInboxRefresh" onclick="refreshInbox()">刷新</button>
+            <button class="btn btn-outline btn-sm" id="btnInboxForce" onclick="refreshInbox(true)" title="跳过缓存重新拉取">强制刷新</button>
+            <button class="btn btn-outline btn-sm" id="btnInboxSearch" onclick="searchAliasMail()" title="查询指定邮箱的收件">查件</button>
+            <button class="btn btn-outline btn-sm" id="btnInboxAll" onclick="checkAliasMail()" title="检查所有隐私邮箱的收件">全部</button>
+            <button class="btn btn-outline btn-sm" id="btnInboxSettings" onclick="openInboxSettings()" title="设置收信密码">设置收信密码</button>
+            <span class="hint" id="cacheStatus"></span>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div id="inboxMsgs" class="empty"><div class="icon"></div><div class="empty-title">收件前先完成设置</div><ol class="empty-steps"><li>在「账号」里添加 Apple 账号</li><li>为账号设置收信密码</li><li>选择账号后即可看信</li></ol><button class="btn btn-primary" onclick="openInboxSettings()">开始设置</button></div>
+        </div>
+      </div>
+    </div>
+    <div id="view-settings" style="display:none">
+      <div class="panel">
+        <div class="settings-section">
+          <h3>自动创建</h3>
+          <p>每小时自动给未满的账号创建邮箱。</p>
+          <div class="toolbar">
+            <span class="status-dot" id="schedDotSettings"></span>
+            <span id="schedLabelSettings">已停止</span>
+            <button class="btn btn-sm" id="btnSched" onclick="toggleScheduler()">启动自动创建</button>
+          </div>
+        </div>
+        <div class="settings-section">
+          <h3>创建邮箱</h3>
+          <p>不同主账号最多 5 个并行；同一账号仍逐个创建，触发 Apple 临时限制时每次等待 1 分钟后自动续建。</p>
+          <div id="batchAccCount" class="hint">0 个可用账号</div>
+          <div class="chk-group" id="batchChkGroup"></div>
+          <div class="toolbar">
+            <label>每账号数量</label>
+            <input type="number" id="batchCount" value="5" min="1" max="750">
+            <label>标签</label>
+            <input type="text" id="batchLabel" placeholder="可选">
+            <button class="btn btn-primary" id="btnBatchExec" onclick="execBatchCreate()">开始创建</button>
+          </div>
+          <div id="batchProgress"></div>
+        </div>
+        <div class="settings-section">
+          <h3>任务与日志</h3>
+          <p>创建、同步和限制解除都会出现在这里。</p>
+          <button class="btn btn-outline btn-sm" onclick="clearLogs()">清屏</button>
+          <div class="log-feed" id="logFeed"></div>
+        </div>
+      </div>
+    </div>
+    <div id="view-docs" style="display:none"></div>
+    <div id="docsContent" style="display:none"></div>
+  </div>
+</main>
+</div>
+<div class="copy-toast" id="toast"></div>
+<script>var E=function(id){return document.getElementById(id)};
+var state={running:false,creating:false,round_status:'',total_created:0,today_created:0,current_round_created:0,next_trigger:null};
+var accounts=[],emails=[],logs=[],logCursor=0;
+var curTab='emails',sseConn=null;
+var pickupLinksByEmail={};var pickupLinksLoaded=false;var pickupSelected={};var exportFilter='unexported';var aliasPage=1;var aliasPageSize=50;
+var batchJob=null;var batchPollTimer=null;
+var _refreshBusy=false;var _createBusyByAccount={};var _aliasesBusy=false;
+var _inboxBusy=false;var _inboxSse=null;var _inboxStreamMsgs=[];
+var _inboxRequestSeq=0;var _inboxRenderedAccount='';var _expandedEmail=null;
+document.querySelectorAll('.nav-item').forEach(function(el){
+  el.addEventListener('click',function(){showTab(this.dataset.tab);});
+});
+function showView(id,on){var el=E(id);if(!el)return;var shown=el.style.display==='block';if(on){el.style.display='block';if(!shown){el.classList.remove('is-enter');void el.offsetWidth;el.classList.add('is-enter');}}else{el.style.display='none';el.classList.remove('is-enter');}}
+function showTab(tab){
+  if(tab==='batch'||tab==='logs'||tab==='dashboard'||tab==='docs')tab='settings';
+  curTab=tab;
+  document.querySelectorAll('.nav-item').forEach(function(n){n.classList.toggle('active',n.dataset.tab===curTab);});
+  var titles={accounts:'账号',emails:'邮箱',inbox:'收件箱',settings:'设置'};
+  E('tabTitle').textContent=titles[curTab]||curTab;
+  updateEmptyState();
+  if(accounts.length){
+    showView('view-accounts',curTab==='accounts');
+    showView('view-emails',curTab==='emails');
+    showView('view-inbox',curTab==='inbox');
+    showView('view-settings',curTab==='settings');
+  }
+  if(curTab==='emails'){refreshEmails().then(renderAliasTable);}
+  if(curTab==='accounts')renderDashboard();
+  if(curTab==='settings'){renderBatchPanel();renderLogs();}
+  if(curTab==='inbox')updateInboxAccountSelect();
+}
+function handlePrimaryAction(){
+  if(!accounts.length){showAddAccountModal();return;}
+  showTab('settings');
+  var box=E('btnBatchExec');if(box)box.scrollIntoView({behavior:'smooth',block:'center'});
+}
+function showCreateDrawer(){handlePrimaryAction();}
+function updateEmptyState(){
+  var empty=E('emptyState');
+  var noAcc=!accounts.length;
+  var showHero=noAcc && curTab!=='inbox';
+  showView('emptyState',showHero);
+  if(noAcc && curTab==='inbox'){
+    showView('view-accounts',false);
+    showView('view-emails',false);
+    showView('view-inbox',true);
+    showView('view-settings',false);
+    renderInboxSetupHint();
+  }else if(noAcc){
+    E('emptyTitle').textContent='先添加账号';
+    E('emptyText').textContent='导入 Cookie 后，就可以创建隐私邮箱。';
+    E('emptyActionBtn').textContent='添加账号';
+    showView('view-accounts',false);
+    showView('view-emails',false);
+    showView('view-inbox',false);
+    showView('view-settings',false);
+  }else{
+    showView('view-accounts',curTab==='accounts');
+    showView('view-emails',curTab==='emails');
+    showView('view-inbox',curTab==='inbox');
+    showView('view-settings',curTab==='settings');
+  }
+  var btn=E('topPrimaryBtn');
+  if(!accounts.length){btn.textContent='添加账号';btn.onclick=showAddAccountModal;}
+  else {btn.textContent='创建邮箱';btn.onclick=showCreateDrawer;}
+}
+async function api(path,opts){var timeout=(opts||{}).timeout||60000;if(opts)delete opts.timeout;var ctrl=new AbortController();var t=setTimeout(function(){ctrl.abort()},timeout);try{var r=await fetch(path,Object.assign({signal:ctrl.signal},opts||{}));clearTimeout(t);return r.json();}catch(e){clearTimeout(t);var msg=(e.name==='AbortError')?('请求超时 ('+(timeout/1000)+'s)'):(e.message||'网络错误');return{ok:false,error:msg};}}
+async function apiSlow(path,opts){return api(path,Object.assign({timeout:60000},opts||{}));}
+async function refreshAll(){if(_refreshBusy)return;_refreshBusy=true;try{var _a=api('/api/accounts'),_s=api('/api/state');var a=await _a,s=await _s;accounts=a.accounts||[];state=s;renderSidebar();renderDashboard();updateEmptyState();if(curTab==='emails'){await refreshEmails();renderAliasTable();}if(curTab==='settings')renderBatchPanel();updateInboxAccountSelect();}finally{_refreshBusy=false;}}
+async function refreshLight(){if(_refreshBusy)return;var s=await api('/api/state');state=s;renderSidebar();}
+async function refreshEmails(){var d=await api('/api/emails');emails=d.emails||[];pickupLinksByEmail={};emails.forEach(function(e){if(e.pickup_url)pickupLinksByEmail[String(e.email||'').toLowerCase()]=e.pickup_url;var acc=accounts.find(function(a){return a.id===e.account_id});e.account_name=acc?(acc.name||acc.real_email||''):(e.account_id||'');e.account_email=acc?(acc.real_email||''):'';});pickupLinksLoaded=true;E('emailCount').textContent=emails.length;updateEmailFilter();}
+
+function renderSidebar(){
+  var running=state.running;
+  var creating=!!(state.creating||(batchJob&&(batchJob.status==='queued'||batchJob.status==='running')));
+  ['schedDot','schedDotSettings','sideTaskDot'].forEach(function(id){var el=E(id);if(el)el.className='status-dot '+(creating?'online busy':(running?'online':'offline'));});
+  var sm=running?(state.creating?'正在创建邮箱':'等待下一轮'):'任务空闲';
+  if(batchJob&&(batchJob.status==='queued'||batchJob.status==='running'))sm='正在创建邮箱';
+  if(E('schedLabel'))E('schedLabel').textContent=sm;
+  if(E('schedLabelSettings'))E('schedLabelSettings').textContent=running?(state.creating?'创建中':'等待下轮'):'已停止';
+  if(E('sideTaskText'))E('sideTaskText').textContent=sm;
+  if(E('sideStatAccounts'))E('sideStatAccounts').textContent=accounts.length;
+  var aliasCount=emails.length||state.alias_count||accounts.reduce(function(n,a){return n+(a.alias_total||0);},0);
+  if(E('sideStatEmails'))E('sideStatEmails').textContent=aliasCount;
+  if(E('sideStatReady'))E('sideStatReady').textContent=accounts.filter(function(a){return a.has_app_password}).length;
+  var bs=E('btnSched');
+  if(bs){bs.textContent=running?'停止自动创建':'启动自动创建';bs.className='btn btn-sm '+(running?'btn-danger':'btn-primary');}
+  renderAccountStrip();
+}
+function accountBatchItem(accId){if(!batchJob||!batchJob.accounts)return null;return batchJob.accounts[accId]||null;}
+function renderAccountStrip(){if(!E('accStripAccounts'))return;var aliasCount=emails.length||state.alias_count||accounts.reduce(function(n,a){return n+(a.alias_total||0);},0);E('accStripAccounts').textContent=accounts.length;E('accStripEmails').textContent=aliasCount;E('accStripToday').textContent=state.today_created||0;var busy=!!(batchJob&&(batchJob.status==='queued'||batchJob.status==='running'));var task='空闲';if(busy){var target=batchTargetCount(batchJob)||0;var created=batchJob.total_created||0;task=created+(target?(' / '+target):'');task=(jobDisplayStatus(batchJob)==='waiting'?'等待限制解除':' 创建中')+' '+task;}else if(state.creating){task='正在创建邮箱';}else if(state.running){task='等待下一轮';}E('accStripTask').textContent=task;E('accStripTask').parentElement.classList.toggle('is-live',busy||!!state.creating);}
+function renderDashboard(){
+  renderAccountStrip();
+  var c=E('accCards');
+  if(!c)return;
+  if(!accounts.length){c.innerHTML='';return;}
+  var limit=750;
+  c.innerHTML=accounts.map(function(a){
+    var stCls=a.status==='active'?'ok':'err';
+    var stText=a.status==='active'?'登录有效':(a.last_error||'登录已过期，请重新导入 Cookie');
+    var mailReady=a.has_app_password?'可以收信':'还不能收信';
+    var email=a.real_email||'';
+    var used=a.alias_total||0;
+    var pct=Math.min(100, used*100/limit);
+    var job=accountBatchItem(a.id);
+    var jobBusy=job&&(job.status==='queued'||job.status==='running'||job.status==='waiting');
+    var jobHtml='';
+    if(jobBusy){var accTarget=parseInt(batchJob.count_per_account,10)||0,accCreated=job.created||0,accErrors=job.errors||0,mode=job.status==='waiting'?'is-wait':'is-run';jobHtml='<div class="acc-job"><div class="progress-head"><strong>'+esc(batchStatusText(job.status))+'</strong><span>'+accCreated+(accTarget?(' / '+accTarget):'')+'</span></div>'+progressBarHtml(accCreated,accErrors,accTarget||Math.max(accCreated+accErrors,1),mode)+'</div>';}
+    return '<div class="acc-card'+(jobBusy?' is-busy':'')+'"><div class="acc-top"><div><div class="acc-title">'+esc(a.name||'未命名')+'</div><div class="acc-email">'+esc(email)+'</div></div><span class="status-badge '+stCls+'">'+esc(stText.substring(0,24))+'</span></div><div class="acc-usage"><div class="progress-head"><span>邮箱容量</span><span>'+used+' / '+limit+'</span></div><div class="progress-bar"><div class="fill ok" style="width:'+pct+'%"></div></div></div><div class="acc-stats"><div>'+esc(mailReady)+'</div></div>'+jobHtml+'<div class="acc-actions"><button class="btn btn-primary btn-xs" onclick="createForAccount(\''+escAttr(a.id)+'\',5)">创建邮箱</button><button class="btn btn-outline btn-xs" onclick="validateAccount(\''+escAttr(a.id)+'\')">检查登录</button><button class="btn btn-outline btn-xs" onclick="showAppPwdModal(\''+escAttr(a.id)+'\')">设置收信</button><button class="btn btn-outline btn-xs" onclick="removeAccount(\''+escAttr(a.id)+'\')">删除</button></div></div>';
+  }).join('');
+}
+function updateEmailFilter(){var sel=E('aliasFilter');if(!sel)return;var old=sel.value;sel.innerHTML='<option value="all">全部账号 ('+emails.length+')</option>';var byAcc={};emails.forEach(function(e){var ak=e.account_id||'?';byAcc[ak]=(byAcc[ak]||0)+1;});Object.keys(byAcc).forEach(function(ak){var acc=accounts.find(function(x){return x.id===ak});var label=acc?(acc.name||acc.real_email||ak):ak;sel.innerHTML+='<option value="'+escAttr(ak)+'">'+esc(label)+' ('+byAcc[ak]+')</option>';});sel.value=old||'all';}
 async function loadPickupLinks(){var d=await apiSlow('/api/pickup-links');if(d.error){toast('取件链接生成失败: '+d.error,true);return}pickupLinksByEmail={};(d.links||[]).forEach(function(x){pickupLinksByEmail[String(x.email||'').toLowerCase()]=x.url});pickupLinksLoaded=true;}
-function setExportFilter(value){exportFilter=value;document.querySelectorAll('[data-export-filter]').forEach(function(btn){btn.classList.toggle('active',btn.dataset.exportFilter===value)});renderAliasTable();}
+function setAliasPageSize(size){aliasPageSize=parseInt(size,10)||50;aliasPage=1;renderAliasTable();}
+function setAliasPage(page){aliasPage=parseInt(page,10)||1;if(aliasPage<1)aliasPage=1;renderAliasTable();}
+function updateAliasPager(total){var pages=Math.max(1,Math.ceil((total||0)/aliasPageSize));if(aliasPage>pages)aliasPage=pages;if(aliasPage<1)aliasPage=1;var start=total?((aliasPage-1)*aliasPageSize+1):0;var end=Math.min(aliasPage*aliasPageSize,total||0);var info=E('aliasPageInfo');if(info)info.textContent=total?(start+'-'+end+' / '+total):'0';var prev=E('btnAliasPrev'),next=E('btnAliasNext');if(prev)prev.disabled=aliasPage<=1||!total;if(next)next.disabled=aliasPage>=pages||!total;document.querySelectorAll('[data-page-size]').forEach(function(btn){btn.classList.toggle('active',String(aliasPageSize)===String(btn.dataset.pageSize));});}
+function setExportFilter(value){exportFilter=value;aliasPage=1;document.querySelectorAll('[data-export-filter]').forEach(function(btn){btn.classList.toggle('active',btn.dataset.exportFilter===value)});renderAliasTable();}
 function togglePickupSelected(email,checked){var key=String(email||'').toLowerCase();if(checked)pickupSelected[key]=true;else delete pickupSelected[key];}
 function toggleAllPickup(){var checks=document.querySelectorAll('#aliasTableContainer input.pickup-check:not(:disabled)');var shouldCheck=Array.from(checks).some(function(c){return !c.checked});checks.forEach(function(c){c.checked=shouldCheck;togglePickupSelected(c.dataset.email,shouldCheck);});}
 function copyPickup(url){if(!url){toast('取件链接尚未生成',true);return}navigator.clipboard.writeText(url).then(function(){toast('取件链接已复制')});}
 function visibleAliases(){var accountFilter=E('aliasFilter').value;return emails.filter(function(e){if(accountFilter!=='all'&&e.account_id!==accountFilter)return false;if(exportFilter==='exported')return !!e.exported;if(exportFilter==='unexported')return !e.exported;return true;});}
 function formatExportTime(value){if(!value)return '--';try{return new Date(value).toLocaleString('zh-CN',{hour12:false})}catch(_){return value}}
-async function exportSelectedPickupTxt(){var selected=emails.filter(function(e){return !e.exported&&pickupSelected[String(e.email||'').toLowerCase()]}).map(function(e){return e.email});if(!selected.length){toast('请先勾选未导出的邮箱',true);return}var d=await apiSlow('/api/pickup-links/export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({emails:selected})});if(!d.ok){toast('导出失败: '+(d.error||'未知错误'),true);return}if(!(d.lines||[]).length){toast('所选邮箱均已导出，未重复生成文件',true);await refreshEmails();renderAliasTable();return}var b=new Blob(['\uFEFF'+d.lines.join('\n')],{type:'text/plain;charset=utf-8'}),a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='icloud_pickup_links_'+new Date().toISOString().slice(0,10)+'.txt';a.click();setTimeout(function(){URL.revokeObjectURL(a.href)},1000);selected.forEach(function(email){delete pickupSelected[String(email).toLowerCase()]});await refreshEmails();renderAliasTable();toast('已导出 '+d.count+' 条，并归类到已导出邮箱');}
+async function exportSelectedPickupTxt(){var selected=emails.filter(function(e){return !e.exported&&pickupSelected[String(e.email||'').toLowerCase()]}).map(function(e){return e.email});if(!selected.length){toast('请先勾选未导出的邮箱',true);return}var d=await apiSlow('/api/pickup-links/export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({emails:selected})});if(!d.ok){toast('导出失败: '+(d.error||'未知错误'),true);return}if(!(d.lines||[]).length){toast('所选邮箱均已导出，未重复生成文件',true);await refreshEmails();renderAliasTable();return}var b=new Blob(['\uFEFF'+d.lines.join('\n')],{type:'text/plain;charset=utf-8'}),a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='hidemail_pickup_links_'+new Date().toISOString().slice(0,10)+'.txt';a.click();setTimeout(function(){URL.revokeObjectURL(a.href)},1000);selected.forEach(function(email){delete pickupSelected[String(email).toLowerCase()]});await refreshEmails();renderAliasTable();toast('已导出 '+d.count+' 条');}
 async function restoreExportedEmail(email){if(!confirm('确认将 '+email+' 恢复为未导出？'))return;var d=await api('/api/export-history/restore',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({emails:[email]})});if(!d.ok){toast('恢复失败: '+(d.error||'未知错误'),true);return}await refreshEmails();renderAliasTable();toast('已恢复为未导出');}
-function renderAliasTable(){updateEmailFilter();var filtered=visibleAliases();var exportedCount=emails.filter(function(e){return e.exported}).length;var unexportedCount=emails.length-exportedCount;E('exportCountUnexported').textContent='未导出 '+unexportedCount;E('exportCountExported').textContent='已导出 '+exportedCount;E('exportCountAll').textContent='全部 '+emails.length;E('emailCount').textContent=filtered.length+' / '+emails.length;var c=E('aliasTableContainer');if(!filtered.length){c.innerHTML='<div class="empty"><div class="icon"></div>'+(exportFilter==='exported'?'暂无已导出邮箱':'暂无可导出邮箱')+'</div>';return;}if(!pickupLinksLoaded){c.innerHTML='<div class="empty">正在生成取件链接...</div>';loadPickupLinks().then(renderAliasTable);return;}var h='<table class="email-table"><thead><tr><th style="width:42px"><input type="checkbox" title="全选/取消全选" onclick="toggleAllPickup()"></th><th>#</th><th>邮箱地址</th><th>取件链接</th><th>所属账号</th><th>标签</th><th>导出状态</th><th>邮箱状态</th></tr></thead><tbody>';filtered.forEach(function(e,i){var key=String(e.email||'').toLowerCase();var url=pickupLinksByEmail[key]||'';var checked=pickupSelected[key]&&!e.exported?' checked':'';var disabled=e.exported?' disabled':'';var accName=e.account_name||e.account_email||e.account_id||'--';var activeHtml=e.hasOwnProperty('active')?(e.active?'<span style="color:var(--green)">活跃</span>':'<span style="color:var(--red)">停用</span>'):'<span style="color:var(--ink-faint)">--</span>';var exportHtml=e.exported?'<span style="color:var(--green)">已导出</span><div style="font-size:10px;color:var(--ink-faint);margin-top:3px">'+esc(formatExportTime(e.exported_at))+'</div><button class="copy-btn" onclick="restoreExportedEmail(\''+escAttr(e.email||'')+'\')" title="恢复后可再次导出">恢复</button>':'<span style="color:var(--ink-faint)">未导出</span>';h+='<tr><td><input class="pickup-check" type="checkbox" data-email="'+escAttr(e.email||'')+'"'+checked+disabled+' onchange="togglePickupSelected(this.dataset.email,this.checked)"></td><td style="color:var(--ink-faint);width:40px">'+(i+1)+'</td><td class="mono">'+esc(e.email||'')+'</td><td style="max-width:360px"><span style="font-size:11px;word-break:break-all">'+esc(url||'生成失败')+'</span> '+(url?'<button class="copy-btn" onclick="copyPickup(\''+escAttr(url)+'\')" title="复制取件链接">复制</button>':'')+'</td><td style="font-size:11px">'+esc(accName)+'</td><td style="font-size:11px;color:var(--ink-faint)">'+esc((e.label||'').substring(0,30))+'</td><td>'+exportHtml+'</td><td>'+activeHtml+'</td></tr>';});h+='</tbody></table>';c.innerHTML=h;}
-var batchJob=null;var batchPollTimer=null;
-function batchStatusText(status){var labels={queued:'等待中',running:'创建中',completed:'已完成',partial:'部分成功',limited:'Apple 已限制',failed:'失败'};return labels[status]||status||'--';}
-function renderBatchPanel(){var activeAccs=accounts.filter(function(a){return a.status==='active'});E('batchAccCount').textContent=activeAccs.length+' 个可用账号';var g=E('batchChkGroup');if(!activeAccs.length){g.innerHTML='<span style="font-size:12px;color:var(--ink-faint)">没有活跃账号，请先添加</span>';E('btnBatchExec').disabled=true;}else{g.innerHTML=activeAccs.map(function(a){var email=a.real_email||a.name||a.id;var limited=a.create_status==='limited';var note=limited?'<span style="color:var(--red);font-size:11px">上次触发 Apple 限制，本次会尝试一次</span>':'';return'<label class="chk-item" style="width:100%;align-items:flex-start"><input type="checkbox" value="'+escAttr(a.id)+'" checked><span><strong>'+esc(a.name||email.substring(0,20))+'</strong> '+note+'</span></label>';}).join('');E('btnBatchExec').disabled=!!(batchJob&&(batchJob.status==='queued'||batchJob.status==='running'));}if(batchJob)renderBatchJob(batchJob);else loadCurrentBatchJob();}
+function renderAliasTable(){updateEmailFilter();var filtered=visibleAliases();var exportedCount=emails.filter(function(e){return e.exported}).length;var unexportedCount=emails.length-exportedCount;E('exportCountUnexported').textContent='未导出 '+unexportedCount;E('exportCountExported').textContent='已导出 '+exportedCount;E('exportCountAll').textContent='全部 '+emails.length;E('emailCount').textContent=filtered.length+' / '+emails.length;updateAliasPager(filtered.length);var c=E('aliasTableContainer');if(!filtered.length){c.innerHTML='<div class="empty"><div class="icon"></div>'+(emails.length?'当前筛选下没有邮箱':'还没有邮箱。请先添加账号，再点击「创建邮箱」。')+'</div>';return;}if(!pickupLinksLoaded){c.innerHTML='<div class="empty">正在生成取件链接...</div>';loadPickupLinks().then(renderAliasTable);return;}var start=(aliasPage-1)*aliasPageSize;var pageItems=filtered.slice(start,start+aliasPageSize);var pages=Math.max(1,Math.ceil(filtered.length/aliasPageSize));var h='<table class="email-table"><thead><tr><th style="width:42px"><input type="checkbox" title="全选本页" onclick="toggleAllPickup()"></th><th>#</th><th>邮箱地址</th><th>取件链接</th><th>所属账号</th><th>标签</th><th>创建时间</th><th>导出状态</th><th>邮箱状态</th></tr></thead><tbody>';pageItems.forEach(function(e,i){var key=String(e.email||'').toLowerCase();var url=pickupLinksByEmail[key]||'';var checked=pickupSelected[key]&&!e.exported?' checked':'';var disabled=e.exported?' disabled':'';var accName=e.account_name||e.account_email||e.account_id||'--';var activeHtml=e.hasOwnProperty('active')?(e.active?'<span style="color:var(--green)">可用</span>':'<span style="color:var(--red)">停用</span>'):'<span style="color:var(--muted)">--</span>';var exportHtml=e.exported?'<span style="color:var(--green)">已导出</span><div class="hint">'+esc(formatExportTime(e.exported_at))+'</div><button class="copy-btn" onclick="restoreExportedEmail(\''+escAttr(e.email||'')+'\')" title="恢复后可再次导出">恢复</button>':'<span style="color:var(--muted)">未导出</span>';h+='<tr><td><input class="pickup-check" type="checkbox" data-email="'+escAttr(e.email||'')+'"'+checked+disabled+' onchange="togglePickupSelected(this.dataset.email,this.checked)"></td><td class="hint">'+(start+i+1)+'</td><td class="mono">'+esc(e.email||'')+'</td><td class="pickup-cell">'+(url?'<button class="copy-btn" onclick="copyPickup(\''+escAttr(url)+'\')" title="'+escAttr(url)+'">复制链接</button>':'<span class="hint">生成失败</span>')+'</td><td>'+esc(accName)+'</td><td class="hint">'+esc((e.label||'').substring(0,30))+'</td><td style="white-space:nowrap">'+esc(formatExportTime(e.created_at))+'</td><td>'+exportHtml+'</td><td>'+activeHtml+'</td></tr>';});h+='</tbody></table>';h+='<div class="pager pager-bottom"><span class="hint">'+(start+1)+'-'+(start+pageItems.length)+' / '+filtered.length+'</span><button class="btn btn-outline btn-sm" onclick="setAliasPage(aliasPage-1)"'+(aliasPage<=1?' disabled':'')+'>上一页</button><button class="btn btn-outline btn-sm" onclick="setAliasPage(aliasPage+1)"'+(aliasPage>=pages?' disabled':'')+'>下一页</button></div>';c.innerHTML=h;}
+function batchStatusText(status){var labels={waiting:'等待 Apple 限制解除',queued:'等待中',running:'创建中',completed:'已完成',partial:'部分成功',limited:'Apple 已限制',failed:'失败'};return labels[status]||status||'--';}
+function renderBatchPanel(){var activeAccs=accounts.filter(function(a){return a.status==='active'});E('batchAccCount').textContent=activeAccs.length+' 个可用账号';var g=E('batchChkGroup');if(!activeAccs.length){g.innerHTML='<span class="hint">没有可用账号，请先添加</span>';E('btnBatchExec').disabled=true;}else{g.innerHTML=activeAccs.map(function(a){var email=a.real_email||a.name||a.id;var limited=a.create_status==='limited';var note=limited?'<span style="color:var(--red);font-size:12px">上次触发限制，本次会再试一次</span>':'';return'<label class="chk-item"><input type="checkbox" value="'+escAttr(a.id)+'" checked><span><strong>'+esc(a.name||email.substring(0,20))+'</strong> '+note+'</span></label>';}).join('');E('btnBatchExec').disabled=!!(batchJob&&(batchJob.status==='queued'||batchJob.status==='running'));}if(batchJob)renderBatchJob(batchJob);else loadCurrentBatchJob();}
 async function loadCurrentBatchJob(){var d=await api('/api/create-batch-current');if(d.ok&&d.job){batchJob=d.job;renderBatchJob(batchJob);if(batchJob.status==='queued'||batchJob.status==='running')scheduleBatchPoll();}}
-function renderBatchJob(job){var box=E('batchProgress');if(!job){box.innerHTML='';return}var total=job.total_accounts||0,done=job.completed_accounts||0,pct=total?Math.round(done*100/total):0;var statusColor=job.status==='completed'?'var(--green)':job.status==='failed'?'var(--red)':'var(--ink)';var h='<div style="border-top:1px solid var(--rule-strong);padding-top:14px"><div style="display:flex;justify-content:space-between;gap:12px;font-family:var(--mono);font-size:12px"><strong style="color:'+statusColor+'">'+esc(batchStatusText(job.status))+'</strong><span>'+done+'/'+total+' 个账号 | '+(job.total_created||0)+' 成功 / '+(job.total_errors||0)+' 失败</span></div><div class="progress-bar"><div class="fill" style="width:'+pct+'%"></div></div><div style="margin-top:10px">';Object.keys(job.accounts||{}).forEach(function(id){var item=job.accounts[id],color=item.status==='completed'?'var(--green)':(item.status==='limited'||item.status==='failed')?'var(--red)':'var(--ink-soft)';h+='<div style="padding:9px 0;border-bottom:1px solid var(--rule);font-family:var(--mono);font-size:12px"><div style="display:flex;justify-content:space-between;gap:10px"><strong>'+esc(item.name||id)+'</strong><span style="color:'+color+'">'+esc(batchStatusText(item.status))+' | '+(item.created||0)+' 成功 / '+(item.errors||0)+' 失败</span></div>'+(item.error?'<div style="color:var(--red);margin-top:5px;word-break:break-word">'+esc(item.error)+'</div>':'')+'</div>';});h+='</div></div>';box.innerHTML=h;var running=job.status==='queued'||job.status==='running';E('btnBatchExec').disabled=running;E('btnBatchExec').textContent=running?'批量创建中...':'开始创建';}
+function jobDisplayStatus(job){var waiting=false,runningAcc=false;Object.keys(job.accounts||{}).forEach(function(id){var st=(job.accounts[id]||{}).status;if(st==='waiting')waiting=true;if(st==='running')runningAcc=true;});if((job.status==='queued'||job.status==='running')&&waiting&&!runningAcc)return 'waiting';return job.status;}
+function batchTargetCount(job){var per=parseInt(job.count_per_account,10)||0;var accs=job.total_accounts||Object.keys(job.accounts||{}).length||0;var target=per*accs;return target||((job.total_created||0)+(job.total_errors||0));}
+function progressBarHtml(created,errors,target,mode){var createdPct=target?Math.min(100,created*100/target):0;var errorPct=target?Math.min(100-createdPct,errors*100/target):0;if(created&&createdPct<1.2)createdPct=1.2;return '<div class="progress-bar'+(mode?(' '+mode):'')+'"><div class="fill ok" style="width:'+createdPct+'%"></div>'+(errorPct?('<div class="fill err" style="width:'+errorPct+'%"></div>'):'')+'</div>';}
+function retryLeftText(retryAt){if(!retryAt)return '';var t=Date.parse(retryAt);if(!t)return '';var sec=Math.max(0,Math.round((t-Date.now())/1000));if(sec<=0)return '即将继续';if(sec<60)return '约 '+sec+' 秒后继续';return '约 '+Math.ceil(sec/60)+' 分钟后继续';}
+function renderBatchJob(job){var box=E('batchProgress');if(!job){box.innerHTML='';return}var total=job.total_accounts||0,done=job.completed_accounts||0,created=job.total_created||0,errors=job.total_errors||0,target=batchTargetCount(job)||0;var processed=target?Math.min(target,created+errors):created+errors;var pct=target?Math.round(processed*100/target):0;var displayStatus=jobDisplayStatus(job);var statusColor=displayStatus==='completed'?'var(--green)':(displayStatus==='failed'||displayStatus==='limited'||displayStatus==='waiting')?'var(--red)':'var(--ink)';var running=job.status==='queued'||job.status==='running';var barMode=displayStatus==='waiting'?'is-wait':(running?'is-run':'');var h='<div class="progress-card"><div class="progress-head"><strong style="color:'+statusColor+'">'+esc(batchStatusText(displayStatus))+'</strong><span>'+created+' / '+target+' · '+pct+'%</span></div>'+progressBarHtml(created,errors,target,barMode)+'<div class="progress-meta"><span>'+done+'/'+total+' 个账号完成</span><span>'+created+' 成功 / '+errors+' 失败</span></div>';Object.keys(job.accounts||{}).forEach(function(id){var item=job.accounts[id],color=item.status==='completed'?'var(--green)':(item.status==='limited'||item.status==='failed'||item.status==='waiting')?'var(--red)':'var(--muted)';var accTarget=parseInt(job.count_per_account,10)||0,accCreated=item.created||0,accErrors=item.errors||0;var accMode=item.status==='waiting'?'is-wait':((item.status==='running'||item.status==='queued')?'is-run':'');var extra=retryLeftText(item.retry_at);h+='<div class="progress-item"><div class="progress-head"><strong>'+esc(item.name||id)+'</strong><span style="color:'+color+'">'+esc(batchStatusText(item.status))+(accTarget?(' · '+accCreated+' / '+accTarget):(' · '+accCreated))+'</span></div>'+progressBarHtml(accCreated,accErrors,accTarget||Math.max(accCreated+accErrors,1),accMode)+(item.error?('<div class="progress-note" style="color:var(--red)">'+esc(item.error)+(extra?(' · '+esc(extra)):'' )+'</div>'):'')+'</div>';});h+='</div>';box.innerHTML=h;E('btnBatchExec').disabled=running;E('btnBatchExec').textContent=running?'正在创建...':'开始创建';renderSidebar();if(curTab==='accounts')renderDashboard();}
 function scheduleBatchPoll(){if(batchPollTimer)clearTimeout(batchPollTimer);batchPollTimer=setTimeout(pollBatchJob,1200);}
-async function pollBatchJob(){if(!batchJob||!batchJob.id)return;var d=await api('/api/create-batch/'+encodeURIComponent(batchJob.id));if(!d.ok){toast('获取批量进度失败: '+(d.error||'未知错误'),true);return}batchJob=d.job;renderBatchJob(batchJob);if(batchJob.status==='queued'||batchJob.status==='running'){scheduleBatchPoll();return}await refreshAll();if(batchJob.total_created){toast('批量完成: '+batchJob.total_created+' 个成功');}else{toast('本次未创建成功，请查看账号错误',true);}}
-async function execBatchCreate(){var checks=document.querySelectorAll('#batchChkGroup input:checked');var ids=[];checks.forEach(function(c){ids.push(c.value)});if(!ids.length){toast('请勾选至少一个账号',true);return}var count=Math.max(1,Math.min(parseInt(E('batchCount').value)||5,20));E('batchCount').value=count;var label=E('batchLabel').value.trim();var btn=E('btnBatchExec');btn.disabled=true;btn.textContent='正在启动...';var d=await api('/api/create-batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({account_ids:ids,count_per_account:count,label:label})});if(!d.ok){btn.disabled=false;btn.textContent='开始创建';if(d.job_id){batchJob={id:d.job_id,status:'running'};scheduleBatchPoll();}toast(d.error||'批量任务启动失败',true);return}batchJob=d.job;renderBatchJob(batchJob);scheduleBatchPoll();}
-var _inboxBusy=false;var _inboxSse=null;var _inboxStreamMsgs=[];function refreshInbox(force){if(_inboxBusy)return;var accId=E('inboxAccount').value;if(!accId){E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>请先选择账号</div>';return}if(force){_inboxBusy=true;var limit=parseInt(E('inboxLimit').value)||20;E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>强制刷新中...</div>';apiSlow('/api/accounts/'+encodeURIComponent(accId)+'/inbox?limit='+limit+'&force=1').then(function(d){_inboxBusy=false;if(d.error){E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>'+esc(d.error||'连接失败')+'</div>';return;}renderInboxMsgs(d.emails||[],'收件箱 ('+(d.count||0)+' 封)');updateCacheStatus(d.cached);});return;}startInboxStream(accId);}function startInboxStream(accId){if(_inboxSse){_inboxSse.close();_inboxSse=null}_inboxBusy=true;_inboxStreamMsgs=[];E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>正在逐条拉取邮件...</div>';var limit=parseInt(E('inboxLimit').value)||20;_inboxSse=new EventSource('/api/accounts/'+encodeURIComponent(accId)+'/inbox-stream?limit='+limit);_inboxSse.onmessage=function(e){try{var d=JSON.parse(e.data);if(d.type==='start'){}else if(d.type==='email'){_inboxStreamMsgs.push(d.email);renderInboxMsgs(_inboxStreamMsgs,'收件箱 ('+d.count+' 封, 加载中...)');}else if(d.type==='done'){_inboxSse.close();_inboxSse=null;_inboxBusy=false;renderInboxMsgs(_inboxStreamMsgs,'收件箱 ('+d.count+' 封)');}else if(d.type==='error'){_inboxSse.close();_inboxSse=null;_inboxBusy=false;E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>'+esc(d.error||'连接失败')+'</div>';}}catch(_){}};_inboxSse.onerror=function(){if(_inboxSse){_inboxSse.close();_inboxSse=null;}_inboxBusy=false;if(_inboxStreamMsgs.length){renderInboxMsgs(_inboxStreamMsgs,'收件箱 ('+_inboxStreamMsgs.length+' 封, 连接中断)');}else{E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>连接失败</div>';}};}async function searchAliasMail(){if(_inboxBusy)return;_inboxBusy=true;try{var accId=E('inboxAccount').value;var alias=E('aliasSearchInput').value.trim();if(!accId){toast('请先选择账号',true);return}if(!alias){toast('请输入隐私邮箱地址',true);return}E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>查询 '+esc(alias)+' ...</div>';var d=await apiSlow('/api/accounts/'+encodeURIComponent(accId)+'/mail/'+encodeURIComponent(alias)+'?limit=30');if(d.error){E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>'+esc(d.error)+'</div>';return;}renderInboxMsgs(d.emails||[],esc(alias)+' ('+(d.count||0)+' 封)');}finally{_inboxBusy=false;}}async function checkAliasMail(){if(_inboxBusy)return;_inboxBusy=true;try{var accId=E('inboxAccount').value;if(!accId){_inboxBusy=false;E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>请先选择账号</div>';return}E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>正在检查各别名的收件...</div>';var d=await apiSlow('/api/accounts/'+encodeURIComponent(accId)+'/alias-mail');if(d.error){E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>'+esc(d.error||'查询失败')+'</div>';return;}var byAlias=d.by_alias||{};var total=0;var aliasKeys=Object.keys(byAlias);if(!aliasKeys.length){E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>所有隐私邮箱暂无收件</div>';return;}var h='';aliasKeys.forEach(function(alias){var msgs=byAlias[alias]||[];total+=msgs.length;h+='<div style="padding:8px 14px;border-bottom:1px solid var(--rule);font-weight:600;font-size:13px;background:var(--paper-dim)">'+esc(alias)+' ('+msgs.length+' 封)</div>';msgs.forEach(function(m){h+='<div style="padding:6px 20px;border-bottom:1px solid var(--rule);font-size:12px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:4px"><span><strong>'+esc(m.subject||'(无主题)')+'</strong></span><span style="color:var(--ink-soft)">'+esc(m.from||'').substring(0,30)+'</span><span style="color:var(--ink-faint);font-size:11px">'+(m.date||'').substring(0,19)+'</span></div>';});});E('inboxMsgs').innerHTML='<div style="font-size:11px;color:var(--ink-faint);padding:8px 14px;border-bottom:1px solid var(--rule)">共 '+aliasKeys.length+' 个别名收到 '+total+' 封邮件</div>'+h;}finally{_inboxBusy=false;}}function renderInboxMsgs(msgs,title){if(!msgs.length){E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>收件箱为空</div>';return;}var h='<div style="font-size:11px;color:var(--ink-faint);padding:8px 16px;border-bottom:1px solid var(--rule)">'+esc(title)+'</div>';msgs.forEach(function(m,i){var mid=m.id||'m'+i;h+='<div class="email-item" style="border-bottom:1px solid var(--rule);cursor:pointer" onclick="toggleEmail(\''+escAttr(mid)+'\',\''+escAttr(m.id||'')+'\')"><div style="padding:12px 16px;display:flex;justify-content:space-between;align-items:flex-start;gap:12px"><div style="flex:1;min-width:0"><div style="font-weight:600;font-size:14px;margin-bottom:4px">'+esc(m.subject||'(无主题)')+'</div><div style="font-size:12px;color:var(--ink-soft)">'+esc(m.from||'')+'</div><div style="font-size:11px;color:var(--ink-faint);margin-top:2px">To: '+esc((m.to||'').substring(0,50))+'</div></div><div style="font-size:11px;color:var(--ink-faint);white-space:nowrap;text-align:right">'+(m.date||'').substring(0,19)+'</div></div><div id="'+escAttr(mid)+'_body" style="display:none;padding:0 16px 16px;font-size:13px;line-height:1.7;color:var(--ink-soft);white-space:pre-wrap;word-break:break-word;max-height:400px;overflow-y:auto;border-top:1px solid var(--rule)"></div></div>';});E('inboxMsgs').innerHTML=h;}var _expandedEmail=null;async function toggleEmail(domId,msgId){var bodyEl=E(domId+'_body');if(!bodyEl)return;if(_expandedEmail&&_expandedEmail!==domId){var prev=E(_expandedEmail+'_body');if(prev)prev.style.display='none';}if(bodyEl.style.display==='block'){bodyEl.style.display='none';_expandedEmail=null;return;}bodyEl.style.display='block';_expandedEmail=domId;if(bodyEl.textContent.trim()&&bodyEl.textContent!=='加载中...')return;bodyEl.textContent='加载中...';if(!msgId){bodyEl.textContent='(无法获取邮件正文)';return;}var accId=E('inboxAccount').value;if(!accId){bodyEl.textContent='(请先选择账号)';return;}var d=await apiSlow('/api/accounts/'+encodeURIComponent(accId)+'/message/'+encodeURIComponent(msgId));if(!d.ok||!d.message){bodyEl.textContent='(获取失败: '+(d.error||'未知')+')';return;}bodyEl.textContent=d.message.body||'(无正文内容)';}function updateCacheStatus(cached){if(!cached)return;var age=cached.cache_age_sec||0;var txt=age<300?'缓存 '+(age<60?Math.round(age)+'s':Math.round(age/60)+'m')+' 前':'';E('cacheStatus').textContent=cached.inbox_cached?' | '+cached.inbox_cached+' 封已缓存 '+txt:'';}function openInboxSettings(){var accId=E('inboxAccount').value;if(!accId){toast('请先选择账号',true);return}showAppPwdModal(accId);}function showAppPwdModal(accId){var acc=accounts.find(function(a){return a.id===accId});var name=acc?(acc.name||acc.real_email||accId):accId;var icloudEmail='';if(acc&&acc.icloud_email&&(acc.icloud_email.indexOf('@icloud.com')>=0||acc.icloud_email.indexOf('@me.com')>=0||acc.icloud_email.indexOf('@mac.com')>=0)){icloudEmail=acc.icloud_email;}else if(acc&&acc.real_email&&(acc.real_email.indexOf('@icloud.com')>=0||acc.real_email.indexOf('@me.com')>=0)){icloudEmail=acc.real_email;}var hasPwd=acc&&acc.has_app_password;var h='<div class="modal-overlay" id="appPwdModal" onclick="if(event.target===this)closeAppPwdModal()"><div class="modal-box"><h3><i class="diamond"></i> '+(hasPwd?'修改':'设置')+' iCloud 邮箱和应用密码</h3><p>账号: <b>'+esc(name)+'</b> (Apple ID: '+esc(acc?acc.real_email:'')+')<br>在 <a href="appleid.apple.com">appleid.apple.com</a> → 登录与安全 → App 专用密码 生成。</p><label style="font-family:var(--mono);font-size:11px;color:var(--ink-faint);letter-spacing:.2em;text-transform:uppercase">iCloud 邮箱 (IMAP 登录用)</label><input type="text" id="icloudEmailInput" value="'+escAttr(icloudEmail)+'" placeholder="xxx@icloud.com"><label style="font-family:var(--mono);font-size:11px;color:var(--ink-faint);letter-spacing:.2em;text-transform:uppercase">App 专用密码'+ (hasPwd?' (重新输入以更新)':'') +'</label><input type="password" id="appPwdInput" placeholder="xxxx-xxxx-xxxx-xxxx"><div class="modal-actions"><button class="btn btn-outline" onclick="closeAppPwdModal()">取消</button><button class="btn btn-primary" id="btnSetPwd" onclick="setAppPassword(\''+escAttr(accId)+'\')">保存并测试</button></div><div class="modal-msg" id="appPwdMsg"></div></div></div>';document.body.insertAdjacentHTML('beforeend',h);}function closeAppPwdModal(){var m=E('appPwdModal');if(m)m.remove()}async function setAppPassword(accId){var pwd=E('appPwdInput').value.trim();var email=E('icloudEmailInput').value.trim();if(!email){E('appPwdMsg').innerHTML='<span style="color:var(--red)">请输入 iCloud 邮箱</span>';return}if(!pwd){E('appPwdMsg').innerHTML='<span style="color:var(--red)">请输入密码</span>';return}var btn=E('btnSetPwd');btn.disabled=true;btn.textContent='测试中...';var d=await api('/api/accounts/'+encodeURIComponent(accId)+'/app-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({app_password:pwd,icloud_email:email})});btn.disabled=false;btn.textContent='保存并测试';if(d.ok){E('appPwdMsg').innerHTML='<span style="color:var(--green)">连接成功! 收件箱 '+d.inbox_count+' 封</span>';var acc=accounts.find(function(a){return a.id===accId});if(acc){acc.has_app_password=true;acc.icloud_email=email;}setTimeout(closeAppPwdModal,1500);updateInboxAccountSelect();}else{E('appPwdMsg').innerHTML='<span style="color:var(--red)">'+esc(d.error||'连接失败')+'</span>';}}async function createForAccount(accId,count){var d=await api('/api/accounts/'+encodeURIComponent(accId)+'/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({count:count})});if(d.ok)toast('成功创建 '+d.created+' 个');else toast('失败: '+(d.error||'?'),true);refreshAll();}async function validateAccount(accId){var d=await api('/api/accounts/'+encodeURIComponent(accId)+'/validate',{method:'POST'});if(d.ok)toast('校验通过: '+d.real_email);else toast('校验失败: '+(d.error||'?'),true);refreshAll();}async function removeAccount(accId){if(!confirm('确认删除该账号？'))return;var d=await api('/api/accounts/'+encodeURIComponent(accId)+'/remove',{method:'POST'});if(d.ok)toast('已删除');refreshAll();}async function toggleScheduler(){var act=state.running?'stop':'start';var d=await api('/api/scheduler/'+act,{method:'POST'});if(d.ok)toast(state.running?'调度器已停止':'调度器已启动');refreshAll();}function copyOne(email){navigator.clipboard.writeText(email).then(function(){toast('已复制: '+email)});}function copyAll(){var filter=E('aliasFilter').value;var filtered=filter==='all'?emails:emails.filter(function(e){return e.account_id===filter});navigator.clipboard.writeText(filtered.map(function(e){return e.email}).join('\n')).then(function(){toast('已复制 '+filtered.length+' 个')});}function exportCSV(){var filter=E('aliasFilter').value;var filtered=filter==='all'?emails:emails.filter(function(e){return e.account_id===filter});var csv='email,account,label,active\n'+filtered.map(function(e){return e.email+','+(e.account_name||e.account_id||'')+','+(e.label||'')+','+(e.hasOwnProperty('active')?(e.active?'yes':'no'):'');}).join('\n');var b=new Blob(['\uFEFF'+csv],{type:'text/csv'}),a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='icloud_aliases.csv';a.click();}function clearLogs(){logs=[];E('logFeed').innerHTML=''}function toast(msg,isErr){var t=E('toast');t.textContent=msg;t.style.background=isErr?'var(--red)':'var(--ink)';t.style.color='var(--paper)';t.classList.add('show');setTimeout(function(){t.classList.remove('show')},2200);}function connectSSE(){if(sseConn){sseConn.close();sseConn=null}sseConn=new EventSource('/api/log-stream');sseConn.onmessage=function(e){try{var entry=JSON.parse(e.data);logs.push(entry);if(logs.length>500)logs=logs.slice(-500);if(curTab==='logs')renderLogs();if(entry.msg&&entry.msg.indexOf('创建')>=0)refreshLight();}catch(_){}};sseConn.onerror=function(){sseConn.close();sseConn=null;setTimeout(connectSSE,5000)};}function renderLogs(){var f=E('logFeed');f.innerHTML=logs.map(function(l){return'<div class="log-line '+l.level+'"><span class="log-time">'+esc(l.time)+'</span>'+esc(l.msg)+'</div>';}).join('\n');f.scrollTop=f.scrollHeight;}function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}function escAttr(s){return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}function showAddAccountModal(){var h='<div class="modal-overlay" id="addAccModal" onclick="if(event.target===this)closeAddAccModal()"><div class="modal-box"><h3><i class="diamond"></i> 导入 iCloud Cookie</h3><p>Chrome 安装 <b>Cookie Editor</b> 扩展 → 登录 icloud.com → 导出 <b>Header String</b> 粘贴即可。<br>也支持 JSON 格式: <code>{"name1":"value1"}</code></p><input type="text" id="accNameInput" placeholder="账号名称 (如: 主号)"><textarea id="cookieInput" placeholder="粘贴 Cookie，支持 Header String 或 JSON 格式"></textarea><div class="modal-actions"><button class="btn btn-outline" onclick="closeAddAccModal()">取消</button><button class="btn btn-primary" id="btnAddAccount" onclick="addAccount()">添加并校验</button></div><div class="modal-msg" id="addAccMsg"></div></div></div>';document.body.insertAdjacentHTML('beforeend',h);}function closeAddAccModal(){var m=E('addAccModal');if(m)m.remove()}async function addAccount(){var name=E('accNameInput').value.trim()||'未命名账号';var cookies=E('cookieInput').value.trim();if(!cookies){E('addAccMsg').innerHTML='<span style="color:var(--red)">请粘贴 Cookie</span>';return}var btn=E('btnAddAccount');btn.disabled=true;btn.textContent='校验中...';var d=await api('/api/accounts/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,cookie_input:cookies})});btn.disabled=false;btn.textContent='添加并校验';if(d.ok){E('addAccMsg').innerHTML='<span style="color:var(--green)">添加成功! '+esc(d.real_email||'')+' ('+(d.alias_total||0)+' 别名)</span>';setTimeout(closeAddAccModal,1500);refreshAll();}else{E('addAccMsg').innerHTML='<span style="color:var(--red)">'+esc(d.error||'失败')+'</span>';}}function renderDocs(){var h='<div style="max-width:900px"><p style="color:var(--ink-soft);margin-bottom:18px">所有接口返回 JSON。Base URL: <code>http://127.0.0.1:5050</code></p>';var sections=[{title:'账号管理',items:[{method:'GET',path:'/api/accounts',desc:'列出所有账号（脱敏，不含 cookie）'},{method:'POST',path:'/api/accounts/add',desc:'添加账号',body:'{"name":"账号名","cookie_input":"name1=value1; name2=value2"}'},{method:'POST',path:'/api/accounts/{id}/remove',desc:'删除账号'},{method:'POST',path:'/api/accounts/{id}/validate',desc:'重新校验账号会话'}]},{title:'状态',items:[{method:'GET',path:'/api/state',desc:'全局状态 + 账号汇总'}]},{title:'别名 / 邮箱',items:[{method:'GET',path:'/api/aliases',desc:'所有账号的别名列表（iCloud API 实时拉取）'},{method:'GET',path:'/api/emails',desc:'本地创建记录（latest_emails.txt，永远可用）'},{method:'POST',path:'/api/accounts/{id}/create',desc:'为指定账号创建别名',body:'{"count":5,"label":"可选标签"}'},{method:'POST',path:'/api/create-batch',desc:'跨账号批量创建',body:'{"account_ids":["id1","id2"],"count_per_account":5}'}]},{title:'收件箱 (IMAP)',items:[{method:'GET',path:'/api/accounts/{id}/inbox?limit=20&force=1',desc:'查收件箱。force=1 跳过缓存强制从 IMAP 拉取'},{method:'GET',path:'/api/accounts/{id}/alias-mail?force=1',desc:'查所有隐私别名的收件情况'},{method:'GET',path:'/api/accounts/{id}/mail/{别名邮箱}',desc:'查指定隐私邮箱的收件'},{method:'POST',path:'/api/accounts/{id}/app-password',desc:'设置 App 专用密码并测试 IMAP',body:'{"app_password":"xxxx-xxxx-xxxx-xxxx","icloud_email":"xxx@icloud.com"}'}]},{title:'快捷入口',items:[{method:'GET',path:'/api/mail?email=user@icloud.com',desc:'按主邮箱查所有别名收件'},{method:'GET',path:'/api/mail?email=...&alias=xxx@icloud.com',desc:'按主邮箱查指定别名收件'}]},{title:'调度器',items:[{method:'POST',path:'/api/scheduler/start',desc:'启动定时调度器'},{method:'POST',path:'/api/scheduler/stop',desc:'停止调度器'}]},{title:'实时日志',items:[{method:'GET',path:'/api/log-stream',desc:'SSE 实时日志流（EventSource）'}]}];sections.forEach(function(sec){h+='<div style="margin-bottom:24px"><div style="font-size:12px;color:var(--ink-faint);letter-spacing:.2em;text-transform:uppercase;margin-bottom:10px;border-bottom:1px solid var(--rule);padding-bottom:4px">'+esc(sec.title)+'</div>';sec.items.forEach(function(item){var methodColor=item.method==='GET'?'var(--green)':item.method==='POST'?'var(--red)':'var(--ink-soft)';h+='<div style="margin-bottom:10px;padding:10px 14px;background:var(--paper-dim)"><span style="font-weight:700;color:'+methodColor+';margin-right:12px;font-size:11px">'+item.method+'</span><code style="font-size:12px">'+esc(item.path)+'</code><div style="color:var(--ink-soft);font-size:12px;margin-top:4px">'+esc(item.desc)+'</div>';if(item.body){h+='<div style="margin-top:6px"><code style="font-size:11px;color:var(--ink-faint);background:var(--paper);padding:3px 8px;display:inline-block">'+esc(item.body)+'</code></div>';}h+='</div>';});h+='</div>';});h+='<div style="margin-top:32px;padding-top:16px;border-top:1px solid var(--rule-strong);font-size:12px;color:var(--ink-faint)">缓存策略：收件箱接口默认 5 分钟内读本地缓存 (<code>results/mail_cache.json</code>)，首次拉取后终身存储。传 <code>?force=1</code> 跳过缓存从 IMAP 增量拉取。<br>Cookie 导入：支持 Header String (<code>name=value; ...</code>) 和 JSON (<code>{"name":"value"}</code>) 两种格式。</div></div>';E('docsContent').innerHTML=h;}function updateInboxAccountSelect(){var sel=E('inboxAccount'),old=sel.value;sel.innerHTML='<option value="">-- 选择账号 --</option>';accounts.forEach(function(a){var hasPwd=a.has_app_password?' [已设]':' [未设密码]';var imapEmail=a.icloud_email||a.real_email||'';sel.innerHTML+='<option value="'+escAttr(a.id)+'">'+esc((a.name||a.real_email||a.id).substring(0,20))+' | '+esc(imapEmail.substring(0,25))+' '+hasPwd+'</option>';});sel.value=old||'';}refreshAll();connectSSE();setInterval(refreshLight,10000);setInterval(refreshAll,30000);</script></body></html>"""
-
-UI_HTML = UI_HTML.replace(
-    "if(curTab==='emails'){refreshEmails();renderAliasTable();}",
-    "if(curTab==='emails'){refreshEmails().then(renderAliasTable);}",
-).replace(
-    ".filter-bar{display:flex;gap:12px",
-    ".filter-bar{display:flex;flex-wrap:wrap;gap:12px",
-).replace(
-    ".panel-body{padding:0}",
-    ".panel-body{padding:0}#aliasTableContainer{overflow-x:auto}",
-).replace(
-    ".email-table{width:100%;",
-    ".email-table{width:100%;min-width:1250px;",
-).replace(
-    'id="batchCount" value="5" min="1" max="20"',
-    'id="batchCount" value="5" min="1" max="750"',
-).replace(
-    "Math.min(parseInt(E('batchCount').value)||5,20)",
-    "Math.min(parseInt(E('batchCount').value)||5,750)",
-).replace(
-    "var labels={queued:",
-    "var labels={waiting:'等待 Apple 限制解除',queued:",
-).replace(
-    "<th>标签</th><th>导出状态</th>",
-    "<th>标签</th><th>创建时间</th><th>导出状态</th>",
-).replace(
-    "+'</td><td>'+exportHtml+'</td><td>'+activeHtml",
-    "+'</td><td style=\"font-size:11px;white-space:nowrap\">'+esc(formatExportTime(e.created_at))+'</td><td>'+exportHtml+'</td><td>'+activeHtml",
-).replace(
-    "e.anonymousId=apiData.anonymousId;e.account_name=",
-    "e.anonymousId=apiData.anonymousId;e.created_at=apiData.createdAt||e.created_at;e.account_name=",
-).replace(
-    "async function refreshEmails(){var d=await api('/api/emails');emails=d.emails||[];emails.forEach(function(e){",
-    "async function refreshEmails(){var d=await api('/api/emails');emails=d.emails||[];pickupLinksByEmail={};emails.forEach(function(e){if(e.pickup_url)pickupLinksByEmail[String(e.email||'').toLowerCase()]=e.pickup_url;",
-).replace(
-    "e.account_email=acc?(acc.real_email||''):'';});E('emailCount').textContent=emails.length;updateEmailFilter();}",
-    "e.account_email=acc?(acc.real_email||''):'';});pickupLinksLoaded=true;E('emailCount').textContent=emails.length;updateEmailFilter();}",
-).replace(
-    "var accounts=[],emails=[],logs=[];var curTab=",
-    "var accounts=[],emails=[],logs=[],logCursor=0;var curTab=",
-).replace(
-    "sseConn=new EventSource('/api/log-stream');",
-    "sseConn=new EventSource('/api/log-stream?after='+logCursor);",
-).replace(
-    "var entry=JSON.parse(e.data);logs.push(entry);",
-    "var entry=JSON.parse(e.data);if((entry.seq||0)<=logCursor)return;logCursor=entry.seq||logCursor;logs.push(entry);",
-).replace(
-    "某个账号触发 Apple 限制时会自动跳过，继续下一个账号。",
-    "不同主账号最多 5 个并行；同一账号仍逐个创建，触发 Apple 临时限制时每次等待 1 分钟后自动续建。",
-).replace(
-    "function exportCSV(){var filter=E('aliasFilter').value;var filtered=filter==='all'?emails:emails.filter(function(e){return e.account_id===filter});var csv='email,account,label,active\\n'+filtered.map(function(e){return e.email+','+(e.account_name||e.account_id||'')+','+(e.label||'')+','+(e.hasOwnProperty('active')?(e.active?'yes':'no'):'');}).join('\\n');var b=new Blob(['\\uFEFF'+csv],{type:'text/csv'}),a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='icloud_aliases.csv';a.click();}",
-    "function csvCell(v){v=String(v==null?'':v);if(/^[=+\\-@]/.test(v))v=\"'\"+v;return '\"'+v.replace(/\"/g,'\"\"')+'\"';}function exportCSV(){var filter=E('aliasFilter').value;var filtered=filter==='all'?emails:emails.filter(function(e){return e.account_id===filter});var csv='email,account,label,active\\n'+filtered.map(function(e){return [e.email,e.account_name||e.account_id||'',e.label||'',e.hasOwnProperty('active')?(e.active?'yes':'no'):''].map(csvCell).join(',');}).join('\\n');var b=new Blob(['\\uFEFF'+csv],{type:'text/csv'}),a=document.createElement('a'),u=URL.createObjectURL(b);a.href=u;a.download='icloud_aliases.csv';a.click();setTimeout(function(){URL.revokeObjectURL(u)},1000);}",
-)
-
-UI_HTML = UI_HTML.replace(
-    '<button class="btn btn-outline btn-sm" onclick="refreshAliases()" title="从 iCloud 云端同步标签和状态">云端同步</button>',
-    '<button class="btn btn-outline btn-sm" id="btnAliasSync" onclick="refreshAliases()" title="从 iCloud 云端同步标签和状态">云端同步</button>',
-).replace(
-    '<div style="display:flex;gap:8px;align-items:center"><select id="inboxAccount" onchange="refreshInbox()">',
-    '<div class="inbox-tools"><select id="inboxAccount" onchange="refreshInbox()">',
-).replace(
-    '<button class="btn btn-outline btn-sm" onclick="refreshInbox()">刷新</button>',
-    '<button class="btn btn-outline btn-sm" id="btnInboxRefresh" onclick="refreshInbox()">刷新</button>',
-).replace(
-    '<button class="btn btn-outline btn-sm" onclick="refreshInbox(true)"',
-    '<button class="btn btn-outline btn-sm" id="btnInboxForce" onclick="refreshInbox(true)"',
-).replace(
-    '<button class="btn btn-outline btn-sm" onclick="searchAliasMail()"',
-    '<button class="btn btn-outline btn-sm" id="btnInboxSearch" onclick="searchAliasMail()"',
-).replace(
-    '<button class="btn btn-outline btn-sm" onclick="checkAliasMail()"',
-    '<button class="btn btn-outline btn-sm" id="btnInboxAll" onclick="checkAliasMail()"',
-).replace(
-    '<a href="appleid.apple.com">appleid.apple.com</a>',
-    '<a href="https://account.apple.com/" target="_blank" rel="noopener noreferrer">account.apple.com</a>',
-).replace(
-    "</style>",
-    ".panel-header{flex-wrap:wrap;gap:10px}.panel-header>div{display:flex;flex-wrap:wrap;gap:8px;align-items:center}.inbox-tools{display:flex;gap:8px;align-items:center}@media(max-width:768px){.panel-header{align-items:flex-start}.inbox-tools{width:100%;align-items:stretch}.inbox-tools select{flex:1 1 220px;min-width:0}.inbox-tools input[type=text]{flex:1 1 220px;width:auto!important;min-width:0}.inbox-tools input[type=number]{flex:0 0 64px}.inbox-tools .btn{flex:1 1 auto}.inbox-tools #cacheStatus{flex-basis:100%;word-break:break-word}.filter-bar .segmented{margin-left:0;max-width:100%;overflow-x:auto}.panel-header>div{width:100%}}</style>",
-)
-
-UI_HTML = UI_HTML.replace(
-    "</style>",
-    "@media(max-width:768px){html,body{width:100%;max-width:100%;overflow-x:hidden}.sidebar{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));width:100%;max-width:100%;overflow-x:hidden}.sidebar .logo,.sidebar .section-label,#sidebarAccounts,.sidebar>button,.sidebar>div:last-child{grid-column:1/-1}.sidebar .logo{width:100%;margin-right:0}.sidebar .nav-item{min-width:0;justify-content:center;text-align:center;padding:8px 4px;font-size:12px;white-space:nowrap}.main,.panel,.panel-header,.panel-body,.inbox-tools{width:100%;min-width:0;max-width:100%}.main{overflow-x:hidden}.inbox-tools>*{min-width:0;max-width:100%}.inbox-tools .btn{flex:1 1 calc(33.333% - 8px);padding-left:8px;padding-right:8px}.inbox-tools #btnInboxSettings{flex-basis:calc(33.333% - 8px)}}</style>",
-)
-
-UI_HTML = UI_HTML.replace("</script></body>", r"""
-var _createBusyByAccount={};
-function setCreateBusy(accId,busy){if(busy)_createBusyByAccount[accId]=true;else delete _createBusyByAccount[accId];document.querySelectorAll('.acc-actions button').forEach(function(btn){var action=btn.getAttribute('onclick')||'';if(action.indexOf("createForAccount('"+accId+"'")>=0)btn.disabled=busy;});}
-async function createForAccount(accId,count){if(_createBusyByAccount[accId]){toast('该账号正在创建，请勿重复点击',true);return}setCreateBusy(accId,true);try{var d=await api('/api/accounts/'+encodeURIComponent(accId)+'/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({count:count})});if(d.ok)toast('成功创建 '+d.created+' 个');else toast('失败: '+(d.error||'?'),true);}finally{setCreateBusy(accId,false);await refreshAll();}}
-function copyAll(){var filtered=visibleAliases();if(!filtered.length){toast('当前筛选下没有邮箱',true);return}navigator.clipboard.writeText(filtered.map(function(e){return e.email}).join('\n')).then(function(){toast('已复制 '+filtered.length+' 个')});}
-function exportCSV(){var filtered=visibleAliases();if(!filtered.length){toast('当前筛选下没有邮箱',true);return}var csv='email,account,label,active\n'+filtered.map(function(e){return [e.email,e.account_name||e.account_id||'',e.label||'',e.hasOwnProperty('active')?(e.active?'yes':'no'):''].map(csvCell).join(',');}).join('\n');var b=new Blob(['\uFEFF'+csv],{type:'text/csv'}),a=document.createElement('a'),u=URL.createObjectURL(b);a.href=u;a.download='icloud_aliases.csv';a.click();setTimeout(function(){URL.revokeObjectURL(u)},1000);toast('已导出 '+filtered.length+' 个');}
-var _aliasesBusy=false;
-async function refreshAliases(){if(_aliasesBusy){toast('云端同步正在进行',true);return}_aliasesBusy=true;var btn=E('btnAliasSync');if(btn){btn.disabled=true;btn.textContent='同步中...'}try{var d=await api('/api/aliases',{timeout:120000});if(d.error&&d.ok===false){toast('云端同步失败: '+d.error,true);return}var apiAliases=d.aliases||[],apiMap={};apiAliases.forEach(function(a){apiMap[String(a.email||'').toLowerCase()]=a;});emails.forEach(function(e){var apiData=apiMap[String(e.email||'').toLowerCase()];if(apiData){e.label=apiData.label||'';e.active=apiData.active;e.anonymousId=apiData.anonymousId;e.created_at=apiData.createdAt||e.created_at;e.account_name=apiData.account_name||e.account_name;e.account_email=apiData.account_email||e.account_email;}});E('emailCount').textContent=emails.length;updateEmailFilter();renderAliasTable();var failed=Object.keys(d.failures||{});if(failed.length){toast('同步完成，但有 '+failed.length+' 个账号失败',true)}else{toast('云端同步完成: '+apiAliases.length+' 个邮箱')}}finally{_aliasesBusy=false;if(btn){btn.disabled=false;btn.textContent='云端同步'}}}
-var _inboxRequestSeq=0;var _inboxRenderedAccount='';
+async function pollBatchJob(){if(!batchJob||!batchJob.id)return;var d=await api('/api/create-batch/'+encodeURIComponent(batchJob.id));if(!d.ok){toast('获取进度失败: '+(d.error||'未知错误'),true);return}batchJob=d.job;renderBatchJob(batchJob);if(batchJob.status==='queued'||batchJob.status==='running'){scheduleBatchPoll();return}await refreshAll();if(batchJob.total_created){toast('创建完成: '+batchJob.total_created+' 个成功');}else{toast('本次没有创建成功，请查看账号错误',true);}}
+async function execBatchCreate(){var checks=document.querySelectorAll('#batchChkGroup input:checked');var ids=[];checks.forEach(function(c){ids.push(c.value)});if(!ids.length){toast('请勾选至少一个账号',true);return}var count=Math.max(1,Math.min(parseInt(E('batchCount').value)||5,750));E('batchCount').value=count;var label=E('batchLabel').value.trim();var btn=E('btnBatchExec');btn.disabled=true;btn.textContent='正在启动...';var d=await api('/api/create-batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({account_ids:ids,count_per_account:count,label:label})});if(!d.ok){btn.disabled=false;btn.textContent='开始创建';if(d.job_id){batchJob={id:d.job_id,status:'running'};scheduleBatchPoll();}toast(d.error||'创建任务启动失败',true);return}batchJob=d.job;renderBatchJob(batchJob);scheduleBatchPoll();}
 function setInboxBusy(busy){_inboxBusy=busy;['btnInboxSearch','btnInboxAll'].forEach(function(id){var btn=E(id);if(btn)btn.disabled=busy});}
 function beginInboxRequest(){if(_inboxSse){_inboxSse.close();_inboxSse=null}_inboxStreamMsgs=[];_inboxRequestSeq+=1;setInboxBusy(true);return _inboxRequestSeq;}
 function inboxRequestCurrent(seq,accId){return seq===_inboxRequestSeq&&E('inboxAccount').value===accId;}
 function finishInboxRequest(seq){if(seq!==_inboxRequestSeq)return;setInboxBusy(false);}
-function refreshInbox(force){var accId=E('inboxAccount').value;if(!accId){beginInboxRequest();finishInboxRequest(_inboxRequestSeq);E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>请先选择账号</div>';return}var seq=beginInboxRequest();var limit=parseInt(E('inboxLimit').value)||20;if(force){E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>强制刷新中...</div>';api('/api/accounts/'+encodeURIComponent(accId)+'/inbox?limit='+limit+'&force=1',{timeout:120000}).then(function(d){if(!inboxRequestCurrent(seq,accId))return;if(d.error){E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>'+esc(d.error||'连接失败')+'</div>';finishInboxRequest(seq);return}renderInboxMsgs(d.emails||[],'收件箱 ('+(d.count||0)+' 封)',accId);updateCacheStatus(d.cached);finishInboxRequest(seq);});return}startInboxStream(accId,seq);}
-function startInboxStream(accId,seq){E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>正在逐条拉取邮件...</div>';var limit=parseInt(E('inboxLimit').value)||20;var source=new EventSource('/api/accounts/'+encodeURIComponent(accId)+'/inbox-stream?limit='+limit);_inboxSse=source;source.onmessage=function(e){if(!inboxRequestCurrent(seq,accId)||_inboxSse!==source){source.close();return}try{var d=JSON.parse(e.data);if(d.type==='email'){_inboxStreamMsgs.push(d.email);renderInboxMsgs(_inboxStreamMsgs,'收件箱 ('+d.count+' 封, 加载中...)',accId)}else if(d.type==='done'){source.close();_inboxSse=null;renderInboxMsgs(_inboxStreamMsgs,'收件箱 ('+d.count+' 封)',accId);finishInboxRequest(seq)}else if(d.type==='error'){source.close();_inboxSse=null;E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>'+esc(d.error||'连接失败')+'</div>';finishInboxRequest(seq)}}catch(_){}};source.onerror=function(){if(!inboxRequestCurrent(seq,accId)||_inboxSse!==source){source.close();return}source.close();_inboxSse=null;if(_inboxStreamMsgs.length){renderInboxMsgs(_inboxStreamMsgs,'收件箱 ('+_inboxStreamMsgs.length+' 封, 连接中断)',accId)}else{E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>连接失败</div>'}finishInboxRequest(seq);};}
-async function searchAliasMail(){var accId=E('inboxAccount').value,alias=E('aliasSearchInput').value.trim();if(!accId){toast('请先选择账号',true);return}if(!alias){toast('请输入隐私邮箱地址',true);return}var seq=beginInboxRequest();E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>查询 '+esc(alias)+' ...</div>';var d=await api('/api/accounts/'+encodeURIComponent(accId)+'/mail/'+encodeURIComponent(alias)+'?limit=30',{timeout:120000});if(!inboxRequestCurrent(seq,accId))return;if(d.error){E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>'+esc(d.error)+'</div>'}else{renderInboxMsgs(d.emails||[],esc(alias)+' ('+(d.count||0)+' 封)',accId)}finishInboxRequest(seq);}
-async function checkAliasMail(){var accId=E('inboxAccount').value;if(!accId){toast('请先选择账号',true);return}var seq=beginInboxRequest();E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>正在检查各别名的收件...</div>';var d=await api('/api/accounts/'+encodeURIComponent(accId)+'/alias-mail',{timeout:120000});if(!inboxRequestCurrent(seq,accId))return;if(d.error){E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>'+esc(d.error||'查询失败')+'</div>';finishInboxRequest(seq);return}var byAlias=d.by_alias||{},total=0,aliasKeys=Object.keys(byAlias),h='';if(!aliasKeys.length){E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>所有隐私邮箱暂无收件</div>';finishInboxRequest(seq);return}aliasKeys.forEach(function(alias){var msgs=byAlias[alias]||[];total+=msgs.length;h+='<div style="padding:8px 14px;border-bottom:1px solid var(--rule);font-weight:600;font-size:13px;background:var(--paper-dim)">'+esc(alias)+' ('+msgs.length+' 封)</div>';msgs.forEach(function(m){h+='<div style="padding:6px 20px;border-bottom:1px solid var(--rule);font-size:12px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:4px"><span><strong>'+esc(m.subject||'(无主题)')+'</strong></span><span style="color:var(--ink-soft)">'+esc(m.from||'').substring(0,30)+'</span><span style="color:var(--ink-faint);font-size:11px">'+(m.date||'').substring(0,19)+'</span></div>'});});E('inboxMsgs').innerHTML='<div style="font-size:11px;color:var(--ink-faint);padding:8px 14px;border-bottom:1px solid var(--rule)">共 '+aliasKeys.length+' 个别名收到 '+total+' 封邮件</div>'+h;finishInboxRequest(seq);}
-function renderInboxMsgs(msgs,title,accountId){_inboxRenderedAccount=accountId||E('inboxAccount').value;if(!msgs.length){E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>收件箱为空</div>';return}var h='<div style="font-size:11px;color:var(--ink-faint);padding:8px 16px;border-bottom:1px solid var(--rule)">'+esc(title)+'</div>';msgs.forEach(function(m,i){var mid=m.id||'m'+i;h+='<div class="email-item" style="border-bottom:1px solid var(--rule);cursor:pointer" onclick="toggleEmail(\''+escAttr(mid)+'\',\''+escAttr(m.id||'')+'\',\''+escAttr(_inboxRenderedAccount)+'\')"><div style="padding:12px 16px;display:flex;justify-content:space-between;align-items:flex-start;gap:12px"><div style="flex:1;min-width:0"><div style="font-weight:600;font-size:14px;margin-bottom:4px">'+esc(m.subject||'(无主题)')+'</div><div style="font-size:12px;color:var(--ink-soft)">'+esc(m.from||'')+'</div><div style="font-size:11px;color:var(--ink-faint);margin-top:2px">To: '+esc((m.to||'').substring(0,50))+'</div></div><div style="font-size:11px;color:var(--ink-faint);white-space:nowrap;text-align:right">'+(m.date||'').substring(0,19)+'</div></div><div id="'+escAttr(mid)+'_body" style="display:none;padding:0 16px 16px;font-size:13px;line-height:1.7;color:var(--ink-soft);white-space:pre-wrap;word-break:break-word;max-height:400px;overflow-y:auto;border-top:1px solid var(--rule)"></div></div>'});E('inboxMsgs').innerHTML=h;}
+function inboxSetupHintHtml(){
+  var accId=E('inboxAccount')?E('inboxAccount').value:'';
+  var acc=accId?accounts.find(function(a){return a.id===accId}):null;
+  if(acc&&!acc.has_app_password){
+    return '<div class="empty"><div class="icon"></div><div class="empty-title">这个账号还不能收信</div><p>请先设置收信密码（Apple 的 App 专用密码），然后就可以查看邮件。</p><button class="btn btn-primary" onclick="showAppPwdModal(\''+escAttr(accId)+'\')">去设置密码</button></div>';
+  }
+  if(!accounts.length){
+    return '<div class="empty"><div class="icon"></div><div class="empty-title">收件前先完成设置</div><ol class="empty-steps"><li>在「账号」里添加 Apple 账号</li><li>为账号设置收信密码</li><li>选择账号后即可看信</li></ol><button class="btn btn-primary" onclick="showAddAccountModal()">添加账号</button></div>';
+  }
+  return '<div class="empty"><div class="icon"></div><div class="empty-title">请先选择账号</div><p>添加账号后，还要设置收信密码，才能在这里看信。</p><button class="btn btn-primary" onclick="openInboxSettings()">设置收信密码</button></div>';
+}
+function renderInboxSetupHint(){var el=E('inboxMsgs');if(el)el.innerHTML=inboxSetupHintHtml();}
+function renderInboxSetupHintIfNeeded(){
+  var sel=E('inboxAccount');
+  var accId=sel?sel.value:'';
+  var acc=accId?accounts.find(function(a){return a.id===accId}):null;
+  if(!accId||(acc&&!acc.has_app_password))renderInboxSetupHint();
+}
+function refreshInbox(force){var accId=E('inboxAccount').value;if(!accId){beginInboxRequest();finishInboxRequest(_inboxRequestSeq);renderInboxSetupHint();return}var acc=accounts.find(function(a){return a.id===accId});if(acc&&!acc.has_app_password){renderInboxSetupHint();return}var seq=beginInboxRequest();var limit=parseInt(E('inboxLimit').value)||20;if(force){E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>正在重新拉取邮件...</div>';api('/api/accounts/'+encodeURIComponent(accId)+'/inbox?limit='+limit+'&force=1',{timeout:120000}).then(function(d){if(!inboxRequestCurrent(seq,accId))return;if(d.error){E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>'+esc(d.error||'连接失败')+'</div>';finishInboxRequest(seq);return}renderInboxMsgs(d.emails||[],'收件箱 ('+(d.count||0)+' 封)',accId);updateCacheStatus(d.cached);finishInboxRequest(seq);});return}startInboxStream(accId,seq);}
+function startInboxStream(accId,seq){E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>正在拉取邮件...</div>';var limit=parseInt(E('inboxLimit').value)||20;var source=new EventSource('/api/accounts/'+encodeURIComponent(accId)+'/inbox-stream?limit='+limit);_inboxSse=source;source.onmessage=function(e){if(!inboxRequestCurrent(seq,accId)||_inboxSse!==source){source.close();return}try{var d=JSON.parse(e.data);if(d.type==='email'){_inboxStreamMsgs.push(d.email);renderInboxMsgs(_inboxStreamMsgs,'收件箱 ('+d.count+' 封, 加载中...)',accId)}else if(d.type==='done'){source.close();_inboxSse=null;renderInboxMsgs(_inboxStreamMsgs,'收件箱 ('+d.count+' 封)',accId);finishInboxRequest(seq)}else if(d.type==='error'){source.close();_inboxSse=null;E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>'+esc(d.error||'连接失败')+'</div>';finishInboxRequest(seq)}}catch(_){}};source.onerror=function(){if(!inboxRequestCurrent(seq,accId)||_inboxSse!==source){source.close();return}source.close();_inboxSse=null;if(_inboxStreamMsgs.length){renderInboxMsgs(_inboxStreamMsgs,'收件箱 ('+_inboxStreamMsgs.length+' 封, 连接中断)',accId)}else{E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>连接失败</div>'}finishInboxRequest(seq);};}
+async function searchAliasMail(){var accId=E('inboxAccount').value,alias=E('aliasSearchInput').value.trim();if(!accId){toast('请先选择账号',true);return}if(!alias){toast('请输入邮箱地址',true);return}var seq=beginInboxRequest();E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>查询 '+esc(alias)+' ...</div>';var d=await api('/api/accounts/'+encodeURIComponent(accId)+'/mail/'+encodeURIComponent(alias)+'?limit=30',{timeout:120000});if(!inboxRequestCurrent(seq,accId))return;if(d.error){E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>'+esc(d.error)+'</div>'}else{renderInboxMsgs(d.emails||[],esc(alias)+' ('+(d.count||0)+' 封)',accId)}finishInboxRequest(seq);}
+async function checkAliasMail(){var accId=E('inboxAccount').value;if(!accId){toast('请先选择账号',true);return}var seq=beginInboxRequest();E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>正在检查各邮箱的收件...</div>';var d=await api('/api/accounts/'+encodeURIComponent(accId)+'/alias-mail',{timeout:120000});if(!inboxRequestCurrent(seq,accId))return;if(d.error){E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>'+esc(d.error||'查询失败')+'</div>';finishInboxRequest(seq);return}var byAlias=d.by_alias||{},total=0,aliasKeys=Object.keys(byAlias),h='';if(!aliasKeys.length){E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>所有隐私邮箱暂无收件</div>';finishInboxRequest(seq);return}aliasKeys.forEach(function(alias){var msgs=byAlias[alias]||[];total+=msgs.length;h+='<div style="padding:8px 14px;border-bottom:1px solid var(--line);font-weight:600">'+esc(alias)+' ('+msgs.length+' 封)</div>';msgs.forEach(function(m){h+='<div style="padding:6px 20px;border-bottom:1px solid var(--line);font-size:12px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:4px"><span><strong>'+esc(m.subject||'(无主题)')+'</strong></span><span style="color:var(--muted)">'+esc(m.from||'').substring(0,30)+'</span><span class="hint">'+(m.date||'').substring(0,19)+'</span></div>';});});E('inboxMsgs').innerHTML='<div class="hint" style="padding:8px 14px;border-bottom:1px solid var(--line)">共 '+aliasKeys.length+' 个邮箱收到 '+total+' 封邮件</div>'+h;finishInboxRequest(seq);}
+function renderInboxMsgs(msgs,title,accountId){_inboxRenderedAccount=accountId||E('inboxAccount').value;if(!msgs.length){E('inboxMsgs').innerHTML='<div class="empty"><div class="icon"></div>收件箱为空</div>';return}var h='<div class="hint" style="padding:8px 16px;border-bottom:1px solid var(--line)">'+esc(title)+'</div>';msgs.forEach(function(m,i){var mid=m.id||'m'+i;h+='<div class="email-item" style="border-bottom:1px solid var(--line);cursor:pointer" onclick="toggleEmail(\''+escAttr(mid)+'\',\''+escAttr(m.id||'')+'\',\''+escAttr(_inboxRenderedAccount)+'\')"><div style="padding:12px 16px;display:flex;justify-content:space-between;align-items:flex-start;gap:12px"><div style="flex:1;min-width:0"><div style="font-weight:600;margin-bottom:4px">'+esc(m.subject||'(无主题)')+'</div><div style="font-size:12px;color:var(--muted)">'+esc(m.from||'')+'</div><div class="hint" style="margin-top:2px">To: '+esc((m.to||'').substring(0,50))+'</div></div><div class="hint" style="white-space:nowrap">'+(m.date||'').substring(0,19)+'</div></div><div id="'+escAttr(mid)+'_body" style="display:none;padding:0 16px 16px;line-height:1.7;color:var(--muted);white-space:pre-wrap;word-break:break-word;max-height:400px;overflow-y:auto;border-top:1px solid var(--line)"></div></div>'});E('inboxMsgs').innerHTML=h;}
 async function toggleEmail(domId,msgId,accountId){var bodyEl=E(domId+'_body');if(!bodyEl)return;if(_expandedEmail&&_expandedEmail!==domId){var prev=E(_expandedEmail+'_body');if(prev)prev.style.display='none'}if(bodyEl.style.display==='block'){bodyEl.style.display='none';_expandedEmail=null;return}bodyEl.style.display='block';_expandedEmail=domId;if(bodyEl.textContent.trim()&&bodyEl.textContent!=='加载中...')return;bodyEl.textContent='加载中...';if(!msgId||!accountId){bodyEl.textContent='(无法获取邮件正文)';return}var d=await api('/api/accounts/'+encodeURIComponent(accountId)+'/message/'+encodeURIComponent(msgId),{timeout:120000});if(!d.ok||!d.message){bodyEl.textContent='(获取失败: '+(d.error||'未知')+')';return}bodyEl.textContent=d.message.body||'(无正文内容)';}
-</script></body>""")
-
+function updateCacheStatus(cached){if(!cached)return;var age=cached.cache_age_sec||0;var txt=age<300?'缓存 '+(age<60?Math.round(age)+'s':Math.round(age/60)+'m')+' 前':'';E('cacheStatus').textContent=cached.inbox_cached?' | '+cached.inbox_cached+' 封已缓存 '+txt:'';}
+function openInboxSettings(){
+  var sel=E('inboxAccount');
+  var accId=sel?sel.value:'';
+  if(!accounts.length){showAddAccountModal();return;}
+  if(!accId){
+    var need=accounts.find(function(a){return !a.has_app_password});
+    if(!need){toast('请先选择账号',true);return;}
+    sel.value=need.id;
+    showAppPwdModal(need.id);
+    return;
+  }
+  showAppPwdModal(accId);
+}
+function showAppPwdModal(accId){var acc=accounts.find(function(a){return a.id===accId});var name=acc?(acc.name||acc.real_email||accId):accId;var icloudEmail='';if(acc&&acc.icloud_email&&(acc.icloud_email.indexOf('@icloud.com')>=0||acc.icloud_email.indexOf('@me.com')>=0||acc.icloud_email.indexOf('@mac.com')>=0)){icloudEmail=acc.icloud_email;}else if(acc&&acc.real_email&&(acc.real_email.indexOf('@icloud.com')>=0||acc.real_email.indexOf('@me.com')>=0)){icloudEmail=acc.real_email;}var hasPwd=acc&&acc.has_app_password;var h='<div class="modal-overlay" id="appPwdModal" onclick="if(event.target===this)closeAppPwdModal()"><div class="modal-box"><h3>'+(hasPwd?'修改':'设置')+'收信密码</h3><p>账号: <b>'+esc(name)+'</b><br>在 <a href="https://account.apple.com/" target="_blank" rel="noopener noreferrer">account.apple.com</a> → 登录与安全 → App 专用密码 生成。</p><label class="hint">iCloud 邮箱</label><input type="text" id="icloudEmailInput" value="'+escAttr(icloudEmail)+'" placeholder="xxx@icloud.com"><label class="hint">App 专用密码'+(hasPwd?' (重新输入以更新)':'')+'</label><input type="password" id="appPwdInput" placeholder="xxxx-xxxx-xxxx-xxxx"><div class="modal-actions"><button class="btn btn-outline" onclick="closeAppPwdModal()">取消</button><button class="btn btn-primary" id="btnSetPwd" onclick="setAppPassword(\''+escAttr(accId)+'\')">保存并测试</button></div><div class="modal-msg" id="appPwdMsg"></div></div></div>';document.body.insertAdjacentHTML('beforeend',h);}
+function closeAppPwdModal(){var m=E('appPwdModal');if(m)m.remove()}
+async function setAppPassword(accId){var pwd=E('appPwdInput').value.trim();var email=E('icloudEmailInput').value.trim();if(!email){E('appPwdMsg').innerHTML='<span style="color:var(--red)">请输入 iCloud 邮箱</span>';return}if(!pwd){E('appPwdMsg').innerHTML='<span style="color:var(--red)">请输入密码</span>';return}var btn=E('btnSetPwd');btn.disabled=true;btn.textContent='测试中...';var d=await api('/api/accounts/'+encodeURIComponent(accId)+'/app-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({app_password:pwd,icloud_email:email})});btn.disabled=false;btn.textContent='保存并测试';if(d.ok){E('appPwdMsg').innerHTML='<span style="color:var(--green)">连接成功，收件箱 '+d.inbox_count+' 封</span>';var acc=accounts.find(function(a){return a.id===accId});if(acc){acc.has_app_password=true;acc.icloud_email=email;}setTimeout(closeAppPwdModal,1500);updateInboxAccountSelect();renderDashboard();if(curTab==='inbox')refreshInbox();}else{E('appPwdMsg').innerHTML='<span style="color:var(--red)">'+esc(d.error||'连接失败')+'</span>';}}
+function setCreateBusy(accId,busy){if(busy)_createBusyByAccount[accId]=true;else delete _createBusyByAccount[accId];document.querySelectorAll('.acc-actions button').forEach(function(btn){var action=btn.getAttribute('onclick')||'';if(action.indexOf("createForAccount('"+accId+"'")>=0)btn.disabled=busy;});}
+async function createForAccount(accId,count){if(_createBusyByAccount[accId]){toast('该账号正在创建，请稍候',true);return}setCreateBusy(accId,true);try{var d=await api('/api/accounts/'+encodeURIComponent(accId)+'/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({count:count})});if(d.ok)toast('成功创建 '+d.created+' 个');else toast(d.error||'创建失败',true);}finally{setCreateBusy(accId,false);await refreshAll();}}
+async function validateAccount(accId){var d=await api('/api/accounts/'+encodeURIComponent(accId)+'/validate',{method:'POST'});if(d.ok)toast('登录有效: '+d.real_email);else toast('登录已过期，请重新导入 Cookie',true);refreshAll();}
+async function removeAccount(accId){if(!confirm('确认删除该账号？'))return;var d=await api('/api/accounts/'+encodeURIComponent(accId)+'/remove',{method:'POST'});if(d.ok)toast('已删除');refreshAll();}
+async function toggleScheduler(){var act=state.running?'stop':'start';var d=await api('/api/scheduler/'+act,{method:'POST'});if(d.ok)toast(state.running?'自动创建已停止':'自动创建已启动');refreshAll();}
+function copyOne(email){navigator.clipboard.writeText(email).then(function(){toast('已复制: '+email)});}
+function copyAll(){var filtered=visibleAliases();if(!filtered.length){toast('当前筛选下没有邮箱',true);return}navigator.clipboard.writeText(filtered.map(function(e){return e.email}).join('\n')).then(function(){toast('已复制 '+filtered.length+' 个')});}
+function csvCell(v){v=String(v==null?'':v);if(/^[=+\-@]/.test(v))v="'"+v;return '"'+v.replace(/"/g,'""')+'"';}
+function exportCSV(){var filtered=visibleAliases();if(!filtered.length){toast('当前筛选下没有邮箱',true);return}var csv='email,account,label,active\n'+filtered.map(function(e){return [e.email,e.account_name||e.account_id||'',e.label||'',e.hasOwnProperty('active')?(e.active?'yes':'no'):''].map(csvCell).join(',');}).join('\n');var b=new Blob(['\uFEFF'+csv],{type:'text/csv'}),a=document.createElement('a'),u=URL.createObjectURL(b);a.href=u;a.download='hidemail_aliases.csv';a.click();setTimeout(function(){URL.revokeObjectURL(u)},1000);toast('已导出 '+filtered.length+' 个');}
+function clearLogs(){logs=[];E('logFeed').innerHTML=''}
+function toast(msg,isErr){var t=E('toast');t.textContent=msg;t.style.background=isErr?'var(--red)':'var(--ink)';t.classList.add('show');setTimeout(function(){t.classList.remove('show')},2200);}
+function connectSSE(){if(sseConn){sseConn.close();sseConn=null}sseConn=new EventSource('/api/log-stream?after='+logCursor);sseConn.onmessage=function(e){try{var entry=JSON.parse(e.data);if((entry.seq||0)<=logCursor)return;logCursor=entry.seq||logCursor;logs.push(entry);if(logs.length>500)logs=logs.slice(-500);if(curTab==='settings')renderLogs();if(entry.msg&&entry.msg.indexOf('创建')>=0)refreshLight();}catch(_){}};sseConn.onerror=function(){sseConn.close();sseConn=null;setTimeout(connectSSE,5000)};}
+function renderLogs(){var f=E('logFeed');if(!f)return;f.innerHTML=logs.map(function(l){return'<div class="log-line '+l.level+'"><span class="log-time">'+esc(l.time)+'</span>'+esc(l.msg)+'</div>';}).join('\n');f.scrollTop=f.scrollHeight;}
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+function escAttr(s){return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
+function showAddAccountModal(){var h='<div class="modal-overlay" id="addAccModal" onclick="if(event.target===this)closeAddAccModal()"><div class="modal-box"><h3>添加账号</h3><p>Chrome 安装 Cookie Editor，登录 icloud.com 后导出 Header String 粘贴即可。<br>也支持 JSON：<code>{"name1":"value1"}</code></p><input type="text" id="accNameInput" placeholder="账号名称，例如：主号"><textarea id="cookieInput" placeholder="粘贴 Cookie，支持 Header String 或 JSON"></textarea><div class="modal-actions"><button class="btn btn-outline" onclick="closeAddAccModal()">取消</button><button class="btn btn-primary" id="btnAddAccount" onclick="addAccount()">添加账号</button></div><div class="modal-msg" id="addAccMsg"></div></div></div>';document.body.insertAdjacentHTML('beforeend',h);}
+function closeAddAccModal(){var m=E('addAccModal');if(m)m.remove()}
+async function addAccount(){var name=E('accNameInput').value.trim()||'未命名账号';var cookies=E('cookieInput').value.trim();if(!cookies){E('addAccMsg').innerHTML='<span style="color:var(--red)">请粘贴 Cookie</span>';return}var btn=E('btnAddAccount');btn.disabled=true;btn.textContent='正在检查登录...';var d=await api('/api/accounts/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,cookie_input:cookies})});btn.disabled=false;btn.textContent='添加账号';if(d.ok){E('addAccMsg').innerHTML='<span style="color:var(--green)">已添加 '+esc(d.real_email||'')+'</span>';setTimeout(closeAddAccModal,1200);refreshAll();}else{E('addAccMsg').innerHTML='<span style="color:var(--red)">'+esc(d.error||'登录已过期，请重新导入 Cookie')+'</span>';}}
+async function refreshAliases(){if(_aliasesBusy){toast('云端同步正在进行',true);return}_aliasesBusy=true;var btn=E('btnAliasSync');if(btn){btn.disabled=true;btn.textContent='同步中...'}try{var d=await api('/api/aliases',{timeout:120000});if(d.error&&d.ok===false){toast('云端同步失败: '+d.error,true);return}var apiAliases=d.aliases||[],apiMap={};apiAliases.forEach(function(a){apiMap[String(a.email||'').toLowerCase()]=a;});emails.forEach(function(e){var apiData=apiMap[String(e.email||'').toLowerCase()];if(apiData){e.label=apiData.label||'';e.active=apiData.active;e.anonymousId=apiData.anonymousId;e.created_at=apiData.createdAt||e.created_at;e.account_name=apiData.account_name||e.account_name;e.account_email=apiData.account_email||e.account_email;}});E('emailCount').textContent=emails.length;updateEmailFilter();renderAliasTable();var failed=Object.keys(d.failures||{});if(failed.length){toast('同步完成，但有 '+failed.length+' 个账号失败',true)}else{toast('云端同步完成: '+apiAliases.length+' 个邮箱')}}finally{_aliasesBusy=false;if(btn){btn.disabled=false;btn.textContent='云端同步'}}}
+function updateInboxAccountSelect(){var sel=E('inboxAccount');if(!sel)return;var old=sel.value;sel.innerHTML='<option value="">选择账号</option>';accounts.forEach(function(a){var hasPwd=a.has_app_password?'可收信':'未设密码';var imapEmail=a.icloud_email||a.real_email||'';sel.innerHTML+='<option value="'+escAttr(a.id)+'">'+esc((a.name||a.real_email||a.id).substring(0,20))+' | '+esc(imapEmail.substring(0,25))+' '+hasPwd+'</option>';});sel.value=old||'';renderInboxSetupHintIfNeeded();}
+function renderDocs(){var el=E('docsContent');if(el)el.innerHTML='';}
+refreshAll();connectSSE();setInterval(refreshLight,10000);setInterval(refreshAll,30000);
+</script>
+</body>
+</html>
+"""
 # ----- Flask Routes -----
 
 @app.route("/")
