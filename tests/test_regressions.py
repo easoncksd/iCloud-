@@ -220,20 +220,26 @@ def test_export_api_prevents_duplicate_downloads():
 def test_scheduler_start_is_idempotent():
     """重复启动只能保留一个调度线程，停止不得触发全局关机事件"""
     import web_ui
-    client = web_ui.app.test_client()
-    first_result = client.post("/api/scheduler/start").get_json()
-    first_thread = web_ui._scheduler_thread
-    second_result = client.post("/api/scheduler/start").get_json()
-    second_thread = web_ui._scheduler_thread
-    try:
-        assert first_result["already_running"] is False
-        assert second_result["already_running"] is True
-        assert first_thread is second_thread and first_thread.is_alive()
-    finally:
-        client.post("/api/scheduler/stop")
-        first_thread.join(timeout=2)
-    assert not first_thread.is_alive()
-    assert not web_ui._shutdown_event.is_set()
+    original_flag = web_ui._SCHEDULER_FLAG_FILE
+    with tempfile.TemporaryDirectory() as td:
+        web_ui._SCHEDULER_FLAG_FILE = Path(td) / "scheduler_enabled.json"
+        client = web_ui.app.test_client()
+        first_result = client.post("/api/scheduler/start").get_json()
+        first_thread = web_ui._scheduler_thread
+        second_result = client.post("/api/scheduler/start").get_json()
+        second_thread = web_ui._scheduler_thread
+        try:
+            assert first_result["already_running"] is False
+            assert second_result["already_running"] is True
+            assert first_thread is second_thread and first_thread.is_alive()
+            assert web_ui._load_scheduler_enabled() is True
+        finally:
+            client.post("/api/scheduler/stop")
+            first_thread.join(timeout=2)
+            web_ui._SCHEDULER_FLAG_FILE = original_flag
+        assert not first_thread.is_alive()
+        assert not web_ui._shutdown_event.is_set()
+        assert web_ui._load_scheduler_enabled.__name__ == " _load_scheduler_enabled".strip()
     print("  PASS test_scheduler_start_is_idempotent")
 
 
@@ -1303,7 +1309,136 @@ def test_ui_create_entry_and_scheduler_copy():
     assert ",5)\">创建邮箱" not in html
     assert "北京时间 7:00 到 20:00" in html
     assert "正在批量创建的账号会自动跳过" in html
+    assert "accHostInput" in html
+    assert "await refreshEmails();emails.forEach" in html
+    assert "_load_scheduler_enabled()" in Path(web_ui.__file__).read_text(encoding="utf-8")
     print("  PASS test_ui_create_entry_and_scheduler_copy")
+
+
+def test_parse_cookie_editor_array():
+    from account_manager import AccountManager
+    mgr = AccountManager()
+    raw = """[{"name":"X_APPLE_WEB_KB","value":"abc123","domain":".icloud.com.cn"},{"Name":"SESSION_TOKEN","Value":"xyz789","domain":".icloud.com.cn"}]"""
+    cookies = mgr.parse_cookie_input(raw)
+    assert cookies["X_APPLE_WEB_KB"] == "abc123"
+    assert cookies["SESSION_TOKEN"] == "xyz789"
+    assert mgr.detect_icloud_host(raw) == "icloud.com.cn"
+    assert mgr.detect_icloud_host("X_APPLE_WEB_KB=abc") == "icloud.com"
+    print("  PASS test_parse_cookie_editor_array")
+
+
+def test_record_known_aliases_and_failed_add():
+    import account_manager
+    import icloud_hme
+
+    class FakeHME:
+        def __init__(self, *_args, **_kwargs):
+            pass
+        def validate_session(self):
+            return {}
+        def get_account_info(self):
+            return {"appleId": "user@icloud.com", "primaryEmail": "user@icloud.com"}
+        def list_aliases(self):
+            return [
+                {"email": "old@icloud.com", "active": True, "createdAt": 1710000000000},
+                {"email": "OLD@icloud.com", "active": True},
+            ]
+
+    class BoomHME(FakeHME):
+        def validate_session(self):
+            raise RuntimeError("expired cookie")
+
+    originals = (account_manager.ACCOUNTS_FILE, account_manager.LATEST_EMAILS, icloud_hme.ICloudHME)
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            account_manager.ACCOUNTS_FILE = Path(td) / "accounts.json"
+            account_manager.LATEST_EMAILS = Path(td) / "latest_emails.txt"
+            icloud_hme.ICloudHME = BoomHME
+            mgr = account_manager.AccountManager()
+            try:
+                mgr.add_account("bad", "a=b")
+                assert False, "should reject invalid cookies"
+            except ValueError:
+                pass
+            assert mgr.accounts == {}
+
+            icloud_hme.ICloudHME = FakeHME
+            first = mgr.add_account("one", "a=b")
+            second = mgr.add_account("two", "a=b")
+            assert first["id"] == second["id"]
+            assert len(mgr.accounts) == 1
+            lines = account_manager.LATEST_EMAILS.read_text(encoding="utf-8").strip().splitlines()
+            assert len(lines) == 1
+            assert lines[0].startswith("old@icloud.com" + chr(9))
+            added = mgr.record_known_aliases(first["id"], [{"email": "old@icloud.com"}])
+            assert added == 0
+        finally:
+            account_manager.ACCOUNTS_FILE, account_manager.LATEST_EMAILS, icloud_hme.ICloudHME = originals
+    print("  PASS test_record_known_aliases_and_failed_add")
+
+
+def test_find_by_recipient_matches_delivered_to():
+    from icloud_mail import ICloudMail
+
+    header = (
+        b"From: Sender <sender@example.com>\r\n"
+        b"To: hidden-forward@icloud.com\r\n"
+        b"Delivered-To: hide@icloud.com\r\n"
+        b"Subject: Code 123456\r\n"
+        b"Date: Sun, 17 Aug 2026 00:00:00 +0800\r\n"
+        b"X-Pad: " + (b"x" * 80) + b"\r\n"
+    )
+
+    class FakeConnection:
+        state = "SELECTED"
+
+        def uid(self, command, *args):
+            if command == "SEARCH":
+                criteria = " ".join(str(item) for item in args)
+                if "TO" in criteria:
+                    return "OK", [b""]
+                return "OK", [b"7"]
+            if command == "FETCH":
+                return "OK", [(b"1 (UID 7 BODY[HEADER])", header), b")"]
+            raise AssertionError(command)
+
+    mail = ICloudMail("user@icloud.com", "password")
+    mail._conn = FakeConnection()
+    found = mail.find_by_recipient("hide@icloud.com", limit=5)
+    assert len(found) == 1
+    assert "hide@icloud.com" in found[0]["recipients"]
+    print("  PASS test_find_by_recipient_matches_delivered_to")
+
+
+def test_check_all_aliases_mail_raises_without_cache():
+    from account_manager import AccountManager
+
+    mgr = object.__new__(AccountManager)
+    class Cache:
+        def get_all_alias_mail(self, _acc_id):
+            return {}
+        def cache_age_seconds(self, _acc_id):
+            return 9999
+    mgr._cache = Cache()
+    def boom(_acc_id, verbose=False):
+        raise RuntimeError("imap down")
+    mgr.get_client = boom
+    try:
+        mgr.check_all_aliases_mail("acc", force=True)
+        assert False, "should raise"
+    except RuntimeError as exc:
+        assert "imap down" in str(exc)
+    print("  PASS test_check_all_aliases_mail_raises_without_cache")
+
+
+def test_health_loop_retries_error_accounts():
+    import web_ui
+    source = Path(web_ui.__file__).read_text(encoding="utf-8")
+    assert "if result.get(\"status\") == \"active\":" in source
+    assert "if account.get(\"status\") != \"active\": continue" not in source.split("def _health_loop():", 1)[1].split("# ----- HTML -----", 1)[0]
+    assert "_manual_creating_accounts.add(acc_id)" in source.split("def _scheduler_loop():", 1)[0] + source.split("def _scheduler_loop():", 1)[1][:2500]
+    print("  PASS test_health_loop_retries_error_accounts")
+
 
 
 if __name__ == "__main__":
@@ -1348,6 +1483,11 @@ if __name__ == "__main__":
         ("public_bind_requires_admin_token", test_public_bind_requires_admin_token),
         ("scheduler_skips_accounts_with_active_create", test_scheduler_skips_accounts_with_active_create),
         ("ui_create_entry_and_scheduler_copy", test_ui_create_entry_and_scheduler_copy),
+        ("parse_cookie_editor_array", test_parse_cookie_editor_array),
+        ("record_known_aliases_and_failed_add", test_record_known_aliases_and_failed_add),
+        ("find_by_recipient_matches_delivered_to", test_find_by_recipient_matches_delivered_to),
+        ("check_all_aliases_mail_raises_without_cache", test_check_all_aliases_mail_raises_without_cache),
+        ("health_loop_retries_error_accounts", test_health_loop_retries_error_accounts),
     ]
     
     passed = 0

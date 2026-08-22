@@ -89,11 +89,30 @@ class ICloudMail:
 
     def find_by_recipient(self, recipient: str, limit: int = 20, days: int = 30) -> List[Dict]:
         self._ensure_connected()
+        needle = (recipient or "").strip().lower()
+        if not needle:
+            return []
+
+        def matches(message: Dict) -> bool:
+            recipients = {
+                str(value).strip().lower()
+                for value in message.get("recipients") or []
+                if value
+            }
+            if needle in recipients:
+                return True
+            return needle in str(message.get("to") or "").lower()
+
         try:
-            return self._search_and_fetch(f'TO "{recipient}"', limit, days)
+            searched = self._search_and_fetch('TO "%s"' % needle, limit, days)
         except Exception:
-            all_msgs = self._search_and_fetch(None, limit * 3, days)
-            return [m for m in all_msgs if recipient.lower() in m.get("to", "").lower()][:limit]
+            searched = []
+        matched = [message for message in searched if matches(message)]
+        if matched:
+            return matched[:limit]
+
+        all_msgs = self._search_and_fetch(None, max(limit * 5, 80), days)
+        return [message for message in all_msgs if matches(message)][:limit]
 
     def recent_uids(self, limit: int = 100, days: int = 30) -> List[bytes]:
         """Return recent message UIDs newest first without fetching message data."""

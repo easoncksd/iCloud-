@@ -150,13 +150,31 @@ class AccountManager:
         if not raw:
             raise ValueError("空白输入 — 请粘贴 Cookie Header String 或 JSON")
 
-        if raw.startswith("{"):
+        if raw.startswith("{") or raw.startswith("["):
             try:
-                cookies = json.loads(raw)
-                if isinstance(cookies, dict):
-                    return {k: str(v) for k, v in cookies.items() if v}
+                parsed = json.loads(raw)
             except json.JSONDecodeError:
-                pass
+                parsed = None
+            if isinstance(parsed, dict):
+                cookies = {k: str(v) for k, v in parsed.items() if v}
+                if cookies:
+                    return cookies
+            if isinstance(parsed, list):
+                cookies = {}
+                for item in parsed:
+                    if not isinstance(item, dict):
+                        continue
+                    name = str(item.get("name") or item.get("Name") or "").strip()
+                    if not name:
+                        continue
+                    value = item.get("value")
+                    if value is None:
+                        value = item.get("Value")
+                    if value is None or value == "":
+                        continue
+                    cookies[name] = str(value)
+                if cookies:
+                    return cookies
 
         cookies: Dict[str, str] = {}
         for part in raw.split(";"):
@@ -176,13 +194,96 @@ class AccountManager:
 
         return cookies
 
+    @staticmethod
+    def detect_icloud_host(raw: str) -> str:
+        text = (raw or "").strip()
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, list):
+                for item in parsed:
+                    if not isinstance(item, dict):
+                        continue
+                    domain = str(item.get("domain") or item.get("Domain") or "").lower()
+                    if "icloud.com.cn" in domain:
+                        return "icloud.com.cn"
+        if "icloud.com.cn" in text.lower():
+            return "icloud.com.cn"
+        return "icloud.com"
+
+    @staticmethod
+    def _alias_created_at(alias: Dict) -> str:
+        value = None
+        if isinstance(alias, dict):
+            value = alias.get("createdAt") or alias.get("created_at")
+        if isinstance(value, (int, float)):
+            ts = float(value)
+            if ts > 10_000_000_000:
+                ts /= 1000.0
+            try:
+                return datetime.fromtimestamp(ts).astimezone().isoformat()
+            except (OSError, OverflowError, ValueError):
+                return datetime.now().astimezone().isoformat()
+        text = str(value or "").strip()
+        return text or datetime.now().astimezone().isoformat()
+
+    def _existing_account_id_locked(self, real_email: str):
+        key = (real_email or "").strip().lower()
+        if not key:
+            return None
+        for acc_id, account in self.accounts.items():
+            if (account.get("real_email") or "").strip().lower() == key:
+                return acc_id
+        return None
+
+    def record_known_aliases(self, acc_id: str, aliases: List[Dict]) -> int:
+        """Persist Apple-listed aliases into latest_emails.txt without duplicates."""
+        rows = []
+        seen = set()
+        for alias in aliases or []:
+            email = str((alias or {}).get("email") or "").strip().lower()
+            if not email or "@" not in email or email in seen:
+                continue
+            seen.add(email)
+            rows.append((email, str(acc_id), self._alias_created_at(alias)))
+        if not rows:
+            return 0
+
+        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        added = 0
+        with self._latest_emails_lock:
+            existing = set()
+            if LATEST_EMAILS.exists():
+                for line in LATEST_EMAILS.read_text(encoding="utf-8").splitlines():
+                    parts = line.split("\t")
+                    if parts and parts[0].strip():
+                        existing.add(parts[0].strip().lower())
+            new_lines = []
+            for email, account_id, created_at in rows:
+                if email in existing:
+                    continue
+                new_lines.append("\t".join([email, account_id, created_at]) + "\n")
+                existing.add(email)
+                added += 1
+            if new_lines:
+                with open(str(LATEST_EMAILS), "a", encoding="utf-8") as handle:
+                    handle.writelines(new_lines)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+        return added
+
     def add_account(
         self, name: str, cookie_input: str, host: str = "icloud.com"
     ) -> Dict:
         from icloud_hme import ICloudHME
 
         cookies = self.parse_cookie_input(cookie_input)
+        if host not in ("icloud.com", "icloud.com.cn"):
+            host = self.detect_icloud_host(cookie_input)
         acc_id = self._generate_id()
+        aliases: List[Dict] = []
 
         account: Dict[str, Any] = {
             "id": acc_id,
@@ -217,17 +318,32 @@ class AccountManager:
                     1 for a in aliases if a.get("active")
                 )
             except Exception:
-                pass
+                aliases = []
 
             account["last_validated"] = datetime.now().isoformat()
             account["last_error"] = None
         except Exception as e:
-            account["status"] = "error"
-            account["last_error"] = str(e)[:300]
+            raise ValueError(str(e)[:300]) from e
 
         with self._lock:
-            self.accounts[acc_id] = account
+            existing_id = self._existing_account_id_locked(account.get("real_email", ""))
+            if existing_id:
+                old = self.accounts[existing_id]
+                acc_id = existing_id
+                account["id"] = existing_id
+                account["created_at"] = old.get("created_at") or account["created_at"]
+                if old.get("app_password"):
+                    account["app_password"] = old["app_password"]
+                if old.get("icloud_email") and not account.get("icloud_email"):
+                    account["icloud_email"] = old["icloud_email"]
+                if (not name or name == "未命名账号") and old.get("name"):
+                    account["name"] = old["name"]
+                self.accounts[existing_id] = account
+            else:
+                self.accounts[acc_id] = account
             self._save()
+        if aliases:
+            self.record_known_aliases(acc_id, aliases)
         return account
 
     def remove_account(self, acc_id: str) -> bool:
@@ -287,6 +403,7 @@ class AccountManager:
         if not account:
             raise KeyError(f"账号不存在: {acc_id}")
 
+        aliases: List[Dict] = []
         try:
             client = ICloudHME(
                 account["cookies"],
@@ -320,6 +437,8 @@ class AccountManager:
             account["last_error"] = str(e)[:300]
 
         self._save()
+        if aliases:
+            self.record_known_aliases(acc_id, aliases)
         return account
 
     def validate_all(self) -> List[Dict]:
@@ -408,16 +527,14 @@ class AccountManager:
 
         try:
             mail = self.get_mail_client(acc_id)
-            new_msgs = mail.check_inbox(limit=50, days=days)
+            new_msgs = mail.check_inbox(limit=max(limit, 50), days=days)
             mail.disconnect()
         except Exception:
             if force or not cached:
                 raise
             new_msgs = []
 
-        if new_msgs:
-            self._cache.set_inbox(acc_id, new_msgs)
-
+        self._cache.set_inbox(acc_id, new_msgs)
         return self._cache.get_inbox(acc_id)[-limit:]
 
     def check_alias_mail(self, acc_id: str, alias_email: str,
@@ -431,7 +548,7 @@ class AccountManager:
 
         try:
             mail = self.get_mail_client(acc_id)
-            new_msgs = mail.find_by_recipient(alias_email, limit=20, days=days)
+            new_msgs = mail.find_by_recipient(alias_email, limit=limit, days=days)
             mail.disconnect()
         except Exception:
             if force or not cached:
@@ -449,30 +566,35 @@ class AccountManager:
         cached = self._cache.get_all_alias_mail(acc_id)
         age = self._cache.cache_age_seconds(acc_id)
 
-        if not force and cached and age < 300:
+        def cached_slice():
             results = {}
-            for alias, msgs in cached.items():
+            for alias, msgs in (cached or {}).items():
                 results[alias] = msgs[-limit_per:]
             return results
 
-        from icloud_hme import ICloudHME
+        if not force and cached and age < 300:
+            return cached_slice()
 
         try:
             client = self.get_client(acc_id, verbose=False)
             aliases = client.list_aliases()
         except Exception:
-            return cached if cached else {}
+            if cached:
+                return cached_slice()
+            raise
 
         alias_set = {a.get("email", "").lower() for a in aliases if a.get("email")}
         if not alias_set:
-            return cached if cached else {}
+            return cached_slice()
 
         try:
             mail = self.get_mail_client(acc_id)
             all_inbox = mail.check_inbox(limit=100, days=days)
             mail.disconnect()
         except Exception:
-            return cached if cached else {}
+            if cached:
+                return cached_slice()
+            raise
 
         results: Dict[str, List[Dict]] = {}
         for msg in all_inbox:

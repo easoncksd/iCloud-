@@ -122,7 +122,7 @@ _pickup_executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix="pickup
 _pickup_pending = 0
 _PICKUP_MAX_PENDING = 256
 _PICKUP_SYNC_INTERVAL_SECONDS = max(
-    1.0, float(os.environ.get("PICKUP_SYNC_INTERVAL_SECONDS", "2"))
+    1.0, float(os.environ.get("PICKUP_SYNC_INTERVAL_SECONDS", "15"))
 )
 _PICKUP_BODY_MAX_ITEMS = 1000
 _PICKUP_BODY_MAX_BYTES = 64 * 1024 * 1024
@@ -239,8 +239,31 @@ def _load_batch_state(path=_BATCH_STATE_FILE):
 
 
 _batch_jobs, _batch_active_id = _load_batch_state()
-_manual_create_lock = threading.Lock()
+_manual_create_lock = threading.RLock()
 _manual_creating_accounts = set()
+_SCHEDULER_FLAG_FILE = RESULTS_DIR / "scheduler_enabled.json"
+
+
+def _load_scheduler_enabled(path=None):
+    target = Path(path or _SCHEDULER_FLAG_FILE)
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+        return bool(isinstance(data, dict) and data.get("enabled"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+
+
+def _save_scheduler_enabled(enabled: bool, path=None):
+    target = Path(path or _SCHEDULER_FLAG_FILE)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({"enabled": bool(enabled)}, ensure_ascii=False)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, target)
+
 
 
 def _save_batch_state_locked(path=None):
@@ -361,7 +384,13 @@ def _scheduler_loop():
                 break
             acc_id = account["id"]
             acc_name = account.get("name", acc_id)
-            if _account_create_in_progress(acc_id):
+            with _manual_create_lock:
+                if _account_create_in_progress(acc_id):
+                    claimed = False
+                else:
+                    _manual_creating_accounts.add(acc_id)
+                    claimed = True
+            if not claimed:
                 _emit_log("info", f"[{acc_name}] 已有创建任务，本轮跳过")
                 continue
             target_count = _random.randint(3, 5)
@@ -373,7 +402,10 @@ def _scheduler_loop():
                 )
             except Exception as e:
                 _emit_log("warn", f"[{acc_name}] 失败: {str(e)[:80]}")
-                continue
+                results = []
+            finally:
+                with _manual_create_lock:
+                    _manual_creating_accounts.discard(acc_id)
             created = [r for r in results if r.get("ok")]
             errors = [r for r in results if not r.get("ok")]
             if created:
@@ -397,12 +429,25 @@ def _scheduler_loop():
 def _health_loop():
     _error_reported = set()
     while not _shutdown_event.is_set():
-        if _shutdown_event.wait(300): break
+        if _shutdown_event.wait(300):
+            break
         for account in _account_mgr.list_accounts():
-            if account.get("status") != "active": continue
-            try: _account_mgr.validate_account(account["id"]); _error_reported.discard(account["id"])
+            acc_id = account["id"]
+            if _account_create_in_progress(acc_id):
+                continue
+            try:
+                result = _account_mgr.validate_account(acc_id)
+                if result.get("status") == "active":
+                    _error_reported.discard(acc_id)
+                    continue
+                error_text = result.get("last_error") or "error"
+                if acc_id not in _error_reported:
+                    _emit_log("warn", f"健康检查失败 [{account.get('name','?')}]: {str(error_text)[:100]}")
+                    _error_reported.add(acc_id)
             except Exception as e:
-                if account["id"] not in _error_reported: _emit_log("warn",f"健康检查失败 [{account.get('name','?')}]: {str(e)[:100]}"); _error_reported.add(account["id"])
+                if acc_id not in _error_reported:
+                    _emit_log("warn", f"健康检查失败 [{account.get('name','?')}]: {str(e)[:100]}")
+                    _error_reported.add(acc_id)
 
 # ----- HTML -----
 UI_HTML = r"""<!DOCTYPE html>
@@ -580,6 +625,9 @@ textarea{width:100%;min-height:140px}
   .work-stat b{font-size:16px}
   .account-grid{grid-template-columns:1fr}
 }
+
+.modal-box label.hint{display:block;margin:8px 0 6px}
+.modal-box input[type=text],.modal-box input[type=password],.modal-box select,.modal-box textarea{width:100%}
 </style>
 </head>
 <body>
@@ -700,7 +748,7 @@ textarea{width:100%;min-height:140px}
       <div class="panel">
         <div class="settings-section">
           <h3>自动创建</h3>
-          <p>北京时间 7:00 到 20:00，每隔 60 到 90 分钟给每个有效账号创建 3 到 5 个邮箱。正在批量创建的账号会自动跳过。</p>
+          <p>北京时间 7:00 到 20:00，每隔 60 到 90 分钟给每个有效账号创建 3 到 5 个邮箱。正在批量创建的账号会自动跳过。开启后会记住，服务重启仍会继续。</p>
           <div class="toolbar">
             <span class="status-dot" id="schedDotSettings"></span>
             <span id="schedLabelSettings">已停止</span>
@@ -933,10 +981,10 @@ function connectSSE(){if(sseConn){sseConn.close();sseConn=null}sseConn=new Event
 function renderLogs(){var f=E('logFeed');if(!f)return;f.innerHTML=logs.map(function(l){return'<div class="log-line '+l.level+'"><span class="log-time">'+esc(l.time)+'</span>'+esc(l.msg)+'</div>';}).join('\n');f.scrollTop=f.scrollHeight;}
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
 function escAttr(s){return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
-function showAddAccountModal(){var h='<div class="modal-overlay" id="addAccModal" onclick="if(event.target===this)closeAddAccModal()"><div class="modal-box"><h3>添加账号</h3><p>Chrome 安装 <a href="https://chromewebstore.google.com/detail/cookie-editor/hlkenndednhfkekhgcdicdfddnkalmdm" target="_blank" rel="noopener noreferrer">Cookie Editor</a>，登录 icloud.com 后导出 Header String 粘贴即可。<br>也支持 JSON：<code>{"name1":"value1"}</code> <a href="https://chromewebstore.google.com/detail/cookie-editor/hlkenndednhfkekhgcdicdfddnkalmdm" target="_blank" rel="noopener noreferrer">下载扩展</a></p><input type="text" id="accNameInput" placeholder="账号名称，例如：主号"><textarea id="cookieInput" placeholder="粘贴 Cookie，支持 Header String 或 JSON"></textarea><div class="modal-actions"><button class="btn btn-outline" onclick="closeAddAccModal()">取消</button><button class="btn btn-primary" id="btnAddAccount" onclick="addAccount()">添加账号</button></div><div class="modal-msg" id="addAccMsg"></div></div></div>';document.body.insertAdjacentHTML('beforeend',h);}
+function showAddAccountModal(){var h='<div class="modal-overlay" id="addAccModal" onclick="if(event.target===this)closeAddAccModal()"><div class="modal-box"><h3>添加账号</h3><p>Chrome 安装 <a href="https://chromewebstore.google.com/detail/cookie-editor/hlkenndednhfkekhgcdicdfddnkalmdm" target="_blank" rel="noopener noreferrer">Cookie Editor</a>，登录 icloud.com 后导出 Header String 粘贴即可。<br>也支持 JSON：<code>{"name1":"value1"}</code> <a href="https://chromewebstore.google.com/detail/cookie-editor/hlkenndednhfkekhgcdicdfddnkalmdm" target="_blank" rel="noopener noreferrer">下载扩展</a></p><label class="hint">区域</label><select id="accHostInput"><option value="icloud.com" selected>国际 (icloud.com)</option><option value="icloud.com.cn">中国 (icloud.com.cn)</option></select><input type="text" id="accNameInput" placeholder="账号名称，例如：主号"><textarea id="cookieInput" placeholder="粘贴 Cookie，支持 Header String 或 JSON"></textarea><div class="modal-actions"><button class="btn btn-outline" onclick="closeAddAccModal()">取消</button><button class="btn btn-primary" id="btnAddAccount" onclick="addAccount()">添加账号</button></div><div class="modal-msg" id="addAccMsg"></div></div></div>';document.body.insertAdjacentHTML('beforeend',h);}
 function closeAddAccModal(){var m=E('addAccModal');if(m)m.remove()}
-async function addAccount(){var name=E('accNameInput').value.trim()||'未命名账号';var cookies=E('cookieInput').value.trim();if(!cookies){E('addAccMsg').innerHTML='<span style="color:var(--red)">请粘贴 Cookie</span>';return}var btn=E('btnAddAccount');btn.disabled=true;btn.textContent='正在检查登录...';var d=await api('/api/accounts/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,cookie_input:cookies})});btn.disabled=false;btn.textContent='添加账号';if(d.ok){E('addAccMsg').innerHTML='<span style="color:var(--green)">已添加 '+esc(d.real_email||'')+'</span>';setTimeout(closeAddAccModal,1200);refreshAll();}else{E('addAccMsg').innerHTML='<span style="color:var(--red)">'+esc(d.error||'登录已过期，请重新导入 Cookie')+'</span>';}}
-async function refreshAliases(){if(_aliasesBusy){toast('云端同步正在进行',true);return}_aliasesBusy=true;var btn=E('btnAliasSync');if(btn){btn.disabled=true;btn.textContent='同步中...'}try{var d=await api('/api/aliases',{timeout:120000});if(d.error&&d.ok===false){toast('云端同步失败: '+d.error,true);return}var apiAliases=d.aliases||[],apiMap={};apiAliases.forEach(function(a){apiMap[String(a.email||'').toLowerCase()]=a;});emails.forEach(function(e){var apiData=apiMap[String(e.email||'').toLowerCase()];if(apiData){e.label=apiData.label||'';e.active=apiData.active;e.anonymousId=apiData.anonymousId;e.created_at=apiData.createdAt||e.created_at;e.account_name=apiData.account_name||e.account_name;e.account_email=apiData.account_email||e.account_email;}});E('emailCount').textContent=emails.length;updateEmailFilter();renderAliasTable();var failed=Object.keys(d.failures||{});if(failed.length){toast('同步完成，但有 '+failed.length+' 个账号失败',true)}else{toast('云端同步完成: '+apiAliases.length+' 个邮箱')}}finally{_aliasesBusy=false;if(btn){btn.disabled=false;btn.textContent='云端同步'}}}
+async function addAccount(){var name=E('accNameInput').value.trim()||'未命名账号';var cookies=E('cookieInput').value.trim();if(!cookies){E('addAccMsg').innerHTML='<span style="color:var(--red)">请粘贴 Cookie</span>';return}var btn=E('btnAddAccount');btn.disabled=true;btn.textContent='正在检查登录...';var d=await api('/api/accounts/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,cookie_input:cookies,host:(E('accHostInput')&&E('accHostInput').value)||'icloud.com'})});btn.disabled=false;btn.textContent='添加账号';if(d.ok){E('addAccMsg').innerHTML='<span style="color:var(--green)">已添加 '+esc(d.real_email||'')+'</span>';setTimeout(closeAddAccModal,1200);refreshAll();}else{E('addAccMsg').innerHTML='<span style="color:var(--red)">'+esc(d.error||'登录已过期，请重新导入 Cookie')+'</span>';}}
+async function refreshAliases(){if(_aliasesBusy){toast('云端同步正在进行',true);return}_aliasesBusy=true;var btn=E('btnAliasSync');if(btn){btn.disabled=true;btn.textContent='同步中...'}try{var d=await api('/api/aliases',{timeout:120000});if(d.error&&d.ok===false){toast('云端同步失败: '+d.error,true);return}var apiAliases=d.aliases||[],apiMap={};apiAliases.forEach(function(a){apiMap[String(a.email||'').toLowerCase()]=a;});await refreshEmails();emails.forEach(function(e){var apiData=apiMap[String(e.email||'').toLowerCase()];if(apiData){e.label=apiData.label||'';e.active=apiData.active;e.anonymousId=apiData.anonymousId;e.created_at=apiData.createdAt||e.created_at;e.account_name=apiData.account_name||e.account_name;e.account_email=apiData.account_email||e.account_email;}});renderAliasTable();var failed=Object.keys(d.failures||{});if(failed.length){toast('同步完成，但有 '+failed.length+' 个账号失败',true)}else{toast('云端同步完成: '+apiAliases.length+' 个邮箱')}}finally{_aliasesBusy=false;if(btn){btn.disabled=false;btn.textContent='云端同步'}}}
 function updateInboxAccountSelect(){var sel=E('inboxAccount');if(!sel)return;var old=sel.value;sel.innerHTML='<option value="">选择账号</option>';accounts.forEach(function(a){var hasPwd=a.has_app_password?'可收信':'未设密码';var imapEmail=a.icloud_email||a.real_email||'';sel.innerHTML+='<option value="'+escAttr(a.id)+'">'+esc((a.name||a.real_email||a.id).substring(0,20))+' | '+esc(imapEmail.substring(0,25))+' '+hasPwd+'</option>';});sel.value=old||'';renderInboxSetupHintIfNeeded();}
 function renderDocs(){var el=E('docsContent');if(el)el.innerHTML='';}
 refreshAll();connectSSE();setInterval(refreshLight,10000);setInterval(refreshAll,30000);
@@ -978,8 +1026,13 @@ def api_add_account():
     cookie_input = data.get("cookie_input","")
     if not cookie_input:
         return jsonify({"ok":False,"error":"请提供 cookie_input"}), 400
+    requested_host = str(data.get("host") or "").strip().lower()
+    if requested_host in ("icloud.com", "icloud.com.cn"):
+        host = requested_host
+    else:
+        host = AccountManager.detect_icloud_host(cookie_input)
     try:
-        account = _account_mgr.add_account(name, cookie_input)
+        account = _account_mgr.add_account(name, cookie_input, host=host)
         _emit_log("info",f"添加账号: {account.get('name','')} ({account.get('real_email','?')})")
         ok = account.get("status") == "active"
         payload = {"ok":ok,"id":account["id"],"name":account["name"],"real_email":account.get("real_email",""),"alias_total":account.get("alias_total",0),"alias_active":account.get("alias_active",0),"status":account.get("status","")}
@@ -1411,58 +1464,57 @@ def api_create_batch():
 
     with _manual_create_lock:
         busy_ids = [acc_id for acc_id in account_ids if acc_id in _manual_creating_accounts]
-    if busy_ids:
-        return jsonify({
-            "ok": False,
-            "error": "所选账号中已有手动创建任务正在运行",
-            "account_ids": busy_ids,
-        }), 409
-
-    with _batch_lock:
-        if _batch_active_id:
-            active = _batch_jobs.get(_batch_active_id)
-            if active and active.get("status") in ("queued", "running"):
-                return jsonify({
-                    "ok": False,
-                    "error": "已有批量任务正在运行",
-                    "job_id": _batch_active_id,
-                }), 409
-        job_id = secrets.token_urlsafe(12)
-        now = datetime.now(_BJ_TZ).isoformat()
-        job = {
-            "id": job_id,
-            "status": "queued",
-            "account_ids": account_ids,
-            "count_per_account": count,
-            "interval": interval,
-            "label": label,
-            "total_accounts": len(account_ids),
-            "completed_accounts": 0,
-            "total_created": 0,
-            "total_errors": 0,
-            "created_at": now,
-            "updated_at": now,
-            "accounts": {
-                acc_id: {
-                    "account_id": acc_id,
-                    "name": (_account_mgr.get_account(acc_id) or {}).get("name") or acc_id,
-                    "status": "queued",
-                    "created": 0,
-                    "errors": 0,
-                    "limited": False,
-                    "error": "",
-                    "retry_count": 0,
-                    "retry_delay_seconds": 0,
-                    "retry_at": None,
-                }
-                for acc_id in account_ids
-            },
-        }
-        _batch_jobs[job_id] = job
-        while len(_batch_jobs) > _BATCH_JOB_HISTORY:
-            _batch_jobs.popitem(last=False)
-        _batch_active_id = job_id
-        _save_batch_state_locked()
+        if busy_ids:
+            return jsonify({
+                "ok": False,
+                "error": "所选账号中已有手动创建任务正在运行",
+                "account_ids": busy_ids,
+            }), 409
+        with _batch_lock:
+            if _batch_active_id:
+                active = _batch_jobs.get(_batch_active_id)
+                if active and active.get("status") in ("queued", "running"):
+                    return jsonify({
+                        "ok": False,
+                        "error": "已有批量任务正在运行",
+                        "job_id": _batch_active_id,
+                    }), 409
+            job_id = secrets.token_urlsafe(12)
+            now = datetime.now(_BJ_TZ).isoformat()
+            job = {
+                "id": job_id,
+                "status": "queued",
+                "account_ids": account_ids,
+                "count_per_account": count,
+                "interval": interval,
+                "label": label,
+                "total_accounts": len(account_ids),
+                "completed_accounts": 0,
+                "total_created": 0,
+                "total_errors": 0,
+                "created_at": now,
+                "updated_at": now,
+                "accounts": {
+                    acc_id: {
+                        "account_id": acc_id,
+                        "name": (_account_mgr.get_account(acc_id) or {}).get("name") or acc_id,
+                        "status": "queued",
+                        "created": 0,
+                        "errors": 0,
+                        "limited": False,
+                        "error": "",
+                        "retry_count": 0,
+                        "retry_delay_seconds": 0,
+                        "retry_at": None,
+                    }
+                    for acc_id in account_ids
+                },
+            }
+            _batch_jobs[job_id] = job
+            while len(_batch_jobs) > _BATCH_JOB_HISTORY:
+                _batch_jobs.popitem(last=False)
+            _batch_active_id = job_id
+            _save_batch_state_locked()
     threading.Thread(target=_run_batch_job, args=(job_id,), daemon=True).start()
     return jsonify({"ok": True, "job_id": job_id, "job": _batch_job_snapshot(job_id)}), 202
 
@@ -1592,6 +1644,12 @@ def api_alias_mail(acc_id):
 def api_aliases():
     try:
         aliases, accounts = _account_mgr.get_all_aliases_with_status(max_workers=5)
+        by_account = {}
+        for alias in aliases:
+            by_account.setdefault(str(alias.get("account_id") or ""), []).append(alias)
+        for acc_id, items in by_account.items():
+            if acc_id:
+                _account_mgr.record_known_aliases(acc_id, items)
         failures = {
             acc_id: status for acc_id, status in accounts.items()
             if not status.get("ok")
@@ -1996,17 +2054,20 @@ def api_scheduler_start():
     global _scheduler_thread
     with _scheduler_lock:
         if _scheduler_thread and _scheduler_thread.is_alive():
+            _save_scheduler_enabled(True)
             return jsonify({"ok":True,"already_running":True})
         _scheduler_stop_event.clear()
         _scheduler_thread = threading.Thread(target=_scheduler_loop, daemon=True)
         _scheduler_thread.start()
         _update_state(running=True)
+        _save_scheduler_enabled(True)
         return jsonify({"ok":True,"already_running":False})
 
 @app.route("/api/scheduler/stop", methods=["POST"])
 def api_scheduler_stop():
     _scheduler_stop_event.set()
     _update_state(running=False, creating=False, next_trigger=None, round_status="正在停止")
+    _save_scheduler_enabled(False)
     return jsonify({"ok":True})
 
 @app.route("/api/log-stream")
@@ -2074,12 +2135,13 @@ def main():
         f"取件后台同步已启动，账号级间隔 {_PICKUP_SYNC_INTERVAL_SECONDS:g} 秒",
     )
     _resume_batch_job_if_needed()
-    if args.scheduler:
+    if args.scheduler or _load_scheduler_enabled():
         global _scheduler_thread
         _scheduler_stop_event.clear()
         _scheduler_thread = threading.Thread(target=_scheduler_loop, daemon=True)
         _scheduler_thread.start()
         _update_state(running=True)
+        _save_scheduler_enabled(True)
         print("[+] Scheduler auto-started")
     def _shutdown(sig,frame):
         print("\n[*] Shutting down...")

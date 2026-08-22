@@ -15,7 +15,9 @@ iCloud Hide My Email — 定时自动创建调度器
 """
 
 import sys, os, json, time, signal, logging, argparse
+import random
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Optional, Dict, List
 
@@ -123,7 +125,12 @@ class Scheduler:
         self.logger.info(f"mode: BJ 7-20h, 60-90min interval, 3-5/account")
         round_num = 0
         while self._running:
-            round_num += 1; now = datetime.now()
+            now = datetime.now(ZoneInfo('Asia/Shanghai'))
+            if now.hour < 7 or now.hour >= 20:
+                self.logger.info(f"outside window BJ {now.hour}:00")
+                wait_interval(self.logger, 1800)
+                continue
+            round_num += 1
             label = f"{self.label_prefix}R{round_num} {now.strftime('%m%d%H%M')}" if self.label_prefix else f"R{round_num} {now.strftime('%m%d%H%M')}"
             round_result = run_one_round(self.mgr, self.logger, label=label, interval_sec=self.interval_sec)
             save_round_result(round_result, self.logger)
@@ -133,7 +140,7 @@ class Scheduler:
             self._state["last_error"] = round_result.fatal_error; save_state(self._state)
             if round_result.fatal_error: self.logger.error(f"fatal exit: {round_result.fatal_error[:200]}"); self._running = False; break
             if not self._running: break
-            wait_interval(self.logger, 3600)
+            wait_interval(self.logger, random.randint(3600, 5400))
         self.logger.info(f"scheduler stopped. total: {self._state.get('total_created',0)}"); save_state(self._state)
 
 def main():
