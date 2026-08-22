@@ -6,10 +6,6 @@
 
 ## 界面预览
 
-项目概览：
-
-![项目概览](docs/images/README-overview.png)
-
 账号管理与创建状态：
 
 ![账号管理界面](docs/images/dashboard-accounts.png)
