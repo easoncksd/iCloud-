@@ -550,7 +550,8 @@ def test_email_api_uses_saved_and_pickup_creation_times():
             assert by_email["new@icloud.com"]["pickup_url"].endswith("/pickup/token-acc-new")
             assert by_email["old@icloud.com"]["pickup_url"].endswith("/pickup/existing-old-token")
             assert by_email["old@icloud.com"]["account_id"] == "acc-current"
-            assert "<th>创建时间</th>" in web_ui.UI_HTML
+            assert "t('table.created')" in web_ui.UI_HTML
+            assert "创建时间" in web_ui.UI_HTML
             assert "formatExportTime(e.created_at)" in web_ui.UI_HTML
             assert "pickupLinksLoaded=true" in web_ui.UI_HTML
         finally:
