@@ -1313,6 +1313,9 @@ def test_ui_create_entry_and_scheduler_copy():
     assert "accHostInput" in html
     assert "await refreshEmails();emails.forEach" in html
     assert "_load_scheduler_enabled()" in Path(web_ui.__file__).read_text(encoding="utf-8")
+    assert 'class="social-links"' in html
+    assert 'href="https://x.com/fangao798"' in html
+    assert 'href="https://t.co/fd6OPHgvKm"' in html
     print("  PASS test_ui_create_entry_and_scheduler_copy")
 
 
