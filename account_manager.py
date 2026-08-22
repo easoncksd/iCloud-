@@ -42,7 +42,7 @@ CREATE_ALIAS_JITTER_SECONDS = max(
     0.0, float(os.environ.get("CREATE_ALIAS_JITTER_SECONDS", "2"))
 )
 
-from mail_cache import get_cache  # noqa: E402
+from mail_cache import get_cache, sort_messages_newest  # noqa: E402
 
 
 class AccountManager:
@@ -523,7 +523,7 @@ class AccountManager:
         age = self._cache.cache_age_seconds(acc_id)
 
         if not force and cached and age < 300:
-            return cached[-limit:]
+            return sort_messages_newest(cached)[:limit]
 
         try:
             mail = self.get_mail_client(acc_id)
@@ -535,7 +535,7 @@ class AccountManager:
             new_msgs = []
 
         self._cache.set_inbox(acc_id, new_msgs)
-        return self._cache.get_inbox(acc_id)[-limit:]
+        return sort_messages_newest(self._cache.get_inbox(acc_id))[:limit]
 
     def check_alias_mail(self, acc_id: str, alias_email: str,
                          limit: int = 20, days: int = 30,
@@ -544,7 +544,7 @@ class AccountManager:
         age = self._cache.cache_age_seconds(acc_id)
 
         if not force and cached and age < 300:
-            return cached[-limit:]
+            return sort_messages_newest(cached)[:limit]
 
         try:
             mail = self.get_mail_client(acc_id)
@@ -558,7 +558,7 @@ class AccountManager:
         if new_msgs:
             self._cache.set_alias_mail(acc_id, alias_email, new_msgs)
 
-        return self._cache.get_alias_mail(acc_id, alias_email)[-limit:]
+        return sort_messages_newest(self._cache.get_alias_mail(acc_id, alias_email))[:limit]
 
     def check_all_aliases_mail(self, acc_id: str, limit_per: int = 5,
                                days: int = 14,
@@ -569,7 +569,7 @@ class AccountManager:
         def cached_slice():
             results = {}
             for alias, msgs in (cached or {}).items():
-                results[alias] = msgs[-limit_per:]
+                results[alias] = sort_messages_newest(msgs)[:limit_per]
             return results
 
         if not force and cached and age < 300:

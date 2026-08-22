@@ -1431,6 +1431,31 @@ def test_check_all_aliases_mail_raises_without_cache():
     print("  PASS test_check_all_aliases_mail_raises_without_cache")
 
 
+
+def test_mail_newest_first():
+    import mail_cache
+    old_path = mail_cache.CACHE_FILE
+    temp_dir = tempfile.TemporaryDirectory()
+    mail_cache.CACHE_FILE = Path(temp_dir.name) / "mail_cache.json"
+    cache = mail_cache.MailCache()
+    cache.set_alias_mail("acc", "a@icloud.com", [
+        {"id": "old", "date": "2026-08-19T14:37:23", "subject": "old"},
+        {"id": "new", "date": "2026-08-22T08:30:03", "subject": "new"},
+        {"id": "mid", "date": "2026-08-21T17:56:57", "subject": "mid"},
+    ])
+    got = cache.get_alias_mail("acc", "a@icloud.com")
+    assert [item["id"] for item in got] == ["new", "mid", "old"], [item["id"] for item in got]
+    many = [{"id": str(i), "date": "2026-08-01T00:00:%02d" % (i % 60)} for i in range(mail_cache.MAX_ALIAS_MESSAGES)]
+    many.append({"id": "fresh", "date": "2026-08-22T12:00:00"})
+    cache.set_alias_mail("acc", "b@icloud.com", many)
+    kept_ids = [item["id"] for item in cache.get_alias_mail("acc", "b@icloud.com")]
+    assert "fresh" in kept_ids
+    assert len(kept_ids) == mail_cache.MAX_ALIAS_MESSAGES
+    mail_cache.CACHE_FILE = old_path
+    temp_dir.cleanup()
+    print("  PASS test_mail_newest_first")
+
+
 def test_health_loop_retries_error_accounts():
     import web_ui
     source = Path(web_ui.__file__).read_text(encoding="utf-8")
@@ -1450,6 +1475,7 @@ if __name__ == "__main__":
         ("derive_icloud_email_appleid_is_icloud", test_derive_icloud_email_appleid_is_icloud),
         ("derive_icloud_email_third_party", test_derive_icloud_email_third_party),
         ("mail_cache_basic", test_mail_cache_basic),
+        ("mail_newest_first", test_mail_newest_first),
         ("pickup_rebind_deduplicates_and_revokes", test_pickup_rebind_deduplicates_and_revokes),
         ("export_history_is_persistent_and_idempotent", test_export_history_is_persistent_and_idempotent),
         ("account_api_reports_validation_failure", test_account_api_reports_validation_failure),

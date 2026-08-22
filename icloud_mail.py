@@ -109,10 +109,13 @@ class ICloudMail:
             searched = []
         matched = [message for message in searched if matches(message)]
         if matched:
+            matched.sort(key=lambda message: str(message.get("date") or ""), reverse=True)
             return matched[:limit]
 
         all_msgs = self._search_and_fetch(None, max(limit * 5, 80), days)
-        return [message for message in all_msgs if matches(message)][:limit]
+        matched = [message for message in all_msgs if matches(message)]
+        matched.sort(key=lambda message: str(message.get("date") or ""), reverse=True)
+        return matched[:limit]
 
     def recent_uids(self, limit: int = 100, days: int = 30) -> List[bytes]:
         """Return recent message UIDs newest first without fetching message data."""

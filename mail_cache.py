@@ -11,12 +11,34 @@ import json
 import os
 import copy
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
 HERE = Path(__file__).resolve().parent
 CACHE_FILE = HERE / "results" / "mail_cache.json"
+
+def message_sort_key(message: Dict) -> datetime:
+    raw = str((message or {}).get("date") or "")
+    if not raw:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except Exception:
+        try:
+            parsed = parsedate_to_datetime(raw)
+        except Exception:
+            return datetime.min.replace(tzinfo=timezone.utc)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def sort_messages_newest(messages: List[Dict]) -> List[Dict]:
+    return sorted(list(messages or []), key=message_sort_key, reverse=True)
+
+
 MAX_INBOX_MESSAGES = 1000
 MAX_ALIAS_MESSAGES = 100
 
@@ -74,9 +96,8 @@ class MailCache:
                 new_emails.append(email)
             if new_emails:
                 self._data[acc_id]["inbox_emails"].extend(new_emails)
-                if len(self._data[acc_id]["inbox_emails"]) > MAX_INBOX_MESSAGES:
-                    self._data[acc_id]["inbox_emails"] = \
-                        self._data[acc_id]["inbox_emails"][-MAX_INBOX_MESSAGES:]
+                self._data[acc_id]["inbox_emails"] = \
+                    sort_messages_newest(self._data[acc_id]["inbox_emails"])[:MAX_INBOX_MESSAGES]
             self._data[acc_id]["last_checked"] = datetime.now().isoformat()
             if new_emails:
                 self._save()
@@ -102,7 +123,7 @@ class MailCache:
             if new_emails:
                 self._data[acc_id]["alias_emails"][alias_email].extend(new_emails)
                 self._data[acc_id]["alias_emails"][alias_email] = \
-                    self._data[acc_id]["alias_emails"][alias_email][-MAX_ALIAS_MESSAGES:]
+                    sort_messages_newest(self._data[acc_id]["alias_emails"][alias_email])[:MAX_ALIAS_MESSAGES]
                 self._save()
 
     def set_alias_mail_batch(self, acc_id: str, by_alias: Dict[str, List[Dict]]):
@@ -123,7 +144,7 @@ class MailCache:
                 if new_emails:
                     self._data[acc_id]["alias_emails"][alias].extend(new_emails)
                     self._data[acc_id]["alias_emails"][alias] = \
-                        self._data[acc_id]["alias_emails"][alias][-MAX_ALIAS_MESSAGES:]
+                        sort_messages_newest(self._data[acc_id]["alias_emails"][alias])[:MAX_ALIAS_MESSAGES]
                     changed = True
             if changed:
                 self._save()
@@ -179,7 +200,7 @@ class MailCache:
                     if message_id not in existing_ids:
                         target["inbox_emails"].append(message)
                         existing_ids.add(message_id)
-                target["inbox_emails"] = target["inbox_emails"][-MAX_INBOX_MESSAGES:]
+                target["inbox_emails"] = sort_messages_newest(target["inbox_emails"])[:MAX_INBOX_MESSAGES]
 
                 for alias, messages in source.get("alias_emails", {}).items():
                     target_messages = target["alias_emails"].setdefault(alias, [])
@@ -189,7 +210,7 @@ class MailCache:
                         if message_id not in alias_ids:
                             target_messages.append(message)
                             alias_ids.add(message_id)
-                    target["alias_emails"][alias] = target_messages[-MAX_ALIAS_MESSAGES:]
+                    target["alias_emails"][alias] = sort_messages_newest(target_messages)[:MAX_ALIAS_MESSAGES]
 
                 old_checked = source.get("last_checked") or ""
                 new_checked = target.get("last_checked") or ""
