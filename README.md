@@ -1,4 +1,4 @@
-# iCloud mail
+# iCloud批量注册隐私邮箱
 
 基于 iCloud Hide My Email，批量创建和管理 `@icloud.com` 隐私邮箱.
 
