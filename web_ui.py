@@ -2,7 +2,7 @@
 """iCloud HME Web UI — 多账号聚合管理平台 — Flask single-page app."""
 import sys, os, json, time, queue, secrets, threading, re, hashlib
 from collections import OrderedDict, deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from datetime import datetime, timedelta
 from html import escape as _html_escape
 from pathlib import Path
@@ -927,7 +927,7 @@ function renderDashboard(){
     var job=accountBatchItem(a.id);
     var jobBusy=job&&(job.status==='queued'||job.status==='running'||job.status==='waiting');
     var jobHtml='';
-    if(jobBusy){var accTarget=parseInt(batchJob.count_per_account,10)||0,accCreated=job.created||0,accErrors=job.errors||0,mode=job.status==='waiting'?'is-wait':'is-run';jobHtml='<div class="acc-job"><div class="progress-head"><strong>'+esc(batchStatusText(job.status))+'</strong><span>'+accCreated+(accTarget?(' / '+accTarget):'')+'</span></div>'+progressBarHtml(accCreated,accErrors,accTarget||Math.max(accCreated+accErrors,1),mode)+'</div>';}
+    if(jobBusy){var accTarget=batchAccountTarget(batchJob,job),accCreated=job.created||0,accErrors=job.errors||0,mode=job.status==='waiting'?'is-wait':'is-run';jobHtml='<div class="acc-job"><div class="progress-head"><strong>'+esc(batchStatusText(job.status))+'</strong><span>'+accCreated+(accTarget?(' / '+accTarget):'')+'</span></div>'+progressBarHtml(accCreated,accErrors,accTarget||Math.max(accCreated+accErrors,1),mode)+'</div>';}
     return '<div class="acc-card'+(jobBusy?' is-busy':'')+'"><div class="acc-top"><div><div class="acc-title">'+esc(a.name||t('name.unnamed'))+'</div><div class="acc-email">'+esc(email)+'</div></div><span class="status-badge '+stCls+'">'+esc(stText.substring(0,42))+'</span></div><div class="acc-usage"><div class="progress-head"><span>'+t('usage.capacity')+'</span><span>'+used+' / '+limit+'</span></div><div class="progress-bar"><div class="fill ok" style="width:'+pct+'%"></div></div></div><div class="acc-stats"><div>'+esc(mailReady)+'</div></div>'+jobHtml+'<div class="acc-actions"><button class="btn btn-primary btn-xs" onclick="handlePrimaryAction(\''+escAttr(a.id)+'\')">'+t('action.create_alias')+'</button><button class="btn btn-outline btn-xs" onclick="validateAccount(\''+escAttr(a.id)+'\')">'+t('action.check_login')+'</button><button class="btn btn-outline btn-xs" onclick="showAppPwdModal(\''+escAttr(a.id)+'\')">'+t('action.set_mail')+'</button><button class="btn btn-outline btn-xs" onclick="removeAccount(\''+escAttr(a.id)+'\')">'+t('action.delete')+'</button></div></div>';
   }).join('');
 }
@@ -948,13 +948,13 @@ async function exportSelectedPickupTxt(){var selected=emails.filter(function(e){
 async function restoreExportedEmail(email){if(!confirm(t('export.restore_confirm',{email:email})))return;var d=await api('/api/export-history/restore',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({emails:[email]})});if(!d.ok){toast(t('export.restore_fail',{err:d.error||t('error.unknown')}),true);return}await refreshEmails();renderAliasTable();toast(t('export.restored'));}
 function renderAliasTable(){updateEmailFilter();var filtered=visibleAliases();var exportedCount=emails.filter(function(e){return e.exported}).length;var unexportedCount=emails.length-exportedCount;E('exportCountUnexported').textContent=t('export.unexported_n',{n:unexportedCount});E('exportCountExported').textContent=t('export.exported_n',{n:exportedCount});E('exportCountAll').textContent=t('export.all_n',{n:emails.length});E('emailCount').textContent=filtered.length+' / '+emails.length;updateAliasPager(filtered.length);var c=E('aliasTableContainer');if(!filtered.length){c.innerHTML='<div class="empty"><div class="icon"></div>'+(emails.length?t('emails.empty_filter'):t('emails.empty'))+'</div>';return;}if(!pickupLinksLoaded){c.innerHTML='<div class="empty">'+t('pickup.generating')+'</div>';loadPickupLinks().then(renderAliasTable);return;}var start=(aliasPage-1)*aliasPageSize;var pageItems=filtered.slice(start,start+aliasPageSize);var pages=Math.max(1,Math.ceil(filtered.length/aliasPageSize));var h='<table class="email-table"><thead><tr><th style="width:42px"><input type="checkbox" title="'+escAttr(t('table.select_page'))+'" onclick="toggleAllPickup()"></th><th>#</th><th>'+t('table.email')+'</th><th>'+t('table.lookup')+'</th><th>'+t('table.pickup')+'</th><th>'+t('table.account')+'</th><th>'+t('table.label')+'</th><th>'+t('table.created')+'</th><th>'+t('table.export')+'</th><th>'+t('table.status')+'</th></tr></thead><tbody>';pageItems.forEach(function(e,i){var key=String(e.email||'').toLowerCase();var url=pickupLinksByEmail[key]||'';var checked=pickupSelected[key]&&!e.exported?' checked':'';var disabled=e.exported?' disabled':'';var accName=e.account_name||e.account_email||e.account_id||'--';var activeHtml=e.hasOwnProperty('active')?(e.active?'<span style="color:var(--green)">'+t('status.active')+'</span>':'<span style="color:var(--red)">'+t('status.inactive')+'</span>'):'<span style="color:var(--muted)">--</span>';var exportHtml=e.exported?'<span style="color:var(--green)">'+t('export.exported')+'</span><div class="hint">'+esc(formatExportTime(e.exported_at))+'</div><button class="copy-btn" onclick="restoreExportedEmail(\''+escAttr(e.email||'')+'\')" title="'+escAttr(t('export.restore_title'))+'">'+t('export.restore')+'</button>':'<span style="color:var(--muted)">'+t('export.unexported')+'</span>';h+='<tr><td><input class="pickup-check" type="checkbox" data-email="'+escAttr(e.email||'')+'"'+checked+disabled+' onchange="togglePickupSelected(this.dataset.email,this.checked)"></td><td class="hint">'+(start+i+1)+'</td><td class="mono">'+esc(e.email||'')+'</td><td class="pickup-cell"><button class="copy-btn" onclick="openAliasInbox(\''+escAttr(e.email||'')+'\',\''+escAttr(e.account_id||'')+'\')" title="'+escAttr(t('lookup.this_alias'))+'">'+t('table.lookup')+'</button></td><td class="pickup-cell">'+(url?'<button class="copy-btn" onclick="copyPickup(\''+escAttr(url)+'\')" title="'+escAttr(url)+'">'+t('pickup.copy')+'</button>':'<span class="hint">'+t('pickup.failed')+'</span>')+'</td><td>'+esc(accName)+'</td><td class="hint">'+esc((e.label||'').substring(0,30))+'</td><td style="white-space:nowrap">'+esc(formatExportTime(e.created_at))+'</td><td>'+exportHtml+'</td><td>'+activeHtml+'</td></tr>';});h+='</tbody></table>';h+='<div class="pager pager-bottom"><span class="hint">'+(start+1)+'-'+(start+pageItems.length)+' / '+filtered.length+'</span><button class="btn btn-outline btn-sm" onclick="setAliasPage(aliasPage-1)"'+(aliasPage<=1?' disabled':'')+'>'+t('pager.prev')+'</button><button class="btn btn-outline btn-sm" onclick="setAliasPage(aliasPage+1)"'+(aliasPage>=pages?' disabled':'')+'>'+t('pager.next')+'</button></div>';c.innerHTML=h;}
 function batchStatusText(status){var labels={waiting:t('batch.wait_apple'),queued:t('batch.queued'),running:t('batch.running'),completed:t('batch.done'),partial:t('batch.partial'),limited:t('batch.limited'),failed:t('batch.failed')};return labels[status]||status||'--';}
-function renderBatchPanel(){var activeAccs=accounts.filter(function(a){return a.status==='active'});E('batchAccCount').textContent=t('batch.available_n',{n:activeAccs.length});var g=E('batchChkGroup');if(!activeAccs.length){g.innerHTML='<span class="hint">'+t('batch.none')+'</span>';E('btnBatchExec').disabled=true;}else{g.innerHTML=activeAccs.map(function(a){var email=a.real_email||a.name||a.id;var limited=a.create_status==='limited';var note=limited?'<span style="color:var(--red);font-size:12px">'+t('batch.retry_note')+'</span>':'';var selected=!pendingBatchAccountId||pendingBatchAccountId===a.id;return'<label class="chk-item"><input type="checkbox" value="'+escAttr(a.id)+'"'+(selected?' checked':'')+'><span><strong>'+esc(a.name||email.substring(0,20))+'</strong> '+note+'</span></label>';}).join('');E('btnBatchExec').disabled=!!(batchJob&&(batchJob.status==='queued'||batchJob.status==='running'));}pendingBatchAccountId=null;if(batchJob)renderBatchJob(batchJob);else loadCurrentBatchJob();}
+function renderBatchPanel(){var activeAccs=accounts.filter(function(a){return a.status==='active'});E('batchAccCount').textContent=t('batch.available_n',{n:activeAccs.length});var g=E('batchChkGroup');if(!activeAccs.length){g.innerHTML='<span class="hint">'+t('batch.none')+'</span>';E('btnBatchExec').disabled=true;}else{g.innerHTML=activeAccs.map(function(a){var email=a.real_email||a.name||a.id;var limited=a.create_status==='limited';var note=limited?'<span style="color:var(--red);font-size:12px">'+t('batch.retry_note')+'</span>':'';var busy=batchBusyAccountIds(batchJob);var isBusy=!!busy[a.id];var selected=(!pendingBatchAccountId||pendingBatchAccountId===a.id)&&!isBusy;return'<label class="chk-item"><input type="checkbox" value="'+escAttr(a.id)+'"'+(isBusy?' disabled':'')+(selected?' checked':'')+'><span><strong>'+esc(a.name||email.substring(0,20))+'</strong> '+note+'</span></label>';}).join('');E('btnBatchExec').disabled=activeAccs.every(function(a){return busy[a.id]});}pendingBatchAccountId=null;if(batchJob)renderBatchJob(batchJob);else loadCurrentBatchJob();}
 async function loadCurrentBatchJob(){var d=await api('/api/create-batch-current');if(d.ok&&d.job){batchJob=d.job;renderBatchJob(batchJob);if(batchJob.status==='queued'||batchJob.status==='running')scheduleBatchPoll();}}
 function jobDisplayStatus(job){var waiting=false,runningAcc=false;Object.keys(job.accounts||{}).forEach(function(id){var st=(job.accounts[id]||{}).status;if(st==='waiting')waiting=true;if(st==='running')runningAcc=true;});if((job.status==='queued'||job.status==='running')&&waiting&&!runningAcc)return 'waiting';return job.status;}
-function batchTargetCount(job){var per=parseInt(job.count_per_account,10)||0;var accs=job.total_accounts||Object.keys(job.accounts||{}).length||0;var target=per*accs;return target||((job.total_created||0)+(job.total_errors||0));}
+function batchBusyAccountIds(job){var ids={};if(!job||(job.status!=='queued'&&job.status!=='running'))return ids;Object.keys(job.accounts||{}).forEach(function(id){var st=(job.accounts[id]||{}).status;if(st==='queued'||st==='running'||st==='waiting')ids[id]=true;});return ids;}function batchAccountTarget(job,item){return parseInt((item||{}).target,10)||parseInt(job.count_per_account,10)||0;}function batchTargetCount(job){var accs=job.accounts||{};var ids=Object.keys(accs);var target=0;ids.forEach(function(id){target+=batchAccountTarget(job,accs[id]);});return target||((job.total_created||0)+(job.total_errors||0));}
 function progressBarHtml(created,errors,target,mode){var createdPct=target?Math.min(100,created*100/target):0;var errorPct=target?Math.min(100-createdPct,errors*100/target):0;if(created&&createdPct<1.2)createdPct=1.2;return '<div class="progress-bar'+(mode?(' '+mode):'')+'"><div class="fill ok" style="width:'+createdPct+'%"></div>'+(errorPct?('<div class="fill err" style="width:'+errorPct+'%"></div>'):'')+'</div>';}
 function retryLeftText(retryAt){if(!retryAt)return '';var t=Date.parse(retryAt);if(!t)return '';var sec=Math.max(0,Math.round((t-Date.now())/1000));if(sec<=0)return t('batch.retry_soon');if(sec<60)return t('batch.retry_sec',{n:sec});return t('batch.retry_min',{n:Math.ceil(sec/60)});}
-function renderBatchJob(job){var box=E('batchProgress');if(!job){box.innerHTML='';return}var total=job.total_accounts||0,done=job.completed_accounts||0,created=job.total_created||0,errors=job.total_errors||0,target=batchTargetCount(job)||0;var processed=target?Math.min(target,created+errors):created+errors;var pct=target?Math.round(processed*100/target):0;var displayStatus=jobDisplayStatus(job);var statusColor=displayStatus==='completed'?'var(--green)':(displayStatus==='failed'||displayStatus==='limited'||displayStatus==='waiting')?'var(--red)':'var(--ink)';var running=job.status==='queued'||job.status==='running';var barMode=displayStatus==='waiting'?'is-wait':(running?'is-run':'');var h='<div class="progress-card"><div class="progress-head"><strong style="color:'+statusColor+'">'+esc(batchStatusText(displayStatus))+'</strong><span>'+created+' / '+target+' · '+pct+'%</span></div>'+progressBarHtml(created,errors,target,barMode)+'<div class="progress-meta"><span>'+t('batch.accounts_done',{done:done,total:total})+'</span><span>'+t('batch.ok_fail',{created:created,errors:errors})+'</span></div>';Object.keys(job.accounts||{}).forEach(function(id){var item=job.accounts[id],color=item.status==='completed'?'var(--green)':(item.status==='limited'||item.status==='failed'||item.status==='waiting')?'var(--red)':'var(--muted)';var accTarget=parseInt(job.count_per_account,10)||0,accCreated=item.created||0,accErrors=item.errors||0;var accMode=item.status==='waiting'?'is-wait':((item.status==='running'||item.status==='queued')?'is-run':'');var extra=retryLeftText(item.retry_at);h+='<div class="progress-item"><div class="progress-head"><strong>'+esc(item.name||id)+'</strong><span style="color:'+color+'">'+esc(batchStatusText(item.status))+(accTarget?(' · '+accCreated+' / '+accTarget):(' · '+accCreated))+'</span></div>'+progressBarHtml(accCreated,accErrors,accTarget||Math.max(accCreated+accErrors,1),accMode)+(item.error?('<div class="progress-note" style="color:var(--red)">'+esc(item.error)+(extra?(' · '+esc(extra)):'' )+'</div>'):'')+'</div>';});h+='</div>';box.innerHTML=h;E('btnBatchExec').disabled=running;E('btnBatchExec').textContent=running?t('batch.creating'):t('settings.start');renderSidebar();if(curTab==='accounts')renderDashboard();}
+function renderBatchJob(job){var box=E('batchProgress');if(!job){box.innerHTML='';return}var total=job.total_accounts||0,done=job.completed_accounts||0,created=job.total_created||0,errors=job.total_errors||0,target=batchTargetCount(job)||0;var processed=target?Math.min(target,created+errors):created+errors;var pct=target?Math.round(processed*100/target):0;var displayStatus=jobDisplayStatus(job);var statusColor=displayStatus==='completed'?'var(--green)':(displayStatus==='failed'||displayStatus==='limited'||displayStatus==='waiting')?'var(--red)':'var(--ink)';var running=job.status==='queued'||job.status==='running';var barMode=displayStatus==='waiting'?'is-wait':(running?'is-run':'');var h='<div class="progress-card"><div class="progress-head"><strong style="color:'+statusColor+'">'+esc(batchStatusText(displayStatus))+'</strong><span>'+created+' / '+target+' · '+pct+'%</span></div>'+progressBarHtml(created,errors,target,barMode)+'<div class="progress-meta"><span>'+t('batch.accounts_done',{done:done,total:total})+'</span><span>'+t('batch.ok_fail',{created:created,errors:errors})+'</span></div>';Object.keys(job.accounts||{}).forEach(function(id){var item=job.accounts[id],color=item.status==='completed'?'var(--green)':(item.status==='limited'||item.status==='failed'||item.status==='waiting')?'var(--red)':'var(--muted)';var accTarget=batchAccountTarget(job,item),accCreated=item.created||0,accErrors=item.errors||0;var accMode=item.status==='waiting'?'is-wait':((item.status==='running'||item.status==='queued')?'is-run':'');var extra=retryLeftText(item.retry_at);h+='<div class="progress-item"><div class="progress-head"><strong>'+esc(item.name||id)+'</strong><span style="color:'+color+'">'+esc(batchStatusText(item.status))+(accTarget?(' · '+accCreated+' / '+accTarget):(' · '+accCreated))+'</span></div>'+progressBarHtml(accCreated,accErrors,accTarget||Math.max(accCreated+accErrors,1),accMode)+(item.error?('<div class="progress-note" style="color:var(--red)">'+esc(item.error)+(extra?(' · '+esc(extra)):'' )+'</div>'):'')+'</div>';});h+='</div>';box.innerHTML=h;var busy=batchBusyAccountIds(job);var checks=document.querySelectorAll('#batchChkGroup input[type=checkbox]');var canStart=false;checks.forEach(function(box){if(!busy[box.value])canStart=true;});E('btnBatchExec').disabled=!canStart;E('btnBatchExec').textContent=t('settings.start');renderSidebar();if(curTab==='accounts')renderDashboard();}
 function scheduleBatchPoll(){if(batchPollTimer)clearTimeout(batchPollTimer);batchPollTimer=setTimeout(pollBatchJob,1200);}
 async function pollBatchJob(){if(!batchJob||!batchJob.id)return;var d=await api('/api/create-batch/'+encodeURIComponent(batchJob.id));if(!d.ok){toast(t('batch.progress_fail',{err:d.error||t('error.unknown')}),true);return}batchJob=d.job;renderBatchJob(batchJob);if(batchJob.status==='queued'||batchJob.status==='running'){scheduleBatchPoll();return}await refreshAll();if(batchJob.total_created){toast(t('batch.complete_n',{n:batchJob.total_created}));}else{toast(t('batch.none_created'),true);}}
 async function execBatchCreate(){var checks=document.querySelectorAll('#batchChkGroup input:checked');var ids=[];checks.forEach(function(c){ids.push(c.value)});if(!ids.length){toast(t('batch.need_account'),true);return}var count=Math.max(1,Math.min(parseInt(E('batchCount').value)||5,750));E('batchCount').value=count;var label=E('batchLabel').value.trim();var btn=E('btnBatchExec');btn.disabled=true;btn.textContent=t('batch.starting');var d=await api('/api/create-batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({account_ids:ids,count_per_account:count,label:label})});if(!d.ok){btn.disabled=false;btn.textContent=t('settings.start');if(d.job_id){batchJob={id:d.job_id,status:'running'};scheduleBatchPoll();}toast(d.error||t('batch.start_fail'),true);return}batchJob=d.job;renderBatchJob(batchJob);scheduleBatchPoll();}
@@ -1100,6 +1100,55 @@ def api_add_account():
         return jsonify({"ok":False,"error":str(e)}), 500
 
 
+_ACTIVE_BATCH_ACCOUNT_STATUSES = ("queued", "running", "waiting")
+_FINISHED_BATCH_ACCOUNT_STATUSES = ("completed", "partial", "failed", "limited")
+_batch_runner_jobs = set()
+
+
+def _batch_account_target(job, acc_id=None, entry=None):
+    item = entry if entry is not None else ((job.get("accounts") or {}).get(acc_id) or {})
+    try:
+        target = int(item.get("target") or 0)
+    except (TypeError, ValueError):
+        target = 0
+    if target > 0:
+        return target
+    try:
+        return max(0, int(job.get("count_per_account") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _new_batch_account_entry(acc_id, count):
+    return {
+        "account_id": acc_id,
+        "name": (_account_mgr.get_account(acc_id) or {}).get("name") or acc_id,
+        "status": "queued",
+        "created": 0,
+        "errors": 0,
+        "limited": False,
+        "error": "",
+        "retry_count": 0,
+        "retry_delay_seconds": 0,
+        "retry_at": None,
+        "finished_at": None,
+        "target": int(count),
+    }
+
+
+def _pending_batch_account_ids(job, inflight_ids=None):
+    inflight_ids = inflight_ids or set()
+    pending = []
+    for acc_id in job.get("account_ids") or []:
+        if acc_id in inflight_ids:
+            continue
+        entry = (job.get("accounts") or {}).get(acc_id) or {}
+        if entry.get("finished_at") and entry.get("status") in _FINISHED_BATCH_ACCOUNT_STATUSES:
+            continue
+        pending.append(acc_id)
+    return pending
+
+
 def _batch_uses_account(acc_id):
     with _batch_lock:
         if not _batch_active_id:
@@ -1108,7 +1157,7 @@ def _batch_uses_account(acc_id):
         if job.get("status") not in ("queued", "running"):
             return False
         item = (job.get("accounts") or {}).get(acc_id) or {}
-        return item.get("status") in ("queued", "running", "waiting")
+        return item.get("status") in _ACTIVE_BATCH_ACCOUNT_STATUSES
 
 
 
@@ -1406,23 +1455,16 @@ def _run_batch_account(job, acc_id, count, label):
 def _run_batch_job(job_id):
     global _batch_active_id
     with _batch_lock:
+        if job_id in _batch_runner_jobs:
+            return
+        _batch_runner_jobs.add(job_id)
         job = _batch_jobs[job_id]
         job["status"] = "running"
         job["started_at"] = job.get("started_at") or datetime.now(_BJ_TZ).isoformat()
-        account_ids = [
-            acc_id for acc_id in job["account_ids"]
-            if not (
-                job["accounts"][acc_id].get("finished_at")
-                and job["accounts"][acc_id].get("status") in (
-                    "completed", "partial", "failed", "limited"
-                )
-            )
-        ]
-        count = job["count_per_account"]
-        label = job["label"]
         _save_batch_state_locked()
     total_accounts = len(job["account_ids"])
-    workers = min(_BATCH_MAX_ACCOUNT_WORKERS, max(1, len(account_ids)))
+    count = job.get("count_per_account")
+    workers = min(_BATCH_MAX_ACCOUNT_WORKERS, max(1, total_accounts))
     _update_state(
         creating=True,
         round_status=f"批量创建 {job.get('completed_accounts', 0)}/{total_accounts} 个账号",
@@ -1432,15 +1474,28 @@ def _run_batch_job(job_id):
     )
 
     try:
-        if account_ids:
-            with ThreadPoolExecutor(
-                max_workers=workers, thread_name_prefix="batch-account"
-            ) as executor:
-                futures = {
-                    executor.submit(_run_batch_account, job, acc_id, count, label): acc_id
-                    for acc_id in account_ids
-                }
-                for future in as_completed(futures):
+        with ThreadPoolExecutor(
+            max_workers=_BATCH_MAX_ACCOUNT_WORKERS, thread_name_prefix="batch-account"
+        ) as executor:
+            futures = {}
+            while True:
+                with _batch_lock:
+                    if _shutdown_event.is_set():
+                        raise _BatchInterrupted()
+                    job = _batch_jobs[job_id]
+                    label = job.get("label") or ""
+                    pending = _pending_batch_account_ids(job, set(futures.values()))
+                    for acc_id in pending:
+                        acc_count = _batch_account_target(job, acc_id)
+                        futures[executor.submit(_run_batch_account, job, acc_id, acc_count, label)] = acc_id
+                    total_accounts = len(job.get("account_ids") or [])
+                if not futures:
+                    break
+                done, _pending = wait(futures, timeout=0.4, return_when=FIRST_COMPLETED)
+                if not done:
+                    continue
+                for future in done:
+                    futures.pop(future)
                     completed_accounts = future.result()
                     _update_state(
                         round_status=f"批量创建 {completed_accounts}/{total_accounts} 个账号"
@@ -1471,6 +1526,7 @@ def _run_batch_job(job_id):
         _emit_log("error", f"批量任务异常: {str(exc)[:200]}")
     finally:
         with _batch_lock:
+            _batch_runner_jobs.discard(job_id)
             if _batch_active_id == job_id and job.get("status") not in ("queued", "running"):
                 _batch_active_id = None
             _save_batch_state_locked()
@@ -1526,51 +1582,68 @@ def api_create_batch():
                 "account_ids": busy_ids,
             }), 409
         with _batch_lock:
-            if _batch_active_id:
-                active = _batch_jobs.get(_batch_active_id)
-                if active and active.get("status") in ("queued", "running"):
+            active = _batch_jobs.get(_batch_active_id) if _batch_active_id else None
+            start_runner = True
+            if active and active.get("status") in ("queued", "running"):
+                overlap = []
+                new_ids = []
+                for acc_id in account_ids:
+                    item = (active.get("accounts") or {}).get(acc_id) or {}
+                    if item.get("status") in _ACTIVE_BATCH_ACCOUNT_STATUSES:
+                        overlap.append(acc_id)
+                    else:
+                        new_ids.append(acc_id)
+                if not new_ids:
                     return jsonify({
                         "ok": False,
-                        "error": "已有批量任务正在运行",
+                        "error": "所选账号已在创建中",
+                        "account_ids": overlap,
                         "job_id": _batch_active_id,
                     }), 409
-            job_id = secrets.token_urlsafe(12)
-            now = datetime.now(_BJ_TZ).isoformat()
-            job = {
-                "id": job_id,
-                "status": "queued",
-                "account_ids": account_ids,
-                "count_per_account": count,
-                "interval": interval,
-                "label": label,
-                "total_accounts": len(account_ids),
-                "completed_accounts": 0,
-                "total_created": 0,
-                "total_errors": 0,
-                "created_at": now,
-                "updated_at": now,
-                "accounts": {
-                    acc_id: {
-                        "account_id": acc_id,
-                        "name": (_account_mgr.get_account(acc_id) or {}).get("name") or acc_id,
-                        "status": "queued",
-                        "created": 0,
-                        "errors": 0,
-                        "limited": False,
-                        "error": "",
-                        "retry_count": 0,
-                        "retry_delay_seconds": 0,
-                        "retry_at": None,
-                    }
-                    for acc_id in account_ids
-                },
-            }
-            _batch_jobs[job_id] = job
-            while len(_batch_jobs) > _BATCH_JOB_HISTORY:
-                _batch_jobs.popitem(last=False)
-            _batch_active_id = job_id
-            _save_batch_state_locked()
-    threading.Thread(target=_run_batch_job, args=(job_id,), daemon=True).start()
+                now = datetime.now(_BJ_TZ).isoformat()
+                for acc_id in new_ids:
+                    active["accounts"][acc_id] = _new_batch_account_entry(acc_id, count)
+                    if acc_id not in active["account_ids"]:
+                        active["account_ids"].append(acc_id)
+                active["total_accounts"] = len(active["account_ids"])
+                active["completed_accounts"] = sum(
+                    1 for entry in active["accounts"].values() if entry.get("finished_at")
+                )
+                if label:
+                    active["label"] = label
+                active["updated_at"] = now
+                job_id = _batch_active_id
+                start_runner = job_id not in _batch_runner_jobs
+                _save_batch_state_locked()
+            else:
+                job_id = secrets.token_urlsafe(12)
+                now = datetime.now(_BJ_TZ).isoformat()
+                job = {
+                    "id": job_id,
+                    "status": "queued",
+                    "account_ids": account_ids,
+                    "count_per_account": count,
+                    "interval": interval,
+                    "label": label,
+                    "total_accounts": len(account_ids),
+                    "completed_accounts": 0,
+                    "total_created": 0,
+                    "total_errors": 0,
+                    "created_at": now,
+                    "updated_at": now,
+                    "accounts": {
+                        acc_id: _new_batch_account_entry(acc_id, count)
+                        for acc_id in account_ids
+                    },
+                }
+                _batch_jobs[job_id] = job
+                while len(_batch_jobs) > _BATCH_JOB_HISTORY:
+                    _batch_jobs.popitem(last=False)
+                _batch_active_id = job_id
+                start_runner = True
+                _save_batch_state_locked()
+    if start_runner:
+        threading.Thread(target=_run_batch_job, args=(job_id,), daemon=True).start()
     return jsonify({"ok": True, "job_id": job_id, "job": _batch_job_snapshot(job_id)}), 202
 
 

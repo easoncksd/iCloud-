@@ -1470,6 +1470,103 @@ def test_health_loop_retries_error_accounts():
 
 
 
+def test_batch_can_add_second_account_while_first_is_running():
+    import threading
+    import web_ui
+
+    started_one = threading.Event()
+    release_one = threading.Event()
+
+    class FakeManager:
+        accounts = {
+            "one": {"id": "one", "name": "one", "status": "active"},
+            "two": {"id": "two", "name": "two", "status": "active"},
+        }
+
+        def get_account(self, account_id):
+            return self.accounts.get(account_id)
+
+        def create_aliases_for_account(self, account_id, count, _label, **_kwargs):
+            if account_id == "one":
+                started_one.set()
+                if not release_one.wait(5):
+                    raise AssertionError("timed out waiting to release account one")
+            return [
+                {"ok": True, "email": "%s-%s@icloud.com" % (account_id, index), "account_id": account_id}
+                for index in range(count)
+            ]
+
+    original_manager = web_ui._account_mgr
+    original_state_file = web_ui._BATCH_STATE_FILE
+    temp_dir = tempfile.TemporaryDirectory()
+    web_ui._BATCH_STATE_FILE = Path(temp_dir.name) / "batch_jobs.json"
+    with web_ui._batch_lock:
+        original_jobs = web_ui._batch_jobs
+        original_active = web_ui._batch_active_id
+        original_runners = set(web_ui._batch_runner_jobs)
+        web_ui._batch_jobs = web_ui.OrderedDict()
+        web_ui._batch_active_id = None
+        web_ui._batch_runner_jobs.clear()
+    web_ui._account_mgr = FakeManager()
+    client = web_ui.app.test_client()
+    try:
+        first = client.post("/api/create-batch", json={
+            "account_ids": ["one"],
+            "count_per_account": 1,
+            "interval": 0,
+        })
+        assert first.status_code == 202, first.get_json()
+        assert started_one.wait(3)
+        second = client.post("/api/create-batch", json={
+            "account_ids": ["two"],
+            "count_per_account": 1,
+            "interval": 0,
+        })
+        assert second.status_code == 202, second.get_json()
+        payload = second.get_json()
+        assert payload["ok"] is True
+        assert "two" in payload["job"]["accounts"]
+        deadline = time.time() + 3
+        two_done = False
+        while time.time() < deadline:
+            job = client.get("/api/create-batch/%s" % payload["job_id"]).get_json()["job"]
+            if job["accounts"]["two"].get("status") == "completed":
+                two_done = True
+                break
+            time.sleep(0.02)
+        assert two_done, job["accounts"]
+        assert job["accounts"]["one"]["status"] in ("queued", "running", "waiting")
+        same = client.post("/api/create-batch", json={
+            "account_ids": ["one"],
+            "count_per_account": 1,
+        })
+        assert same.status_code == 409
+        release_one.set()
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            job = client.get("/api/create-batch/%s" % payload["job_id"]).get_json()["job"]
+            if job["status"] not in ("queued", "running"):
+                break
+            time.sleep(0.02)
+        assert job["status"] == "completed"
+        assert job["total_created"] == 2
+        html = web_ui.UI_HTML
+        assert "function batchBusyAccountIds" in html
+        assert "E('btnBatchExec').disabled=!!(batchJob&&(batchJob.status==='queued'||batchJob.status==='running'))" not in html
+    finally:
+        release_one.set()
+        web_ui._account_mgr = original_manager
+        with web_ui._batch_lock:
+            web_ui._batch_jobs = original_jobs
+            web_ui._batch_active_id = original_active
+            web_ui._batch_runner_jobs.clear()
+            web_ui._batch_runner_jobs.update(original_runners)
+        web_ui._BATCH_STATE_FILE = original_state_file
+        temp_dir.cleanup()
+    print("  PASS test_batch_can_add_second_account_while_first_is_running")
+
+
+
 if __name__ == "__main__":
     tests = [
         ("parse_cookie_header_string", test_parse_cookie_header_string),
@@ -1518,6 +1615,7 @@ if __name__ == "__main__":
         ("find_by_recipient_matches_delivered_to", test_find_by_recipient_matches_delivered_to),
         ("check_all_aliases_mail_raises_without_cache", test_check_all_aliases_mail_raises_without_cache),
         ("health_loop_retries_error_accounts", test_health_loop_retries_error_accounts),
+        ("batch_can_add_second_account_while_first_is_running", test_batch_can_add_second_account_while_first_is_running),
     ]
     
     passed = 0
