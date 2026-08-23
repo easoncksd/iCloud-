@@ -612,15 +612,26 @@ def test_runtime_logs_persist_replay_and_resume():
             assert loaded[0]["msg"] == "日志回放测试"
             assert len(loaded[0]["time"]) == 19
 
+            payload = web_ui.app.test_client().get("/api/logs?after=0").get_json()
+            assert payload["ok"] is True
+            assert payload["logs"][0]["msg"] == "日志回放测试"
+            assert payload["seq"] == 1
+
             response = web_ui.app.test_client().get(
                 "/api/log-stream?after=0", buffered=False
             )
-            chunk = next(response.response).decode("utf-8")
+            buf = ""
+            for raw in response.response:
+                buf += raw.decode("utf-8")
+                if "日志回放测试" in buf:
+                    break
             response.close()
-            assert "id: 1" in chunk
-            assert "日志回放测试" in chunk
-            assert "?after='+logCursor" in web_ui.UI_HTML
-            assert "entry.seq||0)<=logCursor" in web_ui.UI_HTML
+            assert "id: 1" in buf
+            assert "日志回放测试" in buf
+            assert "/api/logs?after=" in web_ui.UI_HTML
+            assert "await loadLogs()" in web_ui.UI_HTML
+            assert "EventSource.CLOSED" in web_ui.UI_HTML
+            assert "function appendLog(" in web_ui.UI_HTML
         finally:
             web_ui._RUNTIME_LOG_FILE = original_file
             with web_ui._log_condition:
