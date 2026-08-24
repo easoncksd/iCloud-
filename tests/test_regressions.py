@@ -1321,6 +1321,9 @@ def test_ui_create_entry_and_scheduler_copy():
     assert ",5)\">创建邮箱" not in html
     assert "北京时间 7:00 到 20:00" in html
     assert "正在批量创建的账号会自动跳过" in html
+    assert "最多 10 个并行" in html
+    assert "Up to 10 accounts run in parallel" in html
+    assert 'os.environ.get("BATCH_MAX_ACCOUNT_WORKERS", "10")' in Path(web_ui.__file__).read_text(encoding="utf-8")
     assert "accHostInput" in html
     assert "await refreshEmails();emails.forEach" in html
     assert "_load_scheduler_enabled()" in Path(web_ui.__file__).read_text(encoding="utf-8")
