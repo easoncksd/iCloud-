@@ -148,6 +148,24 @@ def test_export_history_is_persistent_and_idempotent():
     print("  PASS test_export_history_is_persistent_and_idempotent")
 
 
+
+def test_validate_skips_lock_when_create_in_progress():
+    """检查登录不能卡在正在创建的账号锁上。"""
+    import web_ui
+
+    original = web_ui._account_create_in_progress
+    web_ui._account_create_in_progress = lambda _acc_id: True
+    try:
+        payload = web_ui.app.test_client().post("/api/accounts/busy-acc/validate").get_json()
+        assert payload["ok"] is False
+        assert payload["busy"] is True
+        assert "正在创建邮箱" in payload["error"]
+        assert "toast(t('status.checking_login'))" in web_ui.UI_HTML
+    finally:
+        web_ui._account_create_in_progress = original
+    print("  PASS test_validate_skips_lock_when_create_in_progress")
+
+
 def test_account_api_reports_validation_failure():
     """账号底层状态为 error 时 API 不能返回 ok=true"""
     import web_ui
@@ -1321,6 +1339,8 @@ def test_ui_create_entry_and_scheduler_copy():
     assert ",5)\">创建邮箱" not in html
     assert "北京时间 7:00 到 20:00" in html
     assert "正在批量创建的账号会自动跳过" in html
+    assert "toast(t('status.checking_login'))" in html
+    assert "d.error||t('status.login_expired')" in html
     assert "最多 10 个并行" in html
     assert "Up to 10 accounts run in parallel" in html
     assert 'os.environ.get("BATCH_MAX_ACCOUNT_WORKERS", "10")' in Path(web_ui.__file__).read_text(encoding="utf-8")
@@ -1593,6 +1613,7 @@ if __name__ == "__main__":
         ("mail_newest_first", test_mail_newest_first),
         ("pickup_rebind_deduplicates_and_revokes", test_pickup_rebind_deduplicates_and_revokes),
         ("export_history_is_persistent_and_idempotent", test_export_history_is_persistent_and_idempotent),
+        ("validate_skips_lock_when_create_in_progress", test_validate_skips_lock_when_create_in_progress),
         ("account_api_reports_validation_failure", test_account_api_reports_validation_failure),
         ("export_api_prevents_duplicate_downloads", test_export_api_prevents_duplicate_downloads),
         ("scheduler_start_is_idempotent", test_scheduler_start_is_idempotent),
