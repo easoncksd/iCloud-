@@ -5,6 +5,7 @@ import sys
 import json
 import os
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -1601,6 +1602,154 @@ def test_batch_can_add_second_account_while_first_is_running():
 
 
 
+def test_icloud_request_does_not_retry_http_421():
+    from icloud_hme import ICloudHME
+
+    client = ICloudHME({}, verbose=False)
+    calls = []
+
+    class FakeResp:
+        ok = False
+        status_code = 421
+        text = '{"success":false,"trustTokens":[]}'
+
+    def fake_request(*_args, **_kwargs):
+        calls.append(1)
+        return FakeResp()
+
+    client.session.request = fake_request
+    try:
+        client._request("POST", "https://setup.icloud.com/setup/ws/1/validate")
+        raise AssertionError("HTTP 421 should raise")
+    except RuntimeError as exc:
+        assert "421" in str(exc)
+    assert len(calls) == 1
+    print("  PASS test_icloud_request_does_not_retry_http_421")
+
+
+def test_create_aliases_stops_after_first_failure():
+    import account_manager
+    import icloud_hme
+
+    class FakeHME:
+        calls = 0
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def create_alias(self, **_kwargs):
+            type(self).calls += 1
+            raise RuntimeError('generate failed: HTTP 421: {"trustTokens":[]}')
+
+    originals = (
+        account_manager.ACCOUNTS_FILE,
+        account_manager.LATEST_EMAILS,
+        icloud_hme.ICloudHME,
+    )
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            account_manager.ACCOUNTS_FILE = Path(td) / "accounts.json"
+            account_manager.LATEST_EMAILS = Path(td) / "latest_emails.txt"
+            icloud_hme.ICloudHME = FakeHME
+            manager = account_manager.AccountManager()
+            manager.accounts["acc"] = {
+                "id": "acc", "name": "didj", "status": "active",
+                "cookies": {}, "host": "icloud.com",
+                "alias_total": 0, "alias_active": 0,
+            }
+            results = manager.create_aliases_for_account("acc", count=8)
+            assert len(results) == 1
+            assert results[0]["ok"] is False
+            assert results[0]["retryable"] is True
+            assert FakeHME.calls == 1
+        finally:
+            (
+                account_manager.ACCOUNTS_FILE,
+                account_manager.LATEST_EMAILS,
+                icloud_hme.ICloudHME,
+            ) = originals
+    print("  PASS test_create_aliases_stops_after_first_failure")
+
+
+def test_batch_create_emits_heartbeat_while_apple_call_hangs():
+    import web_ui
+
+    started = threading.Event()
+    release = threading.Event()
+
+    class FakeManager:
+        def get_account(self, account_id):
+            return {"id": "slow", "name": "didjndndn@163.com", "status": "active"}
+
+        def create_aliases_for_account(self, account_id, count, _label, **_kwargs):
+            started.set()
+            if not release.wait(2):
+                raise TimeoutError("test hung")
+            return [{
+                "ok": True,
+                "email": "alive@icloud.com",
+                "account_id": account_id,
+            } for _ in range(count)]
+
+    original_manager = web_ui._account_mgr
+    original_state_file = web_ui._BATCH_STATE_FILE
+    original_heartbeat = web_ui._BATCH_CREATE_HEARTBEAT_SECONDS
+    original_delay = web_ui._BATCH_RETRY_DELAY_SECONDS
+    temp_dir = tempfile.TemporaryDirectory()
+    web_ui._BATCH_STATE_FILE = Path(temp_dir.name) / "batch_jobs.json"
+    web_ui._BATCH_CREATE_HEARTBEAT_SECONDS = 0.05
+    web_ui._BATCH_RETRY_DELAY_SECONDS = 0.01
+    with web_ui._batch_lock:
+        original_jobs = web_ui._batch_jobs
+        original_active = web_ui._batch_active_id
+        web_ui._batch_jobs = web_ui.OrderedDict()
+        web_ui._batch_active_id = None
+    web_ui._account_mgr = FakeManager()
+    client = web_ui.app.test_client()
+    try:
+        started_job = client.post("/api/create-batch", json={
+            "account_ids": ["slow"],
+            "count_per_account": 1,
+            "interval": 0,
+        })
+        assert started_job.status_code == 202
+        assert started.wait(1)
+        deadline = time.time() + 1
+        saw_heartbeat = False
+        while time.time() < deadline:
+            with web_ui._log_condition:
+                msgs = [entry["msg"] for entry in web_ui._log_entries]
+            if any("didjndndn@163.com" in msg and "Apple" in msg for msg in msgs):
+                saw_heartbeat = True
+                break
+            time.sleep(0.02)
+        release.set()
+        job_id = started_job.get_json()["job_id"]
+        done_deadline = time.time() + 3
+        while time.time() < done_deadline:
+            job = client.get("/api/create-batch/%s" % job_id).get_json()["job"]
+            if job["status"] not in ("queued", "running"):
+                break
+            time.sleep(0.02)
+        assert saw_heartbeat
+        assert job["status"] == "completed"
+        source = Path(web_ui.__file__).read_text(encoding="utf-8")
+        assert "stop_heartbeat" in source
+        assert "_BATCH_CREATE_HEARTBEAT_SECONDS" in source
+    finally:
+        release.set()
+        web_ui._account_mgr = original_manager
+        web_ui._BATCH_STATE_FILE = original_state_file
+        web_ui._BATCH_CREATE_HEARTBEAT_SECONDS = original_heartbeat
+        web_ui._BATCH_RETRY_DELAY_SECONDS = original_delay
+        with web_ui._batch_lock:
+            web_ui._batch_jobs = original_jobs
+            web_ui._batch_active_id = original_active
+        temp_dir.cleanup()
+    print("  PASS test_batch_create_emits_heartbeat_while_apple_call_hangs")
+
+
+
 if __name__ == "__main__":
     tests = [
         ("parse_cookie_header_string", test_parse_cookie_header_string),
@@ -1651,6 +1800,9 @@ if __name__ == "__main__":
         ("check_all_aliases_mail_raises_without_cache", test_check_all_aliases_mail_raises_without_cache),
         ("health_loop_retries_error_accounts", test_health_loop_retries_error_accounts),
         ("batch_can_add_second_account_while_first_is_running", test_batch_can_add_second_account_while_first_is_running),
+        ("icloud_request_does_not_retry_http_421", test_icloud_request_does_not_retry_http_421),
+        ("create_aliases_stops_after_first_failure", test_create_aliases_stops_after_first_failure),
+        ("batch_create_emits_heartbeat_while_apple_call_hangs", test_batch_create_emits_heartbeat_while_apple_call_hangs),
     ]
     
     passed = 0

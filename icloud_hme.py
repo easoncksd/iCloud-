@@ -283,7 +283,7 @@ class ICloudHME:
                 resp = self.session.request(method, full_url, headers=headers, data=body, timeout=timeout)
                 if not resp.ok:
                     last_err = RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
-                    if resp.status_code in (401, 403):
+                    if resp.status_code in (401, 403, 421):
                         raise last_err
                     if attempt < max_attempts:
                         time.sleep(RETRY_DELAYS[min(attempt - 1, len(RETRY_DELAYS) - 1)])

@@ -198,6 +198,9 @@ _BATCH_RETRY_DELAY_SECONDS = max(
 _BATCH_MAX_ACCOUNT_WORKERS = max(
     1, min(20, int(os.environ.get("BATCH_MAX_ACCOUNT_WORKERS", "10")))
 )
+_BATCH_CREATE_HEARTBEAT_SECONDS = max(
+    5.0, float(os.environ.get("BATCH_CREATE_HEARTBEAT_SECONDS", "15"))
+)
 
 _TEMPORARY_CREATE_LIMIT_MARKERS = (
     "right now",
@@ -207,6 +210,13 @@ _TEMPORARY_CREATE_LIMIT_MARKERS = (
     "429",
     "temporarily",
     "throttle",
+    "timeout",
+    "timed out",
+    "connection",
+    "http 421",
+    "http 401",
+    "http 403",
+    "trusttokens",
 )
 
 
@@ -954,7 +964,7 @@ function jobDisplayStatus(job){var waiting=false,runningAcc=false;Object.keys(jo
 function batchBusyAccountIds(job){var ids={};if(!job||(job.status!=='queued'&&job.status!=='running'))return ids;Object.keys(job.accounts||{}).forEach(function(id){var st=(job.accounts[id]||{}).status;if(st==='queued'||st==='running'||st==='waiting')ids[id]=true;});return ids;}function batchAccountTarget(job,item){return parseInt((item||{}).target,10)||parseInt(job.count_per_account,10)||0;}function batchTargetCount(job){var accs=job.accounts||{};var ids=Object.keys(accs);var target=0;ids.forEach(function(id){target+=batchAccountTarget(job,accs[id]);});return target||((job.total_created||0)+(job.total_errors||0));}
 function progressBarHtml(created,errors,target,mode){var createdPct=target?Math.min(100,created*100/target):0;var errorPct=target?Math.min(100-createdPct,errors*100/target):0;if(created&&createdPct<1.2)createdPct=1.2;return '<div class="progress-bar'+(mode?(' '+mode):'')+'"><div class="fill ok" style="width:'+createdPct+'%"></div>'+(errorPct?('<div class="fill err" style="width:'+errorPct+'%"></div>'):'')+'</div>';}
 function retryLeftText(retryAt){if(!retryAt)return '';var t=Date.parse(retryAt);if(!t)return '';var sec=Math.max(0,Math.round((t-Date.now())/1000));if(sec<=0)return t('batch.retry_soon');if(sec<60)return t('batch.retry_sec',{n:sec});return t('batch.retry_min',{n:Math.ceil(sec/60)});}
-function renderBatchJob(job){var box=E('batchProgress');if(!job){box.innerHTML='';return}var total=job.total_accounts||0,done=job.completed_accounts||0,created=job.total_created||0,errors=job.total_errors||0,target=batchTargetCount(job)||0;var processed=target?Math.min(target,created+errors):created+errors;var pct=target?Math.round(processed*100/target):0;var displayStatus=jobDisplayStatus(job);var statusColor=displayStatus==='completed'?'var(--green)':(displayStatus==='failed'||displayStatus==='limited'||displayStatus==='waiting')?'var(--red)':'var(--ink)';var running=job.status==='queued'||job.status==='running';var barMode=displayStatus==='waiting'?'is-wait':(running?'is-run':'');var h='<div class="progress-card"><div class="progress-head"><strong style="color:'+statusColor+'">'+esc(batchStatusText(displayStatus))+'</strong><span>'+created+' / '+target+' · '+pct+'%</span></div>'+progressBarHtml(created,errors,target,barMode)+'<div class="progress-meta"><span>'+t('batch.accounts_done',{done:done,total:total})+'</span><span>'+t('batch.ok_fail',{created:created,errors:errors})+'</span></div>';Object.keys(job.accounts||{}).forEach(function(id){var item=job.accounts[id],color=item.status==='completed'?'var(--green)':(item.status==='limited'||item.status==='failed'||item.status==='waiting')?'var(--red)':'var(--muted)';var accTarget=batchAccountTarget(job,item),accCreated=item.created||0,accErrors=item.errors||0;var accMode=item.status==='waiting'?'is-wait':((item.status==='running'||item.status==='queued')?'is-run':'');var extra=retryLeftText(item.retry_at);h+='<div class="progress-item"><div class="progress-head"><strong>'+esc(item.name||id)+'</strong><span style="color:'+color+'">'+esc(batchStatusText(item.status))+(accTarget?(' · '+accCreated+' / '+accTarget):(' · '+accCreated))+'</span></div>'+progressBarHtml(accCreated,accErrors,accTarget||Math.max(accCreated+accErrors,1),accMode)+(item.error?('<div class="progress-note" style="color:var(--red)">'+esc(item.error)+(extra?(' · '+esc(extra)):'' )+'</div>'):'')+'</div>';});h+='</div>';box.innerHTML=h;var busy=batchBusyAccountIds(job);var checks=document.querySelectorAll('#batchChkGroup input[type=checkbox]');var canStart=false;checks.forEach(function(box){if(!busy[box.value])canStart=true;});E('btnBatchExec').disabled=!canStart;E('btnBatchExec').textContent=t('settings.start');renderSidebar();if(curTab==='accounts')renderDashboard();}
+function renderBatchJob(job){var box=E('batchProgress');if(!job){box.innerHTML='';return}var total=job.total_accounts||0,done=job.completed_accounts||0,created=job.total_created||0,errors=job.total_errors||0,target=batchTargetCount(job)||0;var processed=target?Math.min(target,created+errors):created+errors;var pct=target?Math.round(processed*100/target):0;var displayStatus=jobDisplayStatus(job);var statusColor=displayStatus==='completed'?'var(--green)':(displayStatus==='failed'||displayStatus==='limited'||displayStatus==='waiting')?'var(--red)':'var(--ink)';var running=job.status==='queued'||job.status==='running';var barMode=displayStatus==='waiting'?'is-wait':(running?'is-run':'');var h='<div class="progress-card"><div class="progress-head"><strong style="color:'+statusColor+'">'+esc(batchStatusText(displayStatus))+'</strong><span>'+created+' / '+target+' · '+pct+'%</span></div>'+progressBarHtml(created,errors,target,barMode)+'<div class="progress-meta"><span>'+t('batch.accounts_done',{done:done,total:total})+'</span><span>'+t('batch.ok_fail',{created:created,errors:errors})+'</span></div>';Object.keys(job.accounts||{}).forEach(function(id){var item=job.accounts[id],color=item.status==='completed'?'var(--green)':(item.status==='limited'||item.status==='failed'||item.status==='waiting')?'var(--red)':'var(--muted)';var accTarget=batchAccountTarget(job,item),accCreated=item.created||0,accErrors=item.errors||0;var accMode=item.status==='waiting'?'is-wait':((item.status==='running'||item.status==='queued')?'is-run':'');var extra=retryLeftText(item.retry_at);var note=item.error||((item.status==='running'||item.status==='queued')?'正在向 Apple 申请':'');h+='<div class="progress-item"><div class="progress-head"><strong>'+esc(item.name||id)+'</strong><span style="color:'+color+'">'+esc(batchStatusText(item.status))+(accTarget?(' · '+accCreated+' / '+accTarget):(' · '+accCreated))+'</span></div>'+progressBarHtml(accCreated,accErrors,accTarget||Math.max(accCreated+accErrors,1),accMode)+((note||extra)?('<div class="progress-note" style="color:var(--red)">'+esc(note)+(extra?(' · '+esc(extra)):'' )+'</div>'):'')+'</div>';});h+='</div>';box.innerHTML=h;var busy=batchBusyAccountIds(job);var checks=document.querySelectorAll('#batchChkGroup input[type=checkbox]');var canStart=false;checks.forEach(function(box){if(!busy[box.value])canStart=true;});E('btnBatchExec').disabled=!canStart;E('btnBatchExec').textContent=t('settings.start');renderSidebar();if(curTab==='accounts')renderDashboard();}
 function scheduleBatchPoll(){if(batchPollTimer)clearTimeout(batchPollTimer);batchPollTimer=setTimeout(pollBatchJob,1200);}
 async function pollBatchJob(){if(!batchJob||!batchJob.id)return;var d=await api('/api/create-batch/'+encodeURIComponent(batchJob.id));if(!d.ok){toast(t('batch.progress_fail',{err:d.error||t('error.unknown')}),true);return}batchJob=d.job;renderBatchJob(batchJob);if(batchJob.status==='queued'||batchJob.status==='running'){scheduleBatchPoll();return}await refreshAll();if(batchJob.total_created){toast(t('batch.complete_n',{n:batchJob.total_created}));}else{toast(t('batch.none_created'),true);}}
 async function execBatchCreate(){var checks=document.querySelectorAll('#batchChkGroup input:checked');var ids=[];checks.forEach(function(c){ids.push(c.value)});if(!ids.length){toast(t('batch.need_account'),true);return}var count=Math.max(1,Math.min(parseInt(E('batchCount').value)||5,750));E('batchCount').value=count;var label=E('batchLabel').value.trim();var btn=E('btnBatchExec');btn.disabled=true;btn.textContent=t('batch.starting');var d=await api('/api/create-batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({account_ids:ids,count_per_account:count,label:label})});if(!d.ok){btn.disabled=false;btn.textContent=t('settings.start');if(d.job_id){batchJob={id:d.job_id,status:'running'};scheduleBatchPoll();}toast(d.error||t('batch.start_fail'),true);return}batchJob=d.job;renderBatchJob(batchJob);scheduleBatchPoll();}
@@ -1338,9 +1348,31 @@ def _create_account_with_cooldown(job, acc_id, count, label, name):
     while already_created + len(successful) < count:
         remaining = count - already_created - len(successful)
         _emit_log("info", f"[{name}] 继续创建剩余 {remaining} 个")
-        results = _account_mgr.create_aliases_for_account(
-            acc_id, remaining, label, progress_callback=record_progress
-        )
+        stop_heartbeat = threading.Event()
+        started_at = time.monotonic()
+
+        def _heartbeat():
+            while not stop_heartbeat.wait(_BATCH_CREATE_HEARTBEAT_SECONDS):
+                waited = max(1, int(time.monotonic() - started_at))
+                _emit_log(
+                    "info",
+                    f"[{name}] 仍在向 Apple 申请，已等待 {waited} 秒，剩余 {remaining} 个",
+                )
+                with _batch_lock:
+                    entry = job["accounts"][acc_id]
+                    entry["error"] = f"正在向 Apple 申请，已等待 {waited} 秒"
+                    job["updated_at"] = datetime.now(_BJ_TZ).isoformat()
+                    _save_batch_state_locked()
+
+        threading.Thread(
+            target=_heartbeat, daemon=True, name=f"create-hb-{acc_id}"
+        ).start()
+        try:
+            results = _account_mgr.create_aliases_for_account(
+                acc_id, remaining, label, progress_callback=record_progress
+            )
+        finally:
+            stop_heartbeat.set()
         successful.extend(result for result in results if result.get("ok"))
         errors = [result for result in results if not result.get("ok")]
         if not errors:
@@ -1406,6 +1438,7 @@ def _run_batch_account(job, acc_id, count, label):
         entry["status"] = "running"
         entry["started_at"] = entry.get("started_at") or datetime.now(_BJ_TZ).isoformat()
         _save_batch_state_locked()
+    _emit_log("info", f"[{name}] 开始创建，目标 {count} 个，已完成 {previous_created} 个")
     try:
         if not account:
             results = [{"ok": False, "error": "账号不存在", "limited": False}]

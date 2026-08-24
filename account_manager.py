@@ -70,6 +70,13 @@ class AccountManager:
         "429",
         "temporarily",
         "throttle",
+        "timeout",
+        "timed out",
+        "connection",
+        "http 421",
+        "http 401",
+        "http 403",
+        "trusttokens",
         "操作频繁",
         "稍后再试",
     )
@@ -816,6 +823,13 @@ class AccountManager:
                 limited = retryable or any(
                     marker in lower for marker in self._CREATE_LIMIT_MARKERS
                 )
+                retryable = retryable or any(
+                    marker in lower for marker in (
+                        "timeout", "timed out", "connection", "http 421",
+                        "http 401", "http 403", "trusttokens",
+                    )
+                )
+                limited = limited or retryable
                 results.append({
                     "email": None,
                     "account_id": acc_id,
@@ -828,7 +842,7 @@ class AccountManager:
                 if limited:
                     account["create_status"] = "cooldown" if retryable else "limited"
                     account["create_limited_at"] = datetime.now().isoformat()
-                    break
+                break
 
         self._save()
         return results
