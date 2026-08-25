@@ -353,6 +353,67 @@ class AccountManager:
             self.record_known_aliases(acc_id, aliases)
         return account
 
+    def reimport_account(
+        self, acc_id: str, cookie_input: str, host: str = "icloud.com"
+    ) -> Dict:
+        from icloud_hme import ICloudHME
+
+        cookies = self.parse_cookie_input(cookie_input)
+        if host not in ("icloud.com", "icloud.com.cn"):
+            host = self.detect_icloud_host(cookie_input)
+
+        with self._operation_lock(acc_id):
+            account = self.accounts.get(acc_id)
+            if not account:
+                raise KeyError(f"账号不存在: {acc_id}")
+
+            try:
+                client = ICloudHME(cookies, host=host, verbose=False)
+                client.validate_session()
+                info = client.get_account_info() or {}
+            except Exception as e:
+                raise ValueError(str(e)[:300]) from e
+
+            new_email = (
+                str(info.get("appleId") or info.get("primaryEmail") or "")
+            ).strip()
+            old_email = str(account.get("real_email") or "").strip()
+            if old_email and new_email and old_email.lower() != new_email.lower():
+                raise ValueError(
+                    f"Cookie 属于 {new_email}，与当前账号 {old_email} 不一致"
+                )
+
+            aliases: List[Dict] = []
+            try:
+                aliases = client.list_aliases()
+            except Exception:
+                aliases = []
+
+            self._drop_mail_client(acc_id)
+            with self._lock:
+                account = self.accounts.get(acc_id)
+                if not account:
+                    raise KeyError(f"账号不存在: {acc_id}")
+                account["cookies"] = cookies
+                account["host"] = host
+                account["status"] = "active"
+                account["last_error"] = None
+                account["last_validated"] = datetime.now().isoformat()
+                if new_email:
+                    account["real_email"] = new_email
+                derived = self._derive_icloud_email(info)
+                if derived:
+                    account["icloud_email"] = derived
+                if aliases:
+                    account["alias_total"] = len(aliases)
+                    account["alias_active"] = sum(
+                        1 for item in aliases if item.get("active")
+                    )
+                self._save()
+            if aliases:
+                self.record_known_aliases(acc_id, aliases)
+            return dict(account)
+
     def remove_account(self, acc_id: str) -> bool:
         with self._operation_lock(acc_id):
             self._drop_mail_client(acc_id)
@@ -746,16 +807,16 @@ class AccountManager:
 
     def create_aliases_for_account(
         self, acc_id: str, count: int = 1, label: str = "",
-        progress_callback=None,
+        progress_callback=None, should_stop=None, wait=None,
     ) -> List[Dict]:
         with self._operation_lock(acc_id):
             return self._create_aliases_for_account_unlocked(
-                acc_id, count, label, progress_callback
+                acc_id, count, label, progress_callback, should_stop, wait
             )
 
     def _create_aliases_for_account_unlocked(
         self, acc_id: str, count: int = 1, label: str = "",
-        progress_callback=None,
+        progress_callback=None, should_stop=None, wait=None,
     ) -> List[Dict]:
         from icloud_hme import ICloudHME
 
@@ -771,6 +832,8 @@ class AccountManager:
 
         results: List[Dict] = []
         for i in range(count):
+            if callable(should_stop) and should_stop():
+                break
             try:
                 alias_label = label or (
                     f"{account.get('name', acc_id)} "
@@ -803,10 +866,16 @@ class AccountManager:
                         except Exception:
                             pass
                     if i < count - 1 and CREATE_ALIAS_INTERVAL_SECONDS > 0:
-                        time.sleep(
+                        delay = (
                             CREATE_ALIAS_INTERVAL_SECONDS
                             + random.uniform(0, CREATE_ALIAS_JITTER_SECONDS)
                         )
+                        if callable(wait):
+                            wait(delay)
+                        else:
+                            time.sleep(delay)
+                        if callable(should_stop) and should_stop():
+                            break
                 else:
                     results.append({
                         "email": None,

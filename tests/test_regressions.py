@@ -975,7 +975,7 @@ def test_batch_runs_accounts_in_parallel_and_creates_pickup_links():
         def get_account(self, account_id):
             return self.accounts.get(account_id)
 
-        def create_aliases_for_account(self, account_id, count, _label, progress_callback=None):
+        def create_aliases_for_account(self, account_id, count, _label, progress_callback=None, **_kwargs):
             self.active += 1
             self.max_active = max(self.max_active, self.active)
             try:
@@ -1505,6 +1505,353 @@ def test_health_loop_retries_error_accounts():
 
 
 
+
+def test_batch_pause_keeps_remaining_and_stop_discards_it():
+    import threading
+    import web_ui
+
+    started = {"keep": threading.Event()}
+
+    class FakeManager:
+        accounts = {
+            "keep": {"id": "keep", "name": "keep", "status": "active"},
+            "drop": {"id": "drop", "name": "drop", "status": "active"},
+        }
+
+        def get_account(self, account_id):
+            return self.accounts.get(account_id)
+
+        def create_aliases_for_account(self, account_id, count, _label, progress_callback=None, should_stop=None, wait=None):
+            results = []
+            for index in range(count):
+                if callable(should_stop) and should_stop():
+                    break
+                item = {"ok": True, "email": "%s-%s@icloud.com" % (account_id, index), "account_id": account_id}
+                results.append(item)
+                if progress_callback:
+                    progress_callback(item)
+                if account_id == "keep":
+                    started["keep"].set()
+                if callable(wait):
+                    wait(0.2)
+                else:
+                    time.sleep(0.2)
+                if callable(should_stop) and should_stop():
+                    break
+            return results
+
+    original_manager = web_ui._account_mgr
+    original_state_file = web_ui._BATCH_STATE_FILE
+    original_control_file = web_ui._CREATE_CONTROL_FILE
+    temp_dir = tempfile.TemporaryDirectory()
+    web_ui._BATCH_STATE_FILE = Path(temp_dir.name) / "batch_jobs.json"
+    web_ui._CREATE_CONTROL_FILE = Path(temp_dir.name) / "create_controls.json"
+    with web_ui._batch_lock:
+        original_jobs = web_ui._batch_jobs
+        original_active = web_ui._batch_active_id
+        original_runners = set(web_ui._batch_runner_jobs)
+        web_ui._batch_jobs = web_ui.OrderedDict()
+        web_ui._batch_active_id = None
+        web_ui._batch_runner_jobs.clear()
+    with web_ui._account_control_lock:
+        original_paused = set(web_ui._paused_account_ids)
+        original_controls = dict(web_ui._account_controls)
+        web_ui._paused_account_ids = set()
+        web_ui._account_controls = {}
+    web_ui._account_mgr = FakeManager()
+    client = web_ui.app.test_client()
+    try:
+        started_job = client.post("/api/create-batch", json={
+            "account_ids": ["keep", "drop"],
+            "count_per_account": 4,
+            "interval": 0,
+        })
+        assert started_job.status_code == 202
+        job_id = started_job.get_json()["job_id"]
+        assert started["keep"].wait(2)
+        paused = client.post("/api/create-control", json={
+            "action": "pause",
+            "account_ids": ["keep"],
+        })
+        assert paused.status_code == 200
+        deadline = time.time() + 4
+        job = None
+        while time.time() < deadline:
+            job = client.get("/api/create-batch/%s" % job_id).get_json()["job"]
+            if job["accounts"]["keep"]["status"] == "paused":
+                break
+            time.sleep(0.02)
+        assert job["accounts"]["keep"]["status"] == "paused"
+        assert job["accounts"]["keep"]["created"] >= 1
+        remaining = job["accounts"]["keep"]["target"] - job["accounts"]["keep"]["created"]
+        assert remaining > 0
+        paused_created = job["accounts"]["keep"]["created"]
+        resumed = client.post("/api/create-batch", json={
+            "account_ids": ["keep"],
+            "count_per_account": 4,
+            "interval": 0,
+        })
+        assert resumed.status_code == 202
+        deadline = time.time() + 4
+        while time.time() < deadline:
+            job = client.get("/api/create-batch/%s" % job_id).get_json()["job"]
+            if job["accounts"]["keep"]["created"] > paused_created or job["accounts"]["keep"]["status"] in ("completed", "partial"):
+                break
+            time.sleep(0.02)
+        assert job["accounts"]["keep"]["created"] >= paused_created
+        html = web_ui.UI_HTML
+        assert "btnBatchPause" in html
+        assert "btnBatchStop" in html
+        assert "function controlBatchCreate" in html
+    finally:
+        web_ui._account_mgr = original_manager
+        with web_ui._batch_lock:
+            web_ui._batch_jobs = original_jobs
+            web_ui._batch_active_id = original_active
+            web_ui._batch_runner_jobs.clear()
+            web_ui._batch_runner_jobs.update(original_runners)
+        with web_ui._account_control_lock:
+            web_ui._paused_account_ids = original_paused
+            web_ui._account_controls = original_controls
+        web_ui._BATCH_STATE_FILE = original_state_file
+        web_ui._CREATE_CONTROL_FILE = original_control_file
+        temp_dir.cleanup()
+    print("  PASS test_batch_pause_keeps_remaining_and_stop_discards_it")
+
+
+def test_create_control_stop_cancels_remaining():
+    import threading
+    import web_ui
+
+    started = {"slow": threading.Event()}
+
+    class FakeManager:
+        accounts = {"slow": {"id": "slow", "name": "slow", "status": "active"}}
+
+        def get_account(self, account_id):
+            return self.accounts.get(account_id)
+
+        def create_aliases_for_account(self, account_id, count, _label, progress_callback=None, should_stop=None, wait=None):
+            results = []
+            for index in range(count):
+                if callable(should_stop) and should_stop():
+                    break
+                item = {"ok": True, "email": "slow-%s@icloud.com" % index, "account_id": account_id}
+                results.append(item)
+                if progress_callback:
+                    progress_callback(item)
+                started["slow"].set()
+                if callable(wait):
+                    wait(0.3)
+                if callable(should_stop) and should_stop():
+                    break
+            return results
+
+    original_manager = web_ui._account_mgr
+    original_state_file = web_ui._BATCH_STATE_FILE
+    original_control_file = web_ui._CREATE_CONTROL_FILE
+    temp_dir = tempfile.TemporaryDirectory()
+    web_ui._BATCH_STATE_FILE = Path(temp_dir.name) / "batch_jobs.json"
+    web_ui._CREATE_CONTROL_FILE = Path(temp_dir.name) / "create_controls.json"
+    with web_ui._batch_lock:
+        original_jobs = web_ui._batch_jobs
+        original_active = web_ui._batch_active_id
+        original_runners = set(web_ui._batch_runner_jobs)
+        web_ui._batch_jobs = web_ui.OrderedDict()
+        web_ui._batch_active_id = None
+        web_ui._batch_runner_jobs.clear()
+    with web_ui._account_control_lock:
+        original_paused = set(web_ui._paused_account_ids)
+        original_controls = dict(web_ui._account_controls)
+        web_ui._paused_account_ids = set()
+        web_ui._account_controls = {}
+    web_ui._account_mgr = FakeManager()
+    client = web_ui.app.test_client()
+    try:
+        posted = client.post("/api/create-batch", json={
+            "account_ids": ["slow"],
+            "count_per_account": 6,
+            "interval": 0,
+        })
+        assert posted.status_code == 202
+        job_id = posted.get_json()["job_id"]
+        assert started["slow"].wait(2)
+        stopped = client.post("/api/create-control", json={
+            "action": "stop",
+            "account_ids": ["slow"],
+        })
+        assert stopped.status_code == 200
+        deadline = time.time() + 3
+        job = None
+        while time.time() < deadline:
+            job = client.get("/api/create-batch/%s" % job_id).get_json()["job"]
+            if job["accounts"]["slow"]["status"] == "stopped":
+                break
+            time.sleep(0.02)
+        assert job["accounts"]["slow"]["status"] == "stopped"
+        assert job["accounts"]["slow"]["created"] < 6
+        assert job["accounts"]["slow"].get("finished_at")
+    finally:
+        web_ui._account_mgr = original_manager
+        with web_ui._batch_lock:
+            web_ui._batch_jobs = original_jobs
+            web_ui._batch_active_id = original_active
+            web_ui._batch_runner_jobs.clear()
+            web_ui._batch_runner_jobs.update(original_runners)
+        with web_ui._account_control_lock:
+            web_ui._paused_account_ids = original_paused
+            web_ui._account_controls = original_controls
+        web_ui._BATCH_STATE_FILE = original_state_file
+        web_ui._CREATE_CONTROL_FILE = original_control_file
+        temp_dir.cleanup()
+    print("  PASS test_create_control_stop_cancels_remaining")
+
+
+
+def test_reimport_keeps_account_and_rejects_mismatch():
+    import account_manager
+    import icloud_hme
+
+    class FakeHME:
+        info = {"appleId": "keep@163.com", "primaryEmail": "keep@163.com"}
+        aliases = [{"email": "alias@icloud.com", "active": True}]
+
+        def __init__(self, cookies, host="icloud.com", verbose=False):
+            self.cookies = cookies
+            self.host = host
+
+        def validate_session(self):
+            if self.cookies.get("fail"):
+                raise RuntimeError("HTTP 421: trustTokens")
+            return True
+
+        def get_account_info(self):
+            return dict(self.info)
+
+        def list_aliases(self):
+            return list(self.aliases)
+
+    originals = (
+        account_manager.ACCOUNTS_FILE,
+        account_manager.LATEST_EMAILS,
+        icloud_hme.ICloudHME,
+    )
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            account_manager.ACCOUNTS_FILE = Path(td) / "accounts.json"
+            account_manager.LATEST_EMAILS = Path(td) / "latest_emails.txt"
+            icloud_hme.ICloudHME = FakeHME
+            manager = account_manager.AccountManager()
+            manager.accounts["acc"] = {
+                "id": "acc",
+                "name": "keep",
+                "real_email": "keep@163.com",
+                "icloud_email": "keep@icloud.com",
+                "cookies": {"old": "1"},
+                "host": "icloud.com",
+                "status": "error",
+                "last_error": "HTTP 421",
+                "app_password": "secret-app-password",
+                "alias_total": 5,
+                "alias_active": 5,
+                "created_at": "2026-01-01T00:00:00",
+            }
+            updated = manager.reimport_account(
+                "acc",
+                '{"a":"new-cookie"}',
+                host="icloud.com.cn",
+            )
+            assert updated["id"] == "acc"
+            assert updated["status"] == "active"
+            assert updated["cookies"] == {"a": "new-cookie"}
+            assert updated["host"] == "icloud.com.cn"
+            assert updated["app_password"] == "secret-app-password"
+            assert updated["created_at"] == "2026-01-01T00:00:00"
+            assert updated["alias_total"] == 1
+            assert updated["last_error"] is None
+            saved = json.loads(account_manager.ACCOUNTS_FILE.read_text(encoding="utf-8"))
+            assert saved["accounts"]["acc"]["cookies"] == {"a": "new-cookie"}
+            assert saved["accounts"]["acc"]["app_password"] == "secret-app-password"
+
+            FakeHME.info = {"appleId": "other@163.com"}
+            try:
+                manager.reimport_account("acc", '{"a":"other"}')
+                raise AssertionError("mismatch should fail")
+            except ValueError as exc:
+                assert "不一致" in str(exc)
+            assert manager.accounts["acc"]["cookies"] == {"a": "new-cookie"}
+
+            try:
+                manager.reimport_account("acc", '{"fail":"1"}')
+                raise AssertionError("invalid cookie should fail")
+            except ValueError as exc:
+                assert "421" in str(exc)
+            assert manager.accounts["acc"]["cookies"] == {"a": "new-cookie"}
+            assert manager.accounts["acc"]["status"] == "active"
+        finally:
+            (
+                account_manager.ACCOUNTS_FILE,
+                account_manager.LATEST_EMAILS,
+                icloud_hme.ICloudHME,
+            ) = originals
+    print("  PASS test_reimport_keeps_account_and_rejects_mismatch")
+
+
+def test_reimport_api_and_expired_account_button():
+    import web_ui
+
+    class FakeManager:
+        accounts = {
+            "acc": {
+                "id": "acc",
+                "name": "keep",
+                "real_email": "keep@163.com",
+                "status": "error",
+                "app_password": "secret",
+                "alias_total": 5,
+            }
+        }
+
+        def get_account(self, acc_id):
+            return self.accounts.get(acc_id)
+
+        def reimport_account(self, acc_id, cookie_input, host="icloud.com"):
+            if acc_id not in self.accounts:
+                raise KeyError(acc_id)
+            if "mismatch" in cookie_input:
+                raise ValueError("Cookie 属于 other@163.com，与当前账号 keep@163.com 不一致")
+            item = self.accounts[acc_id]
+            item["status"] = "active"
+            item["last_error"] = None
+            item["host"] = host
+            return dict(item)
+
+    original = web_ui._account_mgr
+    web_ui._account_mgr = FakeManager()
+    client = web_ui.app.test_client()
+    try:
+        missing = client.post("/api/accounts/missing/reimport", json={"cookie_input": "a=b"})
+        assert missing.status_code == 404
+        bad = client.post("/api/accounts/acc/reimport", json={"cookie_input": "mismatch"})
+        assert bad.status_code == 400
+        assert "不一致" in bad.get_json()["error"]
+        ok = client.post("/api/accounts/acc/reimport", json={
+            "cookie_input": "a=b",
+            "host": "icloud.com.cn",
+        })
+        assert ok.status_code == 200
+        body = ok.get_json()
+        assert body["ok"] is True
+        assert body["id"] == "acc"
+        assert body["real_email"] == "keep@163.com"
+        html = web_ui.UI_HTML
+        assert "function showReimportModal" in html
+        assert "a.status!=='active'" in html or 'a.status!=="active"' in html
+        assert "action.reimport" in html
+    finally:
+        web_ui._account_mgr = original
+    print("  PASS test_reimport_api_and_expired_account_button")
+
 def test_batch_can_add_second_account_while_first_is_running():
     import threading
     import web_ui
@@ -1749,7 +2096,6 @@ def test_batch_create_emits_heartbeat_while_apple_call_hangs():
     print("  PASS test_batch_create_emits_heartbeat_while_apple_call_hangs")
 
 
-
 if __name__ == "__main__":
     tests = [
         ("parse_cookie_header_string", test_parse_cookie_header_string),
@@ -1799,6 +2145,10 @@ if __name__ == "__main__":
         ("find_by_recipient_matches_delivered_to", test_find_by_recipient_matches_delivered_to),
         ("check_all_aliases_mail_raises_without_cache", test_check_all_aliases_mail_raises_without_cache),
         ("health_loop_retries_error_accounts", test_health_loop_retries_error_accounts),
+        ("batch_pause_keeps_remaining_and_stop_discards_it", test_batch_pause_keeps_remaining_and_stop_discards_it),
+        ("create_control_stop_cancels_remaining", test_create_control_stop_cancels_remaining),
+        ("reimport_keeps_account_and_rejects_mismatch", test_reimport_keeps_account_and_rejects_mismatch),
+        ("reimport_api_and_expired_account_button", test_reimport_api_and_expired_account_button),
         ("batch_can_add_second_account_while_first_is_running", test_batch_can_add_second_account_while_first_is_running),
         ("icloud_request_does_not_retry_http_421", test_icloud_request_does_not_retry_http_421),
         ("create_aliases_stops_after_first_failure", test_create_aliases_stops_after_first_failure),
