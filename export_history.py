@@ -2,9 +2,41 @@
 """Persistent export state for Hide My Email aliases."""
 import json
 import os
+import re
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+
+
+_EXPORT_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+
+
+def parse_export_txt(text):
+    """Extract unique emails from exported pickup TXT."""
+    emails = []
+    seen = set()
+    raw = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    if raw.startswith("\ufeff"):
+        raw = raw[1:]
+    for line in raw.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        if "----" in line:
+            candidate = line.split("----", 1)[0].strip()
+        elif "\t" in line:
+            candidate = line.split("\t", 1)[0].strip()
+        else:
+            candidate = line
+        match = _EXPORT_EMAIL_RE.search(candidate) or _EXPORT_EMAIL_RE.search(line)
+        if not match:
+            continue
+        key = match.group(0).strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        emails.append(key)
+    return emails
 
 
 class ExportHistoryStore:

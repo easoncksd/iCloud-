@@ -207,13 +207,18 @@ def test_export_api_prevents_duplicate_downloads():
                 "token": "opaque-token",
             }]
 
+    class FakeAccounts:
+        accounts = {"a1": {"id": "a1"}}
+
     original_pickup = web_ui._pickup_store
     original_export = web_ui._export_store
     original_base = web_ui.PICKUP_BASE_URL
+    original_mgr = web_ui._account_mgr
     with tempfile.TemporaryDirectory() as directory:
         web_ui._pickup_store = FakePickupStore()
         web_ui._export_store = ExportHistoryStore(Path(directory) / "exports.json")
         web_ui.PICKUP_BASE_URL = "https://mail.example.test"
+        web_ui._account_mgr = FakeAccounts()
         client = web_ui.app.test_client()
         try:
             first = client.post("/api/pickup-links/export", json={"emails": ["one@icloud.com"]}).get_json()
@@ -233,7 +238,72 @@ def test_export_api_prevents_duplicate_downloads():
             web_ui._pickup_store = original_pickup
             web_ui._export_store = original_export
             web_ui.PICKUP_BASE_URL = original_base
+            web_ui._account_mgr = original_mgr
     print("  PASS test_export_api_prevents_duplicate_downloads")
+
+def test_restore_from_txt_skips_deleted_accounts():
+    import web_ui
+    from export_history import ExportHistoryStore, parse_export_txt
+
+    text = "\ufeffkeep@icloud.com----https://mail.example.test/pickup/keep\ngone@icloud.com----https://mail.example.test/pickup/gone\nplain@icloud.com\nkeep@icloud.com----dup\n"
+    assert parse_export_txt(text) == [
+        "keep@icloud.com",
+        "gone@icloud.com",
+        "plain@icloud.com",
+    ]
+    html = web_ui.UI_HTML
+    assert "handleRestoreTxtFile(this)" in html
+    assert "emails.restore_txt" in html
+    assert "function parseExportTxt(" in html
+
+    class FakePickupStore:
+        def list_all(self):
+            return [
+                {"alias_email": "keep@icloud.com", "account_id": "live", "token": "keep"},
+                {"alias_email": "gone@icloud.com", "account_id": "dead", "token": "gone"},
+                {"alias_email": "plain@icloud.com", "account_id": "live", "token": "plain"},
+            ]
+
+    class FakeAccounts:
+        accounts = {"live": {"id": "live"}}
+
+    original_pickup = web_ui._pickup_store
+    original_export = web_ui._export_store
+    original_mgr = web_ui._account_mgr
+    with tempfile.TemporaryDirectory() as directory:
+        store = ExportHistoryStore(Path(directory) / "exports.json")
+        store.claim([
+            {"email": "keep@icloud.com", "account_id": "live"},
+            {"email": "gone@icloud.com", "account_id": "dead"},
+            {"email": "plain@icloud.com", "account_id": "live"},
+        ])
+        web_ui._pickup_store = FakePickupStore()
+        web_ui._export_store = store
+        web_ui._account_mgr = FakeAccounts()
+        client = web_ui.app.test_client()
+        try:
+            payload = client.post(
+                "/api/export-history/restore",
+                json={"text": "keep@icloud.com----https://x/pickup/keep\ngone@icloud.com----https://x/pickup/gone\n"},
+            ).get_json()
+            assert payload["ok"] is True
+            assert payload["count"] == 1
+            assert payload["restored"] == ["keep@icloud.com"]
+            assert payload["skipped_missing"] == ["gone@icloud.com"]
+            assert payload["skipped"] == 1
+            assert store.get("keep@icloud.com") is None
+            assert store.get("gone@icloud.com") is not None
+            empty = client.post("/api/export-history/restore", json={"text": "keep@icloud.com----https://x/pickup/keep\n"}).get_json()
+            assert empty["ok"] is True
+            assert empty["count"] == 0
+            assert empty["skipped_not_exported"] == ["keep@icloud.com"]
+        finally:
+            web_ui._pickup_store = original_pickup
+            web_ui._export_store = original_export
+            web_ui._account_mgr = original_mgr
+    print("  PASS test_restore_from_txt_skips_deleted_accounts")
+
+
 
 
 def test_scheduler_start_is_idempotent():
@@ -1351,6 +1421,13 @@ def test_ui_create_entry_and_scheduler_copy():
     assert 'class="social-links"' in html
     assert 'href="https://x.com/fangao798"' in html
     assert 'href="https://t.co/fd6OPHgvKm"' in html
+    assert 'data-page-size="100"' in html
+    assert 'onclick="setAliasPageSize(100)"' in html
+    assert '[20,50,100].indexOf(size)>=0?size:50' in html
+    assert "emails.restore_txt" in html
+    assert "function handleRestoreTxtFile(" in html
+    assert 'id="mailWatchHours"' in html
+    assert "status.mail_auth_failed" in html
     print("  PASS test_ui_create_entry_and_scheduler_copy")
 
 
@@ -1493,6 +1570,108 @@ def test_mail_newest_first():
     mail_cache.CACHE_FILE = old_path
     temp_dir.cleanup()
     print("  PASS test_mail_newest_first")
+
+
+
+def test_mail_watch_interval_and_auth_detection():
+    import web_ui
+    from pathlib import Path as P
+    import tempfile
+
+    assert web_ui._clamp_mail_watch_hours(0) == 1
+    assert web_ui._clamp_mail_watch_hours(99) == 24
+    assert web_ui._clamp_mail_watch_hours("3") == 3
+    assert web_ui._mail_error_is_auth_failure("IMAP 登录失败 - 请检查应用专用密码") is True
+    assert web_ui._mail_error_is_auth_failure("AUTHENTICATIONFAILED") is True
+    assert web_ui._mail_error_is_auth_failure("IMAP 连接失败: timed out") is False
+    html = web_ui.UI_HTML
+    assert 'id="mailWatchHours"' in html
+    assert "function saveMailWatch(" in html
+    assert "a.mail_status==='auth_failed'" in html
+    source = P(web_ui.__file__).read_text(encoding="utf-8")
+    loop = source.split("def _mail_watch_loop():", 1)[1].split("def ", 1)[0]
+    assert "if _account_create_in_progress" not in loop
+    assert "test_imap_connection" in source
+    assert "_wait_for_mail_idle" in source
+    assert "_hold_mail_pulls" in source
+    assert "if account_id in _mail_watch_hold_accounts" in source
+    assert "still.append(account)" in loop
+    assert "status == \"busy\"" in loop
+    assert "_apply_mail_watch_result(account_id, True)" in source
+    assert "_apply_mail_watch_result(account_id, False, error_text)" in source
+    with tempfile.TemporaryDirectory() as directory:
+        path = P(directory) / "mail_watch.json"
+        original = web_ui._MAIL_WATCH_FILE
+        try:
+            web_ui._MAIL_WATCH_FILE = path
+            assert web_ui._load_mail_watch_hours() == 1
+            assert web_ui._save_mail_watch_hours(6) == 6
+            assert web_ui._load_mail_watch_hours() == 6
+            client = web_ui.app.test_client()
+            posted = client.post("/api/mail-watch", json={"interval_hours": 2}).get_json()
+            assert posted["ok"] is True
+            assert posted["interval_hours"] == 2
+            got = client.get("/api/mail-watch").get_json()
+            assert got["interval_hours"] == 2
+        finally:
+            web_ui._MAIL_WATCH_FILE = original
+    print("  PASS test_mail_watch_interval_and_auth_detection")
+
+
+def test_mail_watch_reuses_fetch_and_holds_pulls():
+    import threading
+    from datetime import datetime
+    import web_ui
+
+    class DummyMgr:
+        def __init__(self):
+            self.accounts = {
+                "a1": {
+                    "id": "a1",
+                    "app_password": "x",
+                    "mail_status": "ok",
+                    "mail_last_checked": datetime.now().isoformat(),
+                }
+            }
+            self.tested = 0
+            self._locks = {}
+
+        def get_account(self, acc_id):
+            return self.accounts.get(acc_id)
+
+        def list_accounts(self):
+            return list(self.accounts.values())
+
+        def update_account(self, acc_id, **kwargs):
+            self.accounts[acc_id].update(kwargs)
+
+        def _mail_sync_lock(self, acc_id):
+            return self._locks.setdefault(acc_id, threading.Lock())
+
+        def test_imap_connection(self, acc_id):
+            self.tested += 1
+            return {"ok": True}
+
+    dummy = DummyMgr()
+    original = web_ui._account_mgr
+    web_ui._account_mgr = dummy
+    try:
+        status = web_ui._check_account_mail(dummy.accounts["a1"], fresh_seconds=3600)
+        assert status == "ok"
+        assert dummy.tested == 0
+        dummy.accounts["a1"]["mail_last_checked"] = "2020-01-01T00:00:00"
+        status = web_ui._check_account_mail(dummy.accounts["a1"], wait_timeout=1, fresh_seconds=3600)
+        assert status == "ok"
+        assert dummy.tested == 1
+        with web_ui._pickup_refresh_lock:
+            web_ui._mail_watch_hold_accounts.add("a1")
+        assert web_ui._schedule_pickup_account_refresh("a1") is False
+        with web_ui._pickup_refresh_lock:
+            web_ui._mail_watch_hold_accounts.discard("a1")
+        assert not web_ui._mail_pulls_held("a1")
+    finally:
+        web_ui._account_mgr = original
+    print("  PASS test_mail_watch_reuses_fetch_and_holds_pulls")
 
 
 def test_health_loop_retries_error_accounts():
@@ -2111,6 +2290,7 @@ if __name__ == "__main__":
         ("validate_skips_lock_when_create_in_progress", test_validate_skips_lock_when_create_in_progress),
         ("account_api_reports_validation_failure", test_account_api_reports_validation_failure),
         ("export_api_prevents_duplicate_downloads", test_export_api_prevents_duplicate_downloads),
+        ("restore_from_txt_skips_deleted_accounts", test_restore_from_txt_skips_deleted_accounts),
         ("scheduler_start_is_idempotent", test_scheduler_start_is_idempotent),
         ("strip_html", test_strip_html),
         ("strip_html_with_link", test_strip_html_with_link),
@@ -2144,6 +2324,8 @@ if __name__ == "__main__":
         ("record_known_aliases_and_failed_add", test_record_known_aliases_and_failed_add),
         ("find_by_recipient_matches_delivered_to", test_find_by_recipient_matches_delivered_to),
         ("check_all_aliases_mail_raises_without_cache", test_check_all_aliases_mail_raises_without_cache),
+        ("mail_watch_interval_and_auth_detection", test_mail_watch_interval_and_auth_detection),
+        ("mail_watch_reuses_fetch_and_holds_pulls", test_mail_watch_reuses_fetch_and_holds_pulls),
         ("health_loop_retries_error_accounts", test_health_loop_retries_error_accounts),
         ("batch_pause_keeps_remaining_and_stop_discards_it", test_batch_pause_keeps_remaining_and_stop_discards_it),
         ("create_control_stop_cancels_remaining", test_create_control_stop_cancels_remaining),

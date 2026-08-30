@@ -14,7 +14,7 @@ if str(HERE) not in sys.path: sys.path.insert(0, str(HERE))
 from flask import Flask, Response, request, jsonify, render_template_string, redirect
 from icloud_hme import ICloudHME, extract_chrome_cookies
 from account_manager import AccountManager
-from export_history import ExportHistoryStore
+from export_history import ExportHistoryStore, parse_export_txt
 from mail_body_store import MailBodyStore
 from pickup_links import PickupLinkStore
 
@@ -114,6 +114,7 @@ _pickup_store.rebind_stale_accounts(_account_mgr.accounts.keys())
 PICKUP_BASE_URL = os.environ.get("PICKUP_BASE_URL", "").rstrip("/")
 _pickup_refresh_lock = threading.Lock()
 _pickup_refreshing_accounts = set()
+_mail_watch_hold_accounts = set()
 _pickup_last_account_refresh = {}
 _pickup_refresh_errors = {}
 _pickup_error_log_state = {}
@@ -565,6 +566,231 @@ def _health_loop():
                     _emit_log("warn", f"健康检查失败 [{account.get('name','?')}]: {str(e)[:100]}")
                     _error_reported.add(acc_id)
 
+
+_MAIL_WATCH_FILE = RESULTS_DIR / "mail_watch.json"
+_MAIL_WATCH_DEFAULT_HOURS = 1
+_MAIL_WATCH_MIN_HOURS = 1
+_MAIL_WATCH_MAX_HOURS = 24
+
+
+def _clamp_mail_watch_hours(value):
+    try:
+        hours = int(value)
+    except (TypeError, ValueError):
+        hours = _MAIL_WATCH_DEFAULT_HOURS
+    return max(_MAIL_WATCH_MIN_HOURS, min(_MAIL_WATCH_MAX_HOURS, hours))
+
+
+def _load_mail_watch_hours(path=None):
+    target = Path(path or _MAIL_WATCH_FILE)
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+        return _clamp_mail_watch_hours((data or {}).get("interval_hours"))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return _MAIL_WATCH_DEFAULT_HOURS
+
+
+def _save_mail_watch_hours(hours, path=None):
+    hours = _clamp_mail_watch_hours(hours)
+    target = Path(path or _MAIL_WATCH_FILE)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    payload = json.dumps({"interval_hours": hours}, ensure_ascii=False, indent=2)
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, target)
+    return hours
+
+
+def _mail_error_is_auth_failure(error_text):
+    text = str(error_text or "").lower()
+    if any(mark in text for mark in (
+        "timeout", "timed out", "temporarily", "connection", "network",
+        "ssl", "eof", "unreachable", "reset", "broken pipe",
+    )):
+        return False
+    return any(mark in text for mark in (
+        "authentication", "login failed", "imap 登录失败", "application-specific",
+        "app 专用密码", "invalid credentials", "authenticationfailed",
+    ))
+
+
+def _mail_sync_busy(acc_id):
+    acc_id = str(acc_id or "")
+    with _pickup_refresh_lock:
+        if acc_id in _pickup_refreshing_accounts:
+            return True
+    lock = _account_mgr._mail_sync_lock(acc_id)
+    return lock.locked()
+
+
+_MAIL_WATCH_FRESH_SECONDS = 120
+_MAIL_WATCH_BUSY_WAIT_SECONDS = 60
+_MAIL_WATCH_BUSY_RETRIES = 8
+
+
+def _hold_mail_pulls(acc_id):
+    acc_id = str(acc_id or "")
+    if not acc_id:
+        return
+    with _pickup_refresh_lock:
+        _mail_watch_hold_accounts.add(acc_id)
+
+
+def _release_mail_pulls(acc_id):
+    acc_id = str(acc_id or "")
+    if not acc_id:
+        return
+    with _pickup_refresh_lock:
+        _mail_watch_hold_accounts.discard(acc_id)
+
+
+def _mail_pulls_held(acc_id):
+    acc_id = str(acc_id or "")
+    with _pickup_refresh_lock:
+        return acc_id in _mail_watch_hold_accounts
+
+
+def _wait_for_mail_idle(acc_id, timeout):
+    acc_id = str(acc_id or "")
+    deadline = time.time() + max(0.0, float(timeout or 0))
+    while True:
+        if not _mail_sync_busy(acc_id):
+            return True
+        remaining = deadline - time.time()
+        if remaining <= 0 or _shutdown_event.is_set():
+            return not _mail_sync_busy(acc_id)
+        _shutdown_event.wait(min(0.4, remaining))
+
+
+def _mail_checked_within(account, seconds):
+    last = (account or {}).get("mail_last_checked")
+    if not last:
+        return False
+    try:
+        seconds = max(1, int(seconds))
+        checked = datetime.fromisoformat(str(last))
+        if checked.tzinfo is not None:
+            checked = checked.replace(tzinfo=None)
+        return abs((datetime.now() - checked).total_seconds()) <= seconds
+    except (TypeError, ValueError):
+        return False
+
+
+def _apply_mail_watch_result(acc_id, ok, error_text=""):
+    acc_id = str(acc_id or "")
+    account = _account_mgr.get_account(acc_id) if acc_id else None
+    if not account or not account.get("app_password"):
+        return "skip"
+    now = datetime.now().isoformat()
+    if ok:
+        _account_mgr.update_account(
+            acc_id,
+            mail_status="ok",
+            mail_last_error=None,
+            mail_last_checked=now,
+        )
+        return "ok"
+    err = str(error_text or "error")[:200]
+    if _mail_error_is_auth_failure(err):
+        _account_mgr.update_account(
+            acc_id,
+            mail_status="auth_failed",
+            mail_last_error=err,
+            mail_last_checked=now,
+        )
+        return "auth_failed"
+    _account_mgr.update_account(acc_id, mail_last_checked=now)
+    return "transient"
+
+
+def _check_account_mail(account, wait_timeout=0, fresh_seconds=None):
+    acc_id = str(account.get("id") or "")
+    if not acc_id or not account.get("app_password"):
+        return "skip"
+    if fresh_seconds is None:
+        fresh_seconds = _MAIL_WATCH_FRESH_SECONDS
+    fresh_seconds = max(_MAIL_WATCH_FRESH_SECONDS, int(fresh_seconds))
+    live = _account_mgr.get_account(acc_id) or account
+    if _mail_checked_within(live, fresh_seconds) and live.get("mail_status") in ("ok", "auth_failed"):
+        return live.get("mail_status") or "ok"
+    _hold_mail_pulls(acc_id)
+    try:
+        if wait_timeout:
+            _wait_for_mail_idle(acc_id, wait_timeout)
+        live = _account_mgr.get_account(acc_id) or live
+        if _mail_checked_within(live, fresh_seconds) and live.get("mail_status") in ("ok", "auth_failed"):
+            return live.get("mail_status") or "ok"
+        if _mail_sync_busy(acc_id):
+            return "busy"
+        lock = _account_mgr._mail_sync_lock(acc_id)
+        if not lock.acquire(timeout=10):
+            return "busy"
+        try:
+            result = _account_mgr.test_imap_connection(acc_id)
+        finally:
+            lock.release()
+        return _apply_mail_watch_result(acc_id, bool(result.get("ok")), result.get("error") or "")
+    finally:
+        _release_mail_pulls(acc_id)
+
+
+def _mail_watch_loop():
+    reported = set()
+    first = True
+    while not _shutdown_event.is_set():
+        hours = _load_mail_watch_hours()
+        wait_sec = 20 if first else max(60, hours * 3600)
+        waited = 0
+        while waited < wait_sec:
+            step = 5 if wait_sec - waited > 5 else max(1, wait_sec - waited)
+            if _shutdown_event.wait(step):
+                return
+            waited += step
+            if not first:
+                hours = _load_mail_watch_hours()
+                wait_sec = max(60, hours * 3600)
+        first = False
+        hours = _load_mail_watch_hours()
+        fresh_seconds = max(_MAIL_WATCH_FRESH_SECONDS, hours * 3600)
+        pending = [
+            account for account in _account_mgr.list_accounts()
+            if account.get("app_password")
+        ]
+        attempt = 0
+        while pending and attempt < _MAIL_WATCH_BUSY_RETRIES and not _shutdown_event.is_set():
+            still = []
+            wait_timeout = _MAIL_WATCH_BUSY_WAIT_SECONDS if attempt == 0 else 15
+            for account in pending:
+                acc_id = account.get("id")
+                try:
+                    status = _check_account_mail(
+                        account,
+                        wait_timeout=wait_timeout,
+                        fresh_seconds=fresh_seconds,
+                    )
+                except Exception as exc:
+                    if acc_id not in reported:
+                        _emit_log("warn", f"收信检查失败 [{account.get('name') or account.get('real_email') or acc_id}]: {str(exc)[:100]}")
+                        reported.add(acc_id)
+                    continue
+                label = account.get("name") or account.get("real_email") or acc_id
+                if status == "busy":
+                    still.append(account)
+                elif status == "auth_failed":
+                    if acc_id not in reported:
+                        _emit_log("warn", f"收信失效 [{label}]: 请重新设置收信密码")
+                        reported.add(acc_id)
+                elif status == "ok":
+                    reported.discard(acc_id)
+            pending = still
+            attempt += 1
+            if pending and not _shutdown_event.is_set():
+                _shutdown_event.wait(3)
+
+
 # ----- HTML -----
 UI_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -838,6 +1064,8 @@ textarea{width:100%;min-height:140px}
             <button class="btn btn-outline btn-sm" onclick="copyAll()" data-i18n="emails.copy_all">复制全部</button>
             <button class="btn btn-outline btn-sm" onclick="exportCSV()">CSV</button>
             <button class="btn btn-primary btn-sm" onclick="exportSelectedPickupTxt()" data-i18n="emails.export_txt">导出已选 TXT</button>
+            <input type="file" id="restoreTxtInput" accept=".txt,text/plain" style="display:none" onchange="handleRestoreTxtFile(this)">
+            <button class="btn btn-outline btn-sm" onclick="E('restoreTxtInput').click()" data-i18n="emails.restore_txt">从 TXT 恢复</button>
             <button class="btn btn-primary btn-sm" onclick="showCreateDrawer()" data-i18n="action.create_alias">创建邮箱</button>
           </div>
         </div>
@@ -854,6 +1082,7 @@ textarea{width:100%;min-height:140px}
             <div class="segmented" aria-label="每页数量" data-i18n-aria="pager.per_page_aria">
               <button type="button" data-page-size="20" onclick="setAliasPageSize(20)">20</button>
               <button type="button" data-page-size="50" class="active" onclick="setAliasPageSize(50)">50</button>
+              <button type="button" data-page-size="100" onclick="setAliasPageSize(100)">100</button>
             </div>
             <span class="hint" id="aliasPageInfo"></span>
             <button class="btn btn-outline btn-sm" id="btnAliasPrev" onclick="setAliasPage(aliasPage-1)" data-i18n="pager.prev">上一页</button>
@@ -902,6 +1131,15 @@ textarea{width:100%;min-height:140px}
           </div>
         </div>
         <div class="settings-section">
+          <h3 data-i18n="settings.mail_watch">收信监控</h3>
+          <p data-i18n="settings.mail_watch_desc">按设定间隔检查已设置收信密码的账号。平时用拉信结果判断是否正常；只有一段时间没拉过信，才单独检查。单独检查时会先拦住新的拉取，等手头这次拉完再查，查完立刻恢复。创建邮箱时也能查。密码失效会显示在账号页。</p>
+          <div class="toolbar">
+            <label data-i18n="settings.mail_watch_hours">间隔（小时）</label>
+            <input type="number" id="mailWatchHours" value="1" min="1" max="24" step="1">
+            <button class="btn btn-primary btn-sm" onclick="saveMailWatch()" data-i18n="settings.mail_watch_save">保存</button>
+          </div>
+        </div>
+        <div class="settings-section">
           <h3 data-i18n="settings.create">创建邮箱</h3>
           <p data-i18n="settings.create_desc">不同主账号最多 10 个并行；同一账号仍逐个创建，触发 Apple 临时限制时每次等待 1 分钟后自动续建。创建过程中可勾选账号暂停或停止：暂停会保留剩余数量，停止会取消剩余数量。</p>          <div id="batchAccCount" class="hint">0 个可用账号</div>
           <div class="chk-group" id="batchChkGroup"></div>
@@ -931,7 +1169,7 @@ textarea{width:100%;min-height:140px}
 </div>
 <div class="copy-toast" id="toast"></div>
 <script>var LANG_KEY='icloud-mail-lang';
-var I18N={zh:{'nav.accounts':'账号','nav.emails':'邮箱','nav.inbox':'收件箱','nav.settings':'设置','nav.batch':'任务','nav.logs':'日志','side.overview':'概况','side.ready':'可收信','side.foot':'先加账号，再创建邮箱，然后看信或导出。','social.group':'社交媒体','social.x':'X','social.telegram':'Telegram','action.refresh':'刷新','action.add_account':'添加账号','action.create_alias':'创建邮箱','empty.title':'先添加账号','empty.text':'导入 Cookie 后，就可以创建隐私邮箱。','stat.today':'今日新建','stat.task':'当前任务','stat.idle':'空闲','emails.title':'邮箱列表','emails.sync':'云端同步','emails.sync_title':'从云端同步标签和状态','emails.copy_all':'复制全部','emails.export_txt':'导出已选 TXT','filter.account':'筛选账号:','filter.all_accounts':'全部账号','filter.export':'导出状态筛选','pager.per_page':'每页','pager.per_page_aria':'每页数量','pager.prev':'上一页','pager.next':'下一页','emails.empty':'还没有邮箱。请先添加账号，再点击「创建邮箱」。','inbox.limit_title':'邮件数量','inbox.search_ph':'搜索隐私邮箱查件...','inbox.search_title':'搜索已有隐私邮箱，查询这个地址的邮件','inbox.clear_title':'清除查询，查看全部收件','inbox.force':'强制刷新','inbox.force_title':'跳过缓存重新拉取','inbox.search':'查件','inbox.search_btn_title':'查询指定邮箱的收件','inbox.all':'全部','inbox.all_title':'检查所有隐私邮箱的收件','inbox.set_pwd':'设置收信密码','inbox.setup_title':'收件前先完成设置','inbox.step1':'在「账号」里添加 Apple 账号','inbox.step2':'为账号设置收信密码','inbox.step3':'选择账号后即可看信','inbox.start_setup':'开始设置','settings.auto':'自动创建','settings.auto_desc':'北京时间 7:00 到 20:00，每隔 60 到 90 分钟给每个有效账号创建 3 到 5 个邮箱。正在批量创建的账号会自动跳过。开启后会记住，服务重启仍会继续。','settings.create':'创建邮箱','settings.create_desc':'不同主账号最多 10 个并行；同一账号仍逐个创建，触发 Apple 临时限制时每次等待 1 分钟后自动续建。创建过程中可勾选账号暂停或停止：暂停会保留剩余数量，停止会取消剩余数量。','settings.per_account':'每账号数量','settings.label':'标签','settings.label_ph':'可选','settings.start':'开始创建','settings.pause':'暂停','settings.stop':'停止','settings.logs':'任务与日志','settings.logs_desc':'创建、同步和限制解除都会出现在这里。','settings.clear_logs':'清屏','settings.logs_empty':'还没有新日志。创建、同步和限制解除会显示在这里。','settings.logs_cleared':'已清屏，新日志会继续显示。','task.creating':'正在创建邮箱','task.wait_round':'等待下一轮','task.idle':'任务空闲','task.creating_short':'创建中','task.wait_short':'等待下轮','task.stopped':'已停止','action.stop_auto':'停止自动创建','action.start_auto':'启动自动创建','task.wait_limit':'等待限制解除','status.login_ok':'登录有效','status.login_expired':'登录已过期，请重新导入 Cookie','status.mail_ready':'可以收信','status.mail_blocked':'还不能收信','name.unnamed':'未命名','usage.capacity':'邮箱容量','action.check_login':'检查登录','action.set_mail':'设置收信','action.delete':'删除','action.reimport':'重新导入','reimport.title':'重新导入 Cookie','reimport.submit':'重新导入','reimport.help':'为 {email} 粘贴新的 Cookie。账号、已创建邮箱和收信密码都会保留。','reimport.ok':'已更新 {email}','filter.all_accounts_n':'全部账号 ({n})','pickup.gen_fail':'取件链接生成失败: {err}','copy.empty':'没有可复制的内容','copy.fail':'复制失败，请手动复制','pickup.missing':'取件链接尚未生成','pickup.copied':'取件链接已复制','export.need_select':'请先勾选未导出的邮箱','export.fail':'导出失败: {err}','error.unknown':'未知错误','export.already':'所选邮箱均已导出，未重复生成文件','export.done':'已导出 {n} 条','export.restore_confirm':'确认将 {email} 恢复为未导出？','export.restore_fail':'恢复失败: {err}','export.restored':'已恢复为未导出','export.unexported_n':'未导出 {n}','export.exported_n':'已导出 {n}','export.all_n':'全部 {n}','emails.empty_filter':'当前筛选下没有邮箱','pickup.generating':'正在生成取件链接...','table.select_page':'全选本页','table.email':'邮箱地址','table.lookup':'查件','table.pickup':'取件链接','table.account':'所属账号','table.label':'标签','table.created':'创建时间','table.export':'导出状态','table.status':'邮箱状态','status.active':'可用','status.inactive':'停用','export.exported':'已导出','export.restore_title':'恢复后可再次导出','export.restore':'恢复','export.unexported':'未导出','lookup.this_alias':'只看这个隐私邮箱的邮件','pickup.copy':'复制链接','pickup.failed':'生成失败','batch.wait_apple':'等待 Apple 限制解除','batch.queued':'等待中','batch.running':'创建中','batch.done':'已完成','batch.partial':'部分成功','batch.limited':'Apple 已限制','batch.failed':'失败','batch.paused':'已暂停','batch.stopped':'已停止','batch.available_n':'{n} 个可用账号','batch.none':'没有可用账号，请先添加','batch.retry_note':'上次触发限制，本次会再试一次','batch.retry_soon':'即将继续','batch.retry_sec':'约 {n} 秒后继续','batch.retry_min':'约 {n} 分钟后继续','batch.accounts_done':'{done}/{total} 个账号完成','batch.ok_fail':'{created} 成功 / {errors} 失败','batch.creating':'正在创建...','batch.progress_fail':'获取进度失败: {err}','batch.complete_n':'创建完成: {n} 个成功','batch.none_created':'本次没有创建成功，请查看账号错误','batch.need_account':'请勾选至少一个账号','batch.starting':'正在启动...','batch.start_fail':'创建任务启动失败','batch.need_creating':'请选择正在创建或已暂停的账号','batch.paused_ok':'已暂停 {n} 个账号','batch.stopped_ok':'已停止 {n} 个账号','batch.control_fail':'操作失败','inbox.need_password':'这个账号还不能收信','inbox.need_password_text':'请先设置收信密码（Apple 的 App 专用密码），然后就可以查看邮件。','inbox.go_set_password':'去设置密码','inbox.choose_account':'请先选择账号','inbox.choose_account_text':'添加账号后，还要设置收信密码，才能在这里看信。','inbox.refetch':'正在重新拉取邮件...','inbox.connect_fail':'连接失败','inbox.title_n':'收件箱 ({n} 封)','inbox.title_loading':'收件箱 ({n} 封, 加载中...)','inbox.title_cut':'收件箱 ({n} 封, 连接中断)','inbox.fetching':'正在拉取邮件...','alias.no_match':'没有匹配的隐私邮箱','alias.none':'还没有隐私邮箱，请先创建','alias.shown_n':'已显示前 {n} 个，继续输入可缩小范围','alias.need_input':'请输入隐私邮箱地址','alias.querying':'正在查询 {alias} ...','alias.only':'仅显示 {alias}（{n} 封）','alias.empty':'{alias} 暂无收件','alias.checking':'正在检查各邮箱的收件...','alias.query_fail':'查询失败','alias.all_empty':'所有隐私邮箱暂无收件','mail.no_subject':'(无主题)','alias.summary':'共 {aliases} 个邮箱收到 {n} 封邮件','alias.count_n':'{alias} ({n} 封)','inbox.empty':'收件箱为空','mail.loading':'加载中...','mail.nobody':'(无法获取邮件正文)','mail.fetch_fail':'(获取失败: {err})','mail.unknown':'未知','mail.nobody2':'(无正文内容)','cache.ago':'缓存 {age} 前','cache.n':' | {n} 封已缓存 {txt}','pwd.change_title':'修改收信密码','pwd.set_title':'设置收信密码','pwd.account':'账号:','pwd.help_before':'在','pwd.help_after':'→ 登录与安全 → App 专用密码 生成。','pwd.reenter':' (重新输入以更新)','action.cancel':'取消','pwd.save':'保存并测试','pwd.need_email':'请输入 iCloud 邮箱','pwd.need_pwd':'请输入密码','pwd.testing':'测试中...','pwd.ok':'连接成功，收件箱 {n} 封','create.busy':'该账号正在创建，请稍候','create.ok':'成功创建 {n} 个','create.fail':'创建失败','status.login_ok_email':'登录有效: {email}','status.checking_login':'正在检查登录...','status.login_busy':'这个账号正在创建邮箱，登录还有效，创建结束后再检查','account.delete_confirm':'确认删除该账号？','account.deleted':'已删除','auto.stopped':'自动创建已停止','auto.started':'自动创建已启动','copy.one':'已复制: {email}','copy.n':'已复制 {n} 个','add.help_before':'Chrome 安装','add.help_mid':'，登录 icloud.com 后导出 Header String 粘贴即可。','add.help_json':'也支持 JSON：','add.download':'下载扩展','add.region':'区域','add.region_intl':'国际 (icloud.com)','add.region_cn':'中国 (icloud.com.cn)','add.name_ph':'账号名称，例如：主号','add.cookie_ph':'粘贴 Cookie，支持 Header String 或 JSON','add.unnamed':'未命名账号','add.need_cookie':'请粘贴 Cookie','add.checking':'正在检查登录...','add.ok':'已添加 {email}','sync.busy':'云端同步正在进行','sync.running':'同步中...','sync.fail':'云端同步失败: {err}','sync.partial':'同步完成，但有 {n} 个账号失败','sync.ok':'云端同步完成: {n} 个邮箱','inbox.select_account':'选择账号','inbox.ready':'可收信','inbox.no_pwd':'未设密码','api.timeout':'请求超时 ({n}s)','api.network':'网络错误','lang.zh':'中文','lang.en':'English','lang.group':'语言','pwd.icloud_email':'iCloud 邮箱','pwd.app_password':'App 专用密码'},en:{'nav.accounts':'Accounts','nav.emails':'Aliases','nav.inbox':'Inbox','nav.settings':'Settings','nav.batch':'Tasks','nav.logs':'Logs','side.overview':'Overview','side.ready':'Ready','side.foot':'Add an account, create aliases, then read or export mail.','social.group':'Social links','social.x':'X','social.telegram':'Telegram','action.refresh':'Refresh','action.add_account':'Add account','action.create_alias':'Create aliases','empty.title':'Add an account first','empty.text':'Import cookies, then you can create private aliases.','stat.today':'Created today','stat.task':'Current task','stat.idle':'Idle','emails.title':'Alias list','emails.sync':'Sync','emails.sync_title':'Sync labels and status from iCloud','emails.copy_all':'Copy all','emails.export_txt':'Export selected TXT','filter.account':'Account:','filter.all_accounts':'All accounts','filter.export':'Export status','pager.per_page':'Per page','pager.per_page_aria':'Rows per page','pager.prev':'Previous','pager.next':'Next','emails.empty':'No aliases yet. Add an account, then click Create aliases.','inbox.limit_title':'Message count','inbox.search_ph':'Search a private alias','inbox.search_title':'Search an existing alias to view its mail','inbox.clear_title':'Clear search and show full inbox','inbox.force':'Force refresh','inbox.force_title':'Fetch again and skip cache','inbox.search':'Lookup','inbox.search_btn_title':'Look up mail for this alias','inbox.all':'All','inbox.all_title':'Check mail for all aliases','inbox.set_pwd':'Set mail password','inbox.setup_title':'Finish setup before reading mail','inbox.step1':'Add an Apple account under Accounts','inbox.step2':'Set a mail password for the account','inbox.step3':'Choose an account to read mail','inbox.start_setup':'Start setup','settings.auto':'Auto create','settings.auto_desc':'From 07:00 to 20:00 Beijing time, every 60 to 90 minutes each valid account creates 3 to 5 aliases. Accounts already in a batch job are skipped. This stays on after restart.','settings.create':'Create aliases','settings.create_desc':'Up to 10 accounts run in parallel. The same account still creates one by one. If Apple rate-limits, it waits 1 minute and continues. During creation you can pause or stop selected accounts. Pause keeps the remaining count; stop cancels it.','settings.per_account':'Per account','settings.label':'Label','settings.label_ph':'Optional','settings.start':'Start','settings.pause':'Pause','settings.stop':'Stop','settings.logs':'Jobs and logs','settings.logs_desc':'Create, sync, and rate-limit events show up here.','settings.clear_logs':'Clear','settings.logs_empty':'No logs yet. Create, sync, and rate-limit events show up here.','settings.logs_cleared':'Cleared. New logs will show up here.','task.creating':'Creating aliases','task.wait_round':'Waiting for next round','task.idle':'Idle','task.creating_short':'Creating','task.wait_short':'Waiting','task.stopped':'Stopped','action.stop_auto':'Stop auto create','action.start_auto':'Start auto create','task.wait_limit':'Waiting to resume','status.login_ok':'Signed in','status.login_expired':'Sign-in expired. Import cookies again.','status.mail_ready':'Mail ready','status.mail_blocked':'Mail not ready','name.unnamed':'Untitled','usage.capacity':'Alias capacity','action.check_login':'Check sign-in','action.set_mail':'Set mail','action.delete':'Delete','action.reimport':'Re-import','reimport.title':'Re-import cookies','reimport.submit':'Re-import','reimport.help':'Paste new cookies for {email}. The account, aliases, and mail password stay.','reimport.ok':'Updated {email}','filter.all_accounts_n':'All accounts ({n})','pickup.gen_fail':'Could not create pickup links: {err}','copy.empty':'Nothing to copy','copy.fail':'Copy failed. Copy it manually.','pickup.missing':'Pickup link is not ready','pickup.copied':'Pickup link copied','export.need_select':'Select unexported aliases first','export.fail':'Export failed: {err}','error.unknown':'Unknown error','export.already':'Selected aliases were already exported','export.done':'Exported {n}','export.restore_confirm':'Restore {email} as not exported?','export.restore_fail':'Restore failed: {err}','export.restored':'Restored as not exported','export.unexported_n':'Not exported {n}','export.exported_n':'Exported {n}','export.all_n':'All {n}','emails.empty_filter':'No aliases in this filter','pickup.generating':'Creating pickup links...','table.select_page':'Select this page','table.email':'Alias','table.lookup':'Lookup','table.pickup':'Pickup link','table.account':'Account','table.label':'Label','table.created':'Created','table.export':'Export','table.status':'Status','status.active':'Active','status.inactive':'Inactive','export.exported':'Exported','export.restore_title':'Restore to export again','export.restore':'Restore','export.unexported':'Not exported','lookup.this_alias':'Show mail for this alias only','pickup.copy':'Copy link','pickup.failed':'Failed','batch.wait_apple':'Waiting for Apple limit to lift','batch.queued':'Waiting','batch.running':'Creating','batch.done':'Done','batch.partial':'Partial','batch.limited':'Apple limited','batch.failed':'Failed','batch.paused':'Paused','batch.stopped':'Stopped','batch.available_n':'{n} available accounts','batch.none':'No available accounts. Add one first.','batch.retry_note':'Rate-limited last time. This run will try again.','batch.retry_soon':'Continuing soon','batch.retry_sec':'In about {n}s','batch.retry_min':'In about {n} min','batch.accounts_done':'{done}/{total} accounts done','batch.ok_fail':'{created} created / {errors} failed','batch.creating':'Creating...','batch.progress_fail':'Could not load progress: {err}','batch.complete_n':'Created {n} aliases','batch.none_created':'Nothing was created. Check the account errors.','batch.need_account':'Select at least one account','batch.starting':'Starting...','batch.start_fail':'Could not start the create job','batch.need_creating':'Select accounts that are creating or paused','batch.paused_ok':'Paused {n} account(s)','batch.stopped_ok':'Stopped {n} account(s)','batch.control_fail':'Could not update the job','inbox.need_password':'This account cannot read mail yet','inbox.need_password_text':'Set an app-specific password first, then you can read mail.','inbox.go_set_password':'Set password','inbox.choose_account':'Choose an account first','inbox.choose_account_text':'After adding an account, set a mail password to read mail here.','inbox.refetch':'Fetching mail again...','inbox.connect_fail':'Connection failed','inbox.title_n':'Inbox ({n})','inbox.title_loading':'Inbox ({n}, loading...)','inbox.title_cut':'Inbox ({n}, disconnected)','inbox.fetching':'Fetching mail...','alias.no_match':'No matching private alias','alias.none':'No private aliases yet. Create some first.','alias.shown_n':'Showing first {n}. Type more to narrow results.','alias.need_input':'Enter a private alias','alias.querying':'Looking up {alias}...','alias.only':'Showing {alias} ({n})','alias.empty':'{alias} has no mail','alias.checking':'Checking mail for each alias...','alias.query_fail':'Lookup failed','alias.all_empty':'No mail on any private alias','mail.no_subject':'(No subject)','alias.summary':'{aliases} aliases received {n} messages','alias.count_n':'{alias} ({n})','inbox.empty':'Inbox is empty','mail.loading':'Loading...','mail.nobody':'(Could not load message body)','mail.fetch_fail':'(Failed: {err})','mail.unknown':'unknown','mail.nobody2':'(No message body)','cache.ago':'Cached {age} ago','cache.n':' | {n} cached {txt}','pwd.change_title':'Change mail password','pwd.set_title':'Set mail password','pwd.account':'Account:','pwd.help_before':'Create one at','pwd.help_after':'→ Sign-In and Security → App-Specific Passwords.','pwd.reenter':' (enter again to update)','action.cancel':'Cancel','pwd.save':'Save and test','pwd.need_email':'Enter an iCloud email','pwd.need_pwd':'Enter the password','pwd.testing':'Testing...','pwd.ok':'Connected. Inbox has {n} messages.','create.busy':'This account is already creating aliases','create.ok':'Created {n}','create.fail':'Create failed','status.login_ok_email':'Signed in: {email}','status.checking_login':'Checking sign-in...','status.login_busy':'This account is still creating aliases. Sign-in is still valid; check again when it finishes.','account.delete_confirm':'Delete this account?','account.deleted':'Deleted','auto.stopped':'Auto create stopped','auto.started':'Auto create started','copy.one':'Copied: {email}','copy.n':'Copied {n}','add.help_before':'In Chrome, install','add.help_mid':', sign in to icloud.com, export the Header String, then paste it here.','add.help_json':'JSON is also supported:','add.download':'Download extension','add.region':'Region','add.region_intl':'International (icloud.com)','add.region_cn':'China (icloud.com.cn)','add.name_ph':'Account name, e.g. Main','add.cookie_ph':'Paste cookies as Header String or JSON','add.unnamed':'Untitled account','add.need_cookie':'Paste cookies first','add.checking':'Checking sign-in...','add.ok':'Added {email}','sync.busy':'Sync already running','sync.running':'Syncing...','sync.fail':'iCloud sync failed: {err}','sync.partial':'Sync finished, but {n} account(s) failed','sync.ok':'Synced {n} aliases','inbox.select_account':'Choose account','inbox.ready':'Ready','inbox.no_pwd':'No password','api.timeout':'Request timed out ({n}s)','api.network':'Network error','lang.zh':'Chinese','lang.en':'English','lang.group':'Language','pwd.icloud_email':'iCloud email','pwd.app_password':'App-specific password'}};var lang=(function(){try{var v=localStorage.getItem(LANG_KEY);if(v==='en'||v==='zh')return v;}catch(_){}return 'zh';})();
+var I18N={zh:{'nav.accounts':'账号','nav.emails':'邮箱','nav.inbox':'收件箱','nav.settings':'设置','nav.batch':'任务','nav.logs':'日志','side.overview':'概况','side.ready':'可收信','side.foot':'先加账号，再创建邮箱，然后看信或导出。','social.group':'社交媒体','social.x':'X','social.telegram':'Telegram','action.refresh':'刷新','action.add_account':'添加账号','action.create_alias':'创建邮箱','empty.title':'先添加账号','empty.text':'导入 Cookie 后，就可以创建隐私邮箱。','stat.today':'今日新建','stat.task':'当前任务','stat.idle':'空闲','emails.title':'邮箱列表','emails.sync':'云端同步','emails.sync_title':'从云端同步标签和状态','emails.copy_all':'复制全部','emails.export_txt':'导出已选 TXT','emails.restore_txt':'从 TXT 恢复','filter.account':'筛选账号:','filter.all_accounts':'全部账号','filter.export':'导出状态筛选','pager.per_page':'每页','pager.per_page_aria':'每页数量','pager.prev':'上一页','pager.next':'下一页','emails.empty':'还没有邮箱。请先添加账号，再点击「创建邮箱」。','inbox.limit_title':'邮件数量','inbox.search_ph':'搜索隐私邮箱查件...','inbox.search_title':'搜索已有隐私邮箱，查询这个地址的邮件','inbox.clear_title':'清除查询，查看全部收件','inbox.force':'强制刷新','inbox.force_title':'跳过缓存重新拉取','inbox.search':'查件','inbox.search_btn_title':'查询指定邮箱的收件','inbox.all':'全部','inbox.all_title':'检查所有隐私邮箱的收件','inbox.set_pwd':'设置收信密码','inbox.setup_title':'收件前先完成设置','inbox.step1':'在「账号」里添加 Apple 账号','inbox.step2':'为账号设置收信密码','inbox.step3':'选择账号后即可看信','inbox.start_setup':'开始设置','settings.auto':'自动创建','settings.auto_desc':'北京时间 7:00 到 20:00，每隔 60 到 90 分钟给每个有效账号创建 3 到 5 个邮箱。正在批量创建的账号会自动跳过。开启后会记住，服务重启仍会继续。','settings.mail_watch':'收信监控','settings.mail_watch_desc':'按设定间隔检查已设置收信密码的账号。平时用拉信结果判断是否正常；只有一段时间没拉过信，才单独检查。单独检查时会先拦住新的拉取，等手头这次拉完再查，查完立刻恢复。创建邮箱时也能查。密码失效会显示在账号页。','settings.mail_watch_hours':'间隔（小时）','settings.mail_watch_save':'保存','settings.mail_watch_saved':'已保存：每 {n} 小时检查一次收信','settings.mail_watch_invalid':'间隔必须是 1 到 24 小时','status.mail_auth_failed':'收信失效，请重新设置收信密码','settings.create':'创建邮箱','settings.create_desc':'不同主账号最多 10 个并行；同一账号仍逐个创建，触发 Apple 临时限制时每次等待 1 分钟后自动续建。创建过程中可勾选账号暂停或停止：暂停会保留剩余数量，停止会取消剩余数量。','settings.per_account':'每账号数量','settings.label':'标签','settings.label_ph':'可选','settings.start':'开始创建','settings.pause':'暂停','settings.stop':'停止','settings.logs':'任务与日志','settings.logs_desc':'创建、同步和限制解除都会出现在这里。','settings.clear_logs':'清屏','settings.logs_empty':'还没有新日志。创建、同步和限制解除会显示在这里。','settings.logs_cleared':'已清屏，新日志会继续显示。','task.creating':'正在创建邮箱','task.wait_round':'等待下一轮','task.idle':'任务空闲','task.creating_short':'创建中','task.wait_short':'等待下轮','task.stopped':'已停止','action.stop_auto':'停止自动创建','action.start_auto':'启动自动创建','task.wait_limit':'等待限制解除','status.login_ok':'登录有效','status.login_expired':'登录已过期，请重新导入 Cookie','status.mail_ready':'可以收信','status.mail_blocked':'还不能收信','name.unnamed':'未命名','usage.capacity':'邮箱容量','action.check_login':'检查登录','action.set_mail':'设置收信','action.delete':'删除','action.reimport':'重新导入','reimport.title':'重新导入 Cookie','reimport.submit':'重新导入','reimport.help':'为 {email} 粘贴新的 Cookie。账号、已创建邮箱和收信密码都会保留。','reimport.ok':'已更新 {email}','filter.all_accounts_n':'全部账号 ({n})','pickup.gen_fail':'取件链接生成失败: {err}','copy.empty':'没有可复制的内容','copy.fail':'复制失败，请手动复制','pickup.missing':'取件链接尚未生成','pickup.copied':'取件链接已复制','export.need_select':'请先勾选未导出的邮箱','export.fail':'导出失败: {err}','error.unknown':'未知错误','export.already':'所选邮箱均已导出，未重复生成文件','export.done':'已导出 {n} 条','export.restore_confirm':'确认将 {email} 恢复为未导出？','export.restore_fail':'恢复失败: {err}','export.restored':'已恢复为未导出','export.restore_txt_empty':'文件里没有识别到邮箱','export.restore_txt_read_fail':'读取文件失败','export.restore_txt_confirm':'将恢复 {n} 个仍存在的已导出邮箱，跳过 {skip} 个（账号已删除或不在列表）。确定？','export.restore_txt_done':'已恢复 {n} 个，跳过 {skip} 个','export.restore_txt_none':'没有可恢复的邮箱（跳过 {skip} 个）','export.unexported_n':'未导出 {n}','export.exported_n':'已导出 {n}','export.all_n':'全部 {n}','emails.empty_filter':'当前筛选下没有邮箱','pickup.generating':'正在生成取件链接...','table.select_page':'全选本页','table.email':'邮箱地址','table.lookup':'查件','table.pickup':'取件链接','table.account':'所属账号','table.label':'标签','table.created':'创建时间','table.export':'导出状态','table.status':'邮箱状态','status.active':'可用','status.inactive':'停用','export.exported':'已导出','export.restore_title':'恢复后可再次导出','export.restore':'恢复','export.unexported':'未导出','lookup.this_alias':'只看这个隐私邮箱的邮件','pickup.copy':'复制链接','pickup.failed':'生成失败','batch.wait_apple':'等待 Apple 限制解除','batch.queued':'等待中','batch.running':'创建中','batch.done':'已完成','batch.partial':'部分成功','batch.limited':'Apple 已限制','batch.failed':'失败','batch.paused':'已暂停','batch.stopped':'已停止','batch.available_n':'{n} 个可用账号','batch.none':'没有可用账号，请先添加','batch.retry_note':'上次触发限制，本次会再试一次','batch.retry_soon':'即将继续','batch.retry_sec':'约 {n} 秒后继续','batch.retry_min':'约 {n} 分钟后继续','batch.accounts_done':'{done}/{total} 个账号完成','batch.ok_fail':'{created} 成功 / {errors} 失败','batch.creating':'正在创建...','batch.progress_fail':'获取进度失败: {err}','batch.complete_n':'创建完成: {n} 个成功','batch.none_created':'本次没有创建成功，请查看账号错误','batch.need_account':'请勾选至少一个账号','batch.starting':'正在启动...','batch.start_fail':'创建任务启动失败','batch.need_creating':'请选择正在创建或已暂停的账号','batch.paused_ok':'已暂停 {n} 个账号','batch.stopped_ok':'已停止 {n} 个账号','batch.control_fail':'操作失败','inbox.need_password':'这个账号还不能收信','inbox.need_password_text':'请先设置收信密码（Apple 的 App 专用密码），然后就可以查看邮件。','inbox.go_set_password':'去设置密码','inbox.choose_account':'请先选择账号','inbox.choose_account_text':'添加账号后，还要设置收信密码，才能在这里看信。','inbox.refetch':'正在重新拉取邮件...','inbox.connect_fail':'连接失败','inbox.title_n':'收件箱 ({n} 封)','inbox.title_loading':'收件箱 ({n} 封, 加载中...)','inbox.title_cut':'收件箱 ({n} 封, 连接中断)','inbox.fetching':'正在拉取邮件...','alias.no_match':'没有匹配的隐私邮箱','alias.none':'还没有隐私邮箱，请先创建','alias.shown_n':'已显示前 {n} 个，继续输入可缩小范围','alias.need_input':'请输入隐私邮箱地址','alias.querying':'正在查询 {alias} ...','alias.only':'仅显示 {alias}（{n} 封）','alias.empty':'{alias} 暂无收件','alias.checking':'正在检查各邮箱的收件...','alias.query_fail':'查询失败','alias.all_empty':'所有隐私邮箱暂无收件','mail.no_subject':'(无主题)','alias.summary':'共 {aliases} 个邮箱收到 {n} 封邮件','alias.count_n':'{alias} ({n} 封)','inbox.empty':'收件箱为空','mail.loading':'加载中...','mail.nobody':'(无法获取邮件正文)','mail.fetch_fail':'(获取失败: {err})','mail.unknown':'未知','mail.nobody2':'(无正文内容)','cache.ago':'缓存 {age} 前','cache.n':' | {n} 封已缓存 {txt}','pwd.change_title':'修改收信密码','pwd.set_title':'设置收信密码','pwd.account':'账号:','pwd.help_before':'在','pwd.help_after':'→ 登录与安全 → App 专用密码 生成。','pwd.reenter':' (重新输入以更新)','action.cancel':'取消','pwd.save':'保存并测试','pwd.need_email':'请输入 iCloud 邮箱','pwd.need_pwd':'请输入密码','pwd.testing':'测试中...','pwd.ok':'连接成功，收件箱 {n} 封','create.busy':'该账号正在创建，请稍候','create.ok':'成功创建 {n} 个','create.fail':'创建失败','status.login_ok_email':'登录有效: {email}','status.checking_login':'正在检查登录...','status.login_busy':'这个账号正在创建邮箱，登录还有效，创建结束后再检查','account.delete_confirm':'确认删除该账号？','account.deleted':'已删除','auto.stopped':'自动创建已停止','auto.started':'自动创建已启动','copy.one':'已复制: {email}','copy.n':'已复制 {n} 个','add.help_before':'Chrome 安装','add.help_mid':'，登录 icloud.com 后导出 Header String 粘贴即可。','add.help_json':'也支持 JSON：','add.download':'下载扩展','add.region':'区域','add.region_intl':'国际 (icloud.com)','add.region_cn':'中国 (icloud.com.cn)','add.name_ph':'账号名称，例如：主号','add.cookie_ph':'粘贴 Cookie，支持 Header String 或 JSON','add.unnamed':'未命名账号','add.need_cookie':'请粘贴 Cookie','add.checking':'正在检查登录...','add.ok':'已添加 {email}','sync.busy':'云端同步正在进行','sync.running':'同步中...','sync.fail':'云端同步失败: {err}','sync.partial':'同步完成，但有 {n} 个账号失败','sync.ok':'云端同步完成: {n} 个邮箱','inbox.select_account':'选择账号','inbox.ready':'可收信','inbox.no_pwd':'未设密码','api.timeout':'请求超时 ({n}s)','api.network':'网络错误','lang.zh':'中文','lang.en':'English','lang.group':'语言','pwd.icloud_email':'iCloud 邮箱','pwd.app_password':'App 专用密码'},en:{'nav.accounts':'Accounts','nav.emails':'Aliases','nav.inbox':'Inbox','nav.settings':'Settings','nav.batch':'Tasks','nav.logs':'Logs','side.overview':'Overview','side.ready':'Ready','side.foot':'Add an account, create aliases, then read or export mail.','social.group':'Social links','social.x':'X','social.telegram':'Telegram','action.refresh':'Refresh','action.add_account':'Add account','action.create_alias':'Create aliases','empty.title':'Add an account first','empty.text':'Import cookies, then you can create private aliases.','stat.today':'Created today','stat.task':'Current task','stat.idle':'Idle','emails.title':'Alias list','emails.sync':'Sync','emails.sync_title':'Sync labels and status from iCloud','emails.copy_all':'Copy all','emails.export_txt':'Export selected TXT','emails.restore_txt':'Restore from TXT','filter.account':'Account:','filter.all_accounts':'All accounts','filter.export':'Export status','pager.per_page':'Per page','pager.per_page_aria':'Rows per page','pager.prev':'Previous','pager.next':'Next','emails.empty':'No aliases yet. Add an account, then click Create aliases.','inbox.limit_title':'Message count','inbox.search_ph':'Search a private alias','inbox.search_title':'Search an existing alias to view its mail','inbox.clear_title':'Clear search and show full inbox','inbox.force':'Force refresh','inbox.force_title':'Fetch again and skip cache','inbox.search':'Lookup','inbox.search_btn_title':'Look up mail for this alias','inbox.all':'All','inbox.all_title':'Check mail for all aliases','inbox.set_pwd':'Set mail password','inbox.setup_title':'Finish setup before reading mail','inbox.step1':'Add an Apple account under Accounts','inbox.step2':'Set a mail password for the account','inbox.step3':'Choose an account to read mail','inbox.start_setup':'Start setup','settings.auto':'Auto create','settings.auto_desc':'From 07:00 to 20:00 Beijing time, every 60 to 90 minutes each valid account creates 3 to 5 aliases. Accounts already in a batch job are skipped. This stays on after restart.','settings.mail_watch':'Mail watch','settings.mail_watch_desc':'On your interval, recent mail fetches count as the health check. A separate login runs only if that account has not fetched mail for a while. New fetches wait during that login; the current fetch is allowed to finish. It still runs while aliases are being created. Failures show on the account card.','settings.mail_watch_hours':'Interval (hours)','settings.mail_watch_save':'Save','settings.mail_watch_saved':'Saved: check mail every {n} hour(s)','settings.mail_watch_invalid':'Interval must be 1 to 24 hours','status.mail_auth_failed':'Mail login failed. Set the mail password again','settings.create':'Create aliases','settings.create_desc':'Up to 10 accounts run in parallel. The same account still creates one by one. If Apple rate-limits, it waits 1 minute and continues. During creation you can pause or stop selected accounts. Pause keeps the remaining count; stop cancels it.','settings.per_account':'Per account','settings.label':'Label','settings.label_ph':'Optional','settings.start':'Start','settings.pause':'Pause','settings.stop':'Stop','settings.logs':'Jobs and logs','settings.logs_desc':'Create, sync, and rate-limit events show up here.','settings.clear_logs':'Clear','settings.logs_empty':'No logs yet. Create, sync, and rate-limit events show up here.','settings.logs_cleared':'Cleared. New logs will show up here.','task.creating':'Creating aliases','task.wait_round':'Waiting for next round','task.idle':'Idle','task.creating_short':'Creating','task.wait_short':'Waiting','task.stopped':'Stopped','action.stop_auto':'Stop auto create','action.start_auto':'Start auto create','task.wait_limit':'Waiting to resume','status.login_ok':'Signed in','status.login_expired':'Sign-in expired. Import cookies again.','status.mail_ready':'Mail ready','status.mail_blocked':'Mail not ready','name.unnamed':'Untitled','usage.capacity':'Alias capacity','action.check_login':'Check sign-in','action.set_mail':'Set mail','action.delete':'Delete','action.reimport':'Re-import','reimport.title':'Re-import cookies','reimport.submit':'Re-import','reimport.help':'Paste new cookies for {email}. The account, aliases, and mail password stay.','reimport.ok':'Updated {email}','filter.all_accounts_n':'All accounts ({n})','pickup.gen_fail':'Could not create pickup links: {err}','copy.empty':'Nothing to copy','copy.fail':'Copy failed. Copy it manually.','pickup.missing':'Pickup link is not ready','pickup.copied':'Pickup link copied','export.need_select':'Select unexported aliases first','export.fail':'Export failed: {err}','error.unknown':'Unknown error','export.already':'Selected aliases were already exported','export.done':'Exported {n}','export.restore_confirm':'Restore {email} as not exported?','export.restore_fail':'Restore failed: {err}','export.restored':'Restored as not exported','export.restore_txt_empty':'No emails found in the file','export.restore_txt_read_fail':'Failed to read the file','export.restore_txt_confirm':'Restore {n} exported aliases that still exist and skip {skip} (account gone or not in list)?','export.restore_txt_done':'Restored {n}, skipped {skip}','export.restore_txt_none':'Nothing to restore (skipped {skip})','export.unexported_n':'Not exported {n}','export.exported_n':'Exported {n}','export.all_n':'All {n}','emails.empty_filter':'No aliases in this filter','pickup.generating':'Creating pickup links...','table.select_page':'Select this page','table.email':'Alias','table.lookup':'Lookup','table.pickup':'Pickup link','table.account':'Account','table.label':'Label','table.created':'Created','table.export':'Export','table.status':'Status','status.active':'Active','status.inactive':'Inactive','export.exported':'Exported','export.restore_title':'Restore to export again','export.restore':'Restore','export.unexported':'Not exported','lookup.this_alias':'Show mail for this alias only','pickup.copy':'Copy link','pickup.failed':'Failed','batch.wait_apple':'Waiting for Apple limit to lift','batch.queued':'Waiting','batch.running':'Creating','batch.done':'Done','batch.partial':'Partial','batch.limited':'Apple limited','batch.failed':'Failed','batch.paused':'Paused','batch.stopped':'Stopped','batch.available_n':'{n} available accounts','batch.none':'No available accounts. Add one first.','batch.retry_note':'Rate-limited last time. This run will try again.','batch.retry_soon':'Continuing soon','batch.retry_sec':'In about {n}s','batch.retry_min':'In about {n} min','batch.accounts_done':'{done}/{total} accounts done','batch.ok_fail':'{created} created / {errors} failed','batch.creating':'Creating...','batch.progress_fail':'Could not load progress: {err}','batch.complete_n':'Created {n} aliases','batch.none_created':'Nothing was created. Check the account errors.','batch.need_account':'Select at least one account','batch.starting':'Starting...','batch.start_fail':'Could not start the create job','batch.need_creating':'Select accounts that are creating or paused','batch.paused_ok':'Paused {n} account(s)','batch.stopped_ok':'Stopped {n} account(s)','batch.control_fail':'Could not update the job','inbox.need_password':'This account cannot read mail yet','inbox.need_password_text':'Set an app-specific password first, then you can read mail.','inbox.go_set_password':'Set password','inbox.choose_account':'Choose an account first','inbox.choose_account_text':'After adding an account, set a mail password to read mail here.','inbox.refetch':'Fetching mail again...','inbox.connect_fail':'Connection failed','inbox.title_n':'Inbox ({n})','inbox.title_loading':'Inbox ({n}, loading...)','inbox.title_cut':'Inbox ({n}, disconnected)','inbox.fetching':'Fetching mail...','alias.no_match':'No matching private alias','alias.none':'No private aliases yet. Create some first.','alias.shown_n':'Showing first {n}. Type more to narrow results.','alias.need_input':'Enter a private alias','alias.querying':'Looking up {alias}...','alias.only':'Showing {alias} ({n})','alias.empty':'{alias} has no mail','alias.checking':'Checking mail for each alias...','alias.query_fail':'Lookup failed','alias.all_empty':'No mail on any private alias','mail.no_subject':'(No subject)','alias.summary':'{aliases} aliases received {n} messages','alias.count_n':'{alias} ({n})','inbox.empty':'Inbox is empty','mail.loading':'Loading...','mail.nobody':'(Could not load message body)','mail.fetch_fail':'(Failed: {err})','mail.unknown':'unknown','mail.nobody2':'(No message body)','cache.ago':'Cached {age} ago','cache.n':' | {n} cached {txt}','pwd.change_title':'Change mail password','pwd.set_title':'Set mail password','pwd.account':'Account:','pwd.help_before':'Create one at','pwd.help_after':'→ Sign-In and Security → App-Specific Passwords.','pwd.reenter':' (enter again to update)','action.cancel':'Cancel','pwd.save':'Save and test','pwd.need_email':'Enter an iCloud email','pwd.need_pwd':'Enter the password','pwd.testing':'Testing...','pwd.ok':'Connected. Inbox has {n} messages.','create.busy':'This account is already creating aliases','create.ok':'Created {n}','create.fail':'Create failed','status.login_ok_email':'Signed in: {email}','status.checking_login':'Checking sign-in...','status.login_busy':'This account is still creating aliases. Sign-in is still valid; check again when it finishes.','account.delete_confirm':'Delete this account?','account.deleted':'Deleted','auto.stopped':'Auto create stopped','auto.started':'Auto create started','copy.one':'Copied: {email}','copy.n':'Copied {n}','add.help_before':'In Chrome, install','add.help_mid':', sign in to icloud.com, export the Header String, then paste it here.','add.help_json':'JSON is also supported:','add.download':'Download extension','add.region':'Region','add.region_intl':'International (icloud.com)','add.region_cn':'China (icloud.com.cn)','add.name_ph':'Account name, e.g. Main','add.cookie_ph':'Paste cookies as Header String or JSON','add.unnamed':'Untitled account','add.need_cookie':'Paste cookies first','add.checking':'Checking sign-in...','add.ok':'Added {email}','sync.busy':'Sync already running','sync.running':'Syncing...','sync.fail':'iCloud sync failed: {err}','sync.partial':'Sync finished, but {n} account(s) failed','sync.ok':'Synced {n} aliases','inbox.select_account':'Choose account','inbox.ready':'Ready','inbox.no_pwd':'No password','api.timeout':'Request timed out ({n}s)','api.network':'Network error','lang.zh':'Chinese','lang.en':'English','lang.group':'Language','pwd.icloud_email':'iCloud email','pwd.app_password':'App-specific password'}};var lang=(function(){try{var v=localStorage.getItem(LANG_KEY);if(v==='en'||v==='zh')return v;}catch(_){}return 'zh';})();
 function t(key,vars){var dict=I18N[lang]||I18N.zh;var s=dict[key];if(s==null)s=(I18N.zh[key]!=null)?I18N.zh[key]:key;if(vars)Object.keys(vars).forEach(function(k){s=String(s).split('{'+k+'}').join(String(vars[k]));});return s;}
 function applyStaticI18n(){document.documentElement.lang=lang==='en'?'en':'zh-CN';document.querySelectorAll('[data-i18n]').forEach(function(el){el.textContent=t(el.getAttribute('data-i18n'));});document.querySelectorAll('[data-i18n-placeholder]').forEach(function(el){el.setAttribute('placeholder',t(el.getAttribute('data-i18n-placeholder')));});document.querySelectorAll('[data-i18n-title]').forEach(function(el){el.setAttribute('title',t(el.getAttribute('data-i18n-title')));});document.querySelectorAll('[data-i18n-aria]').forEach(function(el){el.setAttribute('aria-label',t(el.getAttribute('data-i18n-aria')));});document.querySelectorAll('.lang-switch [data-lang]').forEach(function(btn){btn.classList.toggle('active',btn.getAttribute('data-lang')===lang);});}
 function setLang(next){if(next!=='zh'&&next!=='en')return;if(next===lang)return;lang=next;try{localStorage.setItem(LANG_KEY,lang);}catch(_){}applyStaticI18n();if(E('tabTitle'))E('tabTitle').textContent=t('nav.'+curTab)||curTab;renderSidebar();updateEmptyState();if(curTab==='accounts')renderDashboard();if(curTab==='emails')renderAliasTable();if(curTab==='settings'){renderBatchPanel();renderLogs();}if(curTab==='inbox'){updateInboxAccountSelect();var aliasInput=E('aliasSearchInput');if(aliasInput&&aliasInput.value.trim())searchAliasMail();else refreshInbox();}}
@@ -1004,7 +1242,7 @@ function updateEmptyState(){
 }
 async function api(path,opts){var timeout=(opts||{}).timeout||60000;if(opts)delete opts.timeout;var ctrl=new AbortController();var t=setTimeout(function(){ctrl.abort()},timeout);try{var r=await fetch(path,Object.assign({signal:ctrl.signal},opts||{}));clearTimeout(t);return r.json();}catch(e){clearTimeout(t);var msg=(e.name==='AbortError')?t('api.timeout',{n:timeout/1000}):(e.message||t('api.network'));return{ok:false,error:msg};}}
 async function apiSlow(path,opts){return api(path,Object.assign({timeout:60000},opts||{}));}
-async function refreshAll(){if(_refreshBusy)return;_refreshBusy=true;try{var _a=api('/api/accounts'),_s=api('/api/state');var a=await _a,s=await _s;accounts=a.accounts||[];state=s;renderSidebar();renderDashboard();updateEmptyState();if(curTab==='emails'){await refreshEmails();renderAliasTable();}if(curTab==='settings')renderBatchPanel();await loadLogs();updateInboxAccountSelect();}finally{_refreshBusy=false;}}
+function fillMailWatch(){var n=parseInt((state&&state.mail_watch_hours)||1,10);if(!(n>=1&&n<=24))n=1;var input=E('mailWatchHours');if(input&&document.activeElement!==input)input.value=n;}async function saveMailWatch(){var n=parseInt(E('mailWatchHours').value,10);if(!(n>=1&&n<=24)){toast(t('settings.mail_watch_invalid'),true);return}var d=await api('/api/mail-watch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({interval_hours:n})});if(!d.ok){toast(d.error||t('error.unknown'),true);return}state.mail_watch_hours=d.interval_hours;fillMailWatch();toast(t('settings.mail_watch_saved',{n:d.interval_hours}));}async function refreshAll(){if(_refreshBusy)return;_refreshBusy=true;try{var _a=api('/api/accounts'),_s=api('/api/state');var a=await _a,s=await _s;accounts=a.accounts||[];state=s;renderSidebar();renderDashboard();updateEmptyState();if(curTab==='emails'){await refreshEmails();renderAliasTable();}if(curTab==='settings'){renderBatchPanel();fillMailWatch();}await loadLogs();updateInboxAccountSelect();}finally{_refreshBusy=false;}}
 async function refreshLight(){if(_refreshBusy)return;var s=await api('/api/state');state=s;renderSidebar();}
 async function refreshEmails(){var d=await api('/api/emails');emails=d.emails||[];pickupLinksByEmail={};emails.forEach(function(e){if(e.pickup_url)pickupLinksByEmail[String(e.email||'').toLowerCase()]=e.pickup_url;var acc=accounts.find(function(a){return a.id===e.account_id});e.account_name=acc?(acc.name||acc.real_email||''):(e.account_id||'');e.account_email=acc?(acc.real_email||''):'';});pickupLinksLoaded=true;E('emailCount').textContent=emails.length;updateEmailFilter();}
 
@@ -1036,7 +1274,7 @@ function renderDashboard(){
   c.innerHTML=accounts.map(function(a){
     var stCls=a.status==='active'?'ok':'err';
     var stText=a.status==='active'?t('status.login_ok'):(a.last_error||t('status.login_expired'));
-    var mailReady=a.has_app_password?t('status.mail_ready'):t('status.mail_blocked');
+    var mailCls='';var mailReady=t('status.mail_blocked');if(a.has_app_password){if(a.mail_status==='auth_failed'){mailReady=t('status.mail_auth_failed');mailCls=' style="color:var(--red)"';}else{mailReady=t('status.mail_ready');}}
     var email=a.real_email||'';
     var used=a.alias_total||0;
     var pct=Math.min(100, used*100/limit);
@@ -1050,7 +1288,7 @@ function renderDashboard(){
 }
 function updateEmailFilter(){var sel=E('aliasFilter');if(!sel)return;var old=sel.value;sel.innerHTML='<option value="all">'+t('filter.all_accounts_n',{n:emails.length})+'</option>';var byAcc={};emails.forEach(function(e){var ak=e.account_id||'?';byAcc[ak]=(byAcc[ak]||0)+1;});Object.keys(byAcc).forEach(function(ak){var acc=accounts.find(function(x){return x.id===ak});var label=acc?(acc.name||acc.real_email||ak):ak;sel.innerHTML+='<option value="'+escAttr(ak)+'">'+esc(label)+' ('+byAcc[ak]+')</option>';});sel.value=old||'all';}
 async function loadPickupLinks(){var d=await apiSlow('/api/pickup-links');if(d.error){toast(t('pickup.gen_fail',{err:d.error}),true);return}pickupLinksByEmail={};(d.links||[]).forEach(function(x){pickupLinksByEmail[String(x.email||'').toLowerCase()]=x.url});pickupLinksLoaded=true;}
-function setAliasPageSize(size){aliasPageSize=parseInt(size,10)||50;aliasPage=1;renderAliasTable();}
+function setAliasPageSize(size){size=parseInt(size,10);aliasPageSize=[20,50,100].indexOf(size)>=0?size:50;aliasPage=1;renderAliasTable();}
 function setAliasPage(page){aliasPage=parseInt(page,10)||1;if(aliasPage<1)aliasPage=1;renderAliasTable();}
 function updateAliasPager(total){var pages=Math.max(1,Math.ceil((total||0)/aliasPageSize));if(aliasPage>pages)aliasPage=pages;if(aliasPage<1)aliasPage=1;var start=total?((aliasPage-1)*aliasPageSize+1):0;var end=Math.min(aliasPage*aliasPageSize,total||0);var info=E('aliasPageInfo');if(info)info.textContent=total?(start+'-'+end+' / '+total):'0';var prev=E('btnAliasPrev'),next=E('btnAliasNext');if(prev)prev.disabled=aliasPage<=1||!total;if(next)next.disabled=aliasPage>=pages||!total;document.querySelectorAll('[data-page-size]').forEach(function(btn){btn.classList.toggle('active',String(aliasPageSize)===String(btn.dataset.pageSize));});}
 function setExportFilter(value){exportFilter=value;aliasPage=1;document.querySelectorAll('[data-export-filter]').forEach(function(btn){btn.classList.toggle('active',btn.dataset.exportFilter===value)});renderAliasTable();}
@@ -1063,6 +1301,9 @@ function formatBeijingTime(value){if(!value)return '--';var raw=String(value).tr
 function formatExportTime(value){if(!value)return '--';try{return new Date(value).toLocaleString('zh-CN',{hour12:false})}catch(_){return value}}
 async function exportSelectedPickupTxt(){var selected=emails.filter(function(e){return !e.exported&&pickupSelected[String(e.email||'').toLowerCase()]}).map(function(e){return e.email});if(!selected.length){toast(t('export.need_select'),true);return}var d=await apiSlow('/api/pickup-links/export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({emails:selected})});if(!d.ok){toast(t('export.fail',{err:d.error||t('error.unknown')}),true);return}if(!(d.lines||[]).length){toast(t('export.already'),true);await refreshEmails();renderAliasTable();return}var b=new Blob(['\uFEFF'+d.lines.join('\n')],{type:'text/plain;charset=utf-8'}),a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='icloud_mail_pickup_links_'+new Date().toISOString().slice(0,10)+'.txt';a.click();setTimeout(function(){URL.revokeObjectURL(a.href)},1000);selected.forEach(function(email){delete pickupSelected[String(email).toLowerCase()]});await refreshEmails();renderAliasTable();toast(t('export.done',{n:d.count}));}
 async function restoreExportedEmail(email){if(!confirm(t('export.restore_confirm',{email:email})))return;var d=await api('/api/export-history/restore',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({emails:[email]})});if(!d.ok){toast(t('export.restore_fail',{err:d.error||t('error.unknown')}),true);return}await refreshEmails();renderAliasTable();toast(t('export.restored'));}
+function parseExportTxt(text){var out=[],seen={};String(text||'').replace(/^\uFEFF/,'').split(/\r\n|\n|\r/).forEach(function(line){line=String(line||'').trim();if(!line)return;var left=line;var cut=line.indexOf('----');if(cut>=0)left=line.slice(0,cut);else if(line.indexOf('\t')>=0)left=line.split('\t')[0];var m=String(left).match(/[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}/i);if(!m)m=line.match(/[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}/i);if(!m)return;var key=m[0].toLowerCase();if(seen[key])return;seen[key]=1;out.push(key);});return out;}
+async function handleRestoreTxtFile(input){var file=input&&input.files&&input.files[0];if(input)input.value='';if(!file)return;var text='';try{text=await file.text()}catch(_){toast(t('export.restore_txt_read_fail'),true);return}var parsed=parseExportTxt(text);if(!parsed.length){toast(t('export.restore_txt_empty'),true);return}var live={};emails.forEach(function(e){live[String(e.email||'').toLowerCase()]=e});var toRestore=[],missing=0,notExported=0;parsed.forEach(function(key){var item=live[key];if(!item)missing++;else if(!item.exported)notExported++;else toRestore.push(key)});var skip=missing+notExported;if(!toRestore.length){toast(t('export.restore_txt_none',{skip:skip}),true);return}if(!confirm(t('export.restore_txt_confirm',{n:toRestore.length,skip:skip})))return;var d=await apiSlow('/api/export-history/restore',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({emails:toRestore})});if(!d.ok){toast(t('export.restore_fail',{err:d.error||t('error.unknown')}),true);return}await refreshEmails();renderAliasTable();var restored=d.count||0;var skipped=d.skipped!=null?d.skipped:skip;toast(t('export.restore_txt_done',{n:restored,skip:skipped}));}
+
 function renderAliasTable(){updateEmailFilter();var filtered=visibleAliases();var exportedCount=emails.filter(function(e){return e.exported}).length;var unexportedCount=emails.length-exportedCount;E('exportCountUnexported').textContent=t('export.unexported_n',{n:unexportedCount});E('exportCountExported').textContent=t('export.exported_n',{n:exportedCount});E('exportCountAll').textContent=t('export.all_n',{n:emails.length});E('emailCount').textContent=filtered.length+' / '+emails.length;updateAliasPager(filtered.length);var c=E('aliasTableContainer');if(!filtered.length){c.innerHTML='<div class="empty"><div class="icon"></div>'+(emails.length?t('emails.empty_filter'):t('emails.empty'))+'</div>';return;}if(!pickupLinksLoaded){c.innerHTML='<div class="empty">'+t('pickup.generating')+'</div>';loadPickupLinks().then(renderAliasTable);return;}var start=(aliasPage-1)*aliasPageSize;var pageItems=filtered.slice(start,start+aliasPageSize);var pages=Math.max(1,Math.ceil(filtered.length/aliasPageSize));var h='<table class="email-table"><thead><tr><th style="width:42px"><input type="checkbox" title="'+escAttr(t('table.select_page'))+'" onclick="toggleAllPickup()"></th><th>#</th><th>'+t('table.email')+'</th><th>'+t('table.lookup')+'</th><th>'+t('table.pickup')+'</th><th>'+t('table.account')+'</th><th>'+t('table.label')+'</th><th>'+t('table.created')+'</th><th>'+t('table.export')+'</th><th>'+t('table.status')+'</th></tr></thead><tbody>';pageItems.forEach(function(e,i){var key=String(e.email||'').toLowerCase();var url=pickupLinksByEmail[key]||'';var checked=pickupSelected[key]&&!e.exported?' checked':'';var disabled=e.exported?' disabled':'';var accName=e.account_name||e.account_email||e.account_id||'--';var activeHtml=e.hasOwnProperty('active')?(e.active?'<span style="color:var(--green)">'+t('status.active')+'</span>':'<span style="color:var(--red)">'+t('status.inactive')+'</span>'):'<span style="color:var(--muted)">--</span>';var exportHtml=e.exported?'<span style="color:var(--green)">'+t('export.exported')+'</span><div class="hint">'+esc(formatExportTime(e.exported_at))+'</div><button class="copy-btn" onclick="restoreExportedEmail(\''+escAttr(e.email||'')+'\')" title="'+escAttr(t('export.restore_title'))+'">'+t('export.restore')+'</button>':'<span style="color:var(--muted)">'+t('export.unexported')+'</span>';h+='<tr><td><input class="pickup-check" type="checkbox" data-email="'+escAttr(e.email||'')+'"'+checked+disabled+' onchange="togglePickupSelected(this.dataset.email,this.checked)"></td><td class="hint">'+(start+i+1)+'</td><td class="mono">'+esc(e.email||'')+'</td><td class="pickup-cell"><button class="copy-btn" onclick="openAliasInbox(\''+escAttr(e.email||'')+'\',\''+escAttr(e.account_id||'')+'\')" title="'+escAttr(t('lookup.this_alias'))+'">'+t('table.lookup')+'</button></td><td class="pickup-cell">'+(url?'<button class="copy-btn" onclick="copyPickup(\''+escAttr(url)+'\')" title="'+escAttr(url)+'">'+t('pickup.copy')+'</button>':'<span class="hint">'+t('pickup.failed')+'</span>')+'</td><td>'+esc(accName)+'</td><td class="hint">'+esc((e.label||'').substring(0,30))+'</td><td style="white-space:nowrap">'+esc(formatExportTime(e.created_at))+'</td><td>'+exportHtml+'</td><td>'+activeHtml+'</td></tr>';});h+='</tbody></table>';h+='<div class="pager pager-bottom"><span class="hint">'+(start+1)+'-'+(start+pageItems.length)+' / '+filtered.length+'</span><button class="btn btn-outline btn-sm" onclick="setAliasPage(aliasPage-1)"'+(aliasPage<=1?' disabled':'')+'>'+t('pager.prev')+'</button><button class="btn btn-outline btn-sm" onclick="setAliasPage(aliasPage+1)"'+(aliasPage>=pages?' disabled':'')+'>'+t('pager.next')+'</button></div>';c.innerHTML=h;}
 function batchStatusText(status){var labels={waiting:t('batch.wait_apple'),queued:t('batch.queued'),running:t('batch.running'),paused:t('batch.paused'),stopped:t('batch.stopped'),completed:t('batch.done'),partial:t('batch.partial'),limited:t('batch.limited'),failed:t('batch.failed')};return labels[status]||status||'--';}
 function renderBatchPanel(){var activeAccs=accounts.filter(function(a){return a.status==='active'});E('batchAccCount').textContent=t('batch.available_n',{n:activeAccs.length});var g=E('batchChkGroup');if(!activeAccs.length){g.innerHTML='<span class="hint">'+t('batch.none')+'</span>';updateCreateControlButtons();}else{var busy=batchBusyAccountIds(batchJob);var paused=batchPausedAccountIds(batchJob);g.innerHTML=activeAccs.map(function(a){var email=a.real_email||a.name||a.id;var limited=a.create_status==='limited';var isBusy=!!busy[a.id];var isPaused=!!paused[a.id];var note=limited?'<span style="color:var(--red);font-size:12px">'+t('batch.retry_note')+'</span>':(isPaused?'<span style="color:var(--ink-faint);font-size:12px">'+t('batch.paused')+'</span>':(isBusy?'<span style="color:var(--ink-faint);font-size:12px">'+t('batch.running')+'</span>':''));var selected=!pendingBatchAccountId||pendingBatchAccountId===a.id;return'<label class="chk-item"><input type="checkbox" value="'+escAttr(a.id)+'"'+(selected?' checked':'')+'><span><strong>'+esc(a.name||email.substring(0,20))+'</strong> '+note+'</span></label>';}).join('');document.querySelectorAll('#batchChkGroup input').forEach(function(box){box.addEventListener('change',updateCreateControlButtons);});updateCreateControlButtons();}pendingBatchAccountId=null;if(batchJob)renderBatchJob(batchJob);else loadCurrentBatchJob();}
@@ -1183,6 +1424,7 @@ def api_state():
         state["cookies_ok"] = summary["active_accounts"] > 0
         state["alias_count"] = summary["total_aliases"]
         state["alias_active"] = summary["total_active_aliases"]
+        state["mail_watch_hours"] = _load_mail_watch_hours()
     return jsonify(state)
 
 @app.route("/api/accounts")
@@ -1378,6 +1620,7 @@ def _purge_account_data(acc_id):
     _pickup_body_store.delete_account(acc_id)
     with _pickup_refresh_lock:
         _pickup_refreshing_accounts.discard(acc_id)
+        _mail_watch_hold_accounts.discard(acc_id)
         _pickup_last_account_refresh.pop(acc_id, None)
         _pickup_refresh_errors.pop(acc_id, None)
         _pickup_error_log_state.pop(acc_id, None)
@@ -2198,7 +2441,12 @@ def api_set_app_password(acc_id):
             return jsonify(result), 400
         _account_mgr._drop_mail_client(acc_id)
         _account_mgr.update_account(
-            acc_id, app_password=pwd, icloud_email=target_email
+            acc_id,
+            app_password=pwd,
+            icloud_email=target_email,
+            mail_status="ok",
+            mail_last_error=None,
+            mail_last_checked=datetime.now().isoformat(),
         )
         return jsonify(result)
     except Exception as e:
@@ -2210,9 +2458,12 @@ def api_inbox(acc_id):
     force = request.args.get("force","0")=="1"
     try:
         emails = _account_mgr.check_inbox(acc_id, limit=limit, force=force)
+        _apply_mail_watch_result(acc_id, True)
         stats = _account_mgr._cache.get_stats(acc_id)
         return jsonify({"emails":emails,"count":len(emails),"cached":stats})
-    except Exception as e: return jsonify({"emails":[],"count":0,"error":str(e)})
+    except Exception as e:
+        _apply_mail_watch_result(acc_id, False, str(e))
+        return jsonify({"emails":[],"count":0,"error":str(e)})
 
 @app.route("/api/accounts/<acc_id>/inbox-stream")
 def api_inbox_stream(acc_id):
@@ -2220,16 +2471,24 @@ def api_inbox_stream(acc_id):
     days = request.args.get("days",7,type=int)
     def generate():
         yield f"data: {json.dumps({'type':'start'})}\n\n"
-        try: mail = _account_mgr.get_mail_client(acc_id)
-        except Exception as e: yield f"data: {json.dumps({'type':'error','error':str(e)[:200]})}\n\n"; return
+        try:
+            mail = _account_mgr.get_mail_client(acc_id)
+        except Exception as e:
+            _apply_mail_watch_result(acc_id, False, str(e))
+            yield f"data: {json.dumps({'type':'error','error':str(e)[:200]})}\n\n"
+            return
         try:
             count = 0
             for msg in mail.stream_inbox(limit=limit, days=days):
                 count += 1
                 yield f"data: {json.dumps({'type':'email','count':count,'email':msg},ensure_ascii=False)}\n\n"
+            _apply_mail_watch_result(acc_id, True)
             yield f"data: {json.dumps({'type':'done','count':count})}\n\n"
-        except GeneratorExit: pass
-        except Exception as e: yield f"data: {json.dumps({'type':'error','error':str(e)[:200]})}\n\n"
+        except GeneratorExit:
+            pass
+        except Exception as e:
+            _apply_mail_watch_result(acc_id, False, str(e))
+            yield f"data: {json.dumps({'type':'error','error':str(e)[:200]})}\n\n"
         finally:
             try: mail.disconnect()
             except: pass
@@ -2367,14 +2626,78 @@ def api_export_pickup_links():
         "missing": max(0, len(set(map(str, requested))) - len(selected)),
     })
 
+
+def _live_alias_emails():
+    live_accounts = {str(acc_id) for acc_id in getattr(_account_mgr, "accounts", {})}
+    live = set()
+    try:
+        items = _pickup_store.list_all() or []
+    except Exception:
+        items = []
+    for item in items:
+        email = str((item or {}).get("alias_email") or "").strip().lower()
+        acc_id = str((item or {}).get("account_id") or "")
+        if email and "@" in email and acc_id in live_accounts:
+            live.add(email)
+    latest = RESULTS_DIR / "latest_emails.txt"
+    if latest.exists():
+        for line in latest.read_text(encoding="utf-8").splitlines():
+            parts = line.split("\t")
+            email = parts[0].strip().lower() if parts else ""
+            acc_id = parts[1].strip() if len(parts) > 1 else ""
+            if email and "@" in email and acc_id in live_accounts:
+                live.add(email)
+    return live
+
+
 @app.route("/api/export-history/restore", methods=["POST"])
 def api_restore_export_history():
     data = request.get_json(silent=True) or {}
-    emails = data.get("emails") or []
-    if not isinstance(emails, list) or not emails:
-        return jsonify({"ok": False, "error": "请选择要恢复的邮箱"}), 400
-    restored = _export_store.restore(emails)
-    return jsonify({"ok": True, "restored": restored, "count": len(restored)})
+    raw_emails = data.get("emails") or []
+    text = data.get("text") or ""
+    if text and not isinstance(text, str):
+        return jsonify({"ok": False, "error": "文件内容无效"}), 400
+    if isinstance(text, str) and len(text) > 2 * 1024 * 1024:
+        return jsonify({"ok": False, "error": "文件过大"}), 400
+    if isinstance(raw_emails, list) and raw_emails:
+        requested = [str(item or "") for item in raw_emails]
+    elif text:
+        requested = parse_export_txt(text)
+    else:
+        requested = []
+    if not requested:
+        return jsonify({"ok": False, "error": "请选择要恢复的邮箱或上传导出的 TXT"}), 400
+    if len(requested) > 5000:
+        return jsonify({"ok": False, "error": "一次最多恢复 5000 个邮箱"}), 400
+
+    unique = []
+    seen = set()
+    for item in requested:
+        key = str(item or "").strip().lower()
+        if not key or "@" not in key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(key)
+    if not unique:
+        return jsonify({"ok": False, "error": "文件里没有识别到邮箱"}), 400
+
+    live = _live_alias_emails()
+    skipped_missing = [email for email in unique if email not in live]
+    existing = [email for email in unique if email in live]
+    status = _export_store.status_map(existing)
+    skipped_not_exported = [email for email in existing if email not in status]
+    to_restore = [email for email in existing if email in status]
+    restored = _export_store.restore(to_restore)
+    return jsonify({
+        "ok": True,
+        "restored": restored,
+        "count": len(restored),
+        "parsed": len(unique),
+        "skipped_missing": skipped_missing,
+        "skipped_not_exported": skipped_not_exported,
+        "skipped": len(skipped_missing) + len(skipped_not_exported),
+    })
+
 
 @app.route("/pickup/<token>")
 def pickup_page(token):
@@ -2478,6 +2801,7 @@ def _refresh_pickup_account(account_id):
         with _pickup_refresh_lock:
             _pickup_refresh_errors.pop(account_id, None)
             _pickup_error_log_state.pop(account_id, None)
+        _apply_mail_watch_result(account_id, True)
     except Exception as e:
         now = time.time()
         error_text = str(e)[:160]
@@ -2489,6 +2813,7 @@ def _refresh_pickup_account(account_id):
                 _pickup_error_log_state[account_id] = (error_text, now)
         if should_log:
             _emit_log("warn", f"取件同步失败 [{account_id}]: {error_text[:100]}")
+        _apply_mail_watch_result(account_id, False, error_text)
     finally:
         with _pickup_refresh_lock:
             _pickup_refreshing_accounts.discard(account_id)
@@ -2500,6 +2825,8 @@ def _schedule_pickup_account_refresh(account_id):
     now = time.time()
     with _pickup_refresh_lock:
         if account_id in _removed_account_ids:
+            return False
+        if account_id in _mail_watch_hold_accounts:
             return False
         if account_id in _pickup_refreshing_accounts:
             return True
@@ -2635,6 +2962,8 @@ def pickup_message(token, msg_id):
         return jsonify({"ready": True, "message": persisted_body}), 200, {"Cache-Control": "no-store"}
 
     with _pickup_refresh_lock:
+        if account_id in _mail_watch_hold_accounts:
+            return jsonify({"ready": False, "refreshing": True}), 202, {"Cache-Control": "no-store"}
         refreshing = key in _pickup_body_refreshing
         if not refreshing and _pickup_pending < _PICKUP_MAX_PENDING:
             _pickup_body_refreshing.add(key)
@@ -2694,6 +3023,15 @@ def api_emails():
         "exported_count": exported_count,
         "unexported_count": len(emails) - exported_count,
     })
+
+@app.route("/api/mail-watch", methods=["GET", "POST"])
+def api_mail_watch():
+    if request.method == "GET":
+        return jsonify({"ok": True, "interval_hours": _load_mail_watch_hours()})
+    data = request.get_json(silent=True) or {}
+    hours = _save_mail_watch_hours(data.get("interval_hours"))
+    _emit_log("info", f"收信监控间隔已设为 {hours} 小时")
+    return jsonify({"ok": True, "interval_hours": hours})
 
 @app.route("/api/scheduler/start", methods=["POST"])
 def api_scheduler_start():
@@ -2765,6 +3103,7 @@ def main():
         offset = _sync_time()
         if abs(offset)>0.5: print(f"[*] Time sync: offset {offset:.1f}s")
     threading.Thread(target=_health_loop, daemon=True).start()
+    threading.Thread(target=_mail_watch_loop, daemon=True).start()
     accounts = _account_mgr.list_accounts()
     if accounts:
         print(f"[+] {len(accounts)} account(s) loaded")
