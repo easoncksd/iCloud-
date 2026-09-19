@@ -1959,7 +1959,11 @@ def _sync_creation_journal(job, acc_id):
         return
     completed = guard.task_count(job["id"], acc_id)
     with _batch_lock:
-        entry = job["accounts"][acc_id]
+        entry = (job.get("accounts") or {}).get(acc_id)
+        if entry is None:
+            # A stale task can outlive an account or a partially written state
+            # file.  Do not let reconciliation crash the whole batch runner.
+            return
         if "journal_base_created" not in entry:
             entry["journal_base_created"] = max(0, int(entry.get("created", 0)) - completed)
         entry["created"] = max(int(entry.get("created", 0)), entry["journal_base_created"] + completed)
@@ -1971,7 +1975,10 @@ def _create_account_with_cooldown(job, acc_id, count, label, name):
     """Create the remaining aliases, pausing after Apple's temporary throttle."""
     successful = []
     with _batch_lock:
-        already_created = int(job["accounts"][acc_id].get("created", 0) or 0)
+        entry = (job.get("accounts") or {}).get(acc_id)
+        if entry is None:
+            return [{"ok": False, "error": "批量任务缺少账号状态记录", "limited": False}]
+        already_created = int(entry.get("created", 0) or 0)
     progress_created = 0
 
     def record_progress(_result):
@@ -2027,7 +2034,9 @@ def _create_account_with_cooldown(job, acc_id, count, label, name):
                     f"[{name}] 仍在向 Apple 申请，已等待 {waited} 秒，剩余 {remaining} 个",
                 )
                 with _batch_lock:
-                    entry = job["accounts"][acc_id]
+                    entry = (job.get("accounts") or {}).get(acc_id)
+                    if entry is None:
+                        return
                     entry["error"] = f"正在向 Apple 申请，已等待 {waited} 秒"
                     job["updated_at"] = datetime.now(_BJ_TZ).isoformat()
                     _save_batch_state_locked()
@@ -2062,7 +2071,9 @@ def _create_account_with_cooldown(job, acc_id, count, label, name):
         remaining_after_limit = count - already_created - len(successful)
 
         with _batch_lock:
-            entry = job["accounts"][acc_id]
+            entry = (job.get("accounts") or {}).get(acc_id)
+            if entry is None:
+                return successful + [{"ok": False, "error": "批量任务缺少账号状态记录", "limited": False}]
             previous_retries = int(entry.get("retry_count", 0) or 0)
             retry_delay = float(errors[0].get("retry_after_seconds", _BATCH_RETRY_DELAY_SECONDS))
             retry_at = datetime.now(_BJ_TZ) + timedelta(seconds=retry_delay)
@@ -2089,7 +2100,9 @@ def _create_account_with_cooldown(job, acc_id, count, label, name):
             if _shutdown_event.is_set():
                 raise _BatchInterrupted()
         with _batch_lock:
-            entry = job["accounts"][acc_id]
+            entry = (job.get("accounts") or {}).get(acc_id)
+            if entry is None:
+                return successful + [{"ok": False, "error": "批量任务缺少账号状态记录", "limited": False}]
             entry["status"] = "running"
             entry["retry_at"] = None
             entry["error"] = ""
@@ -2107,7 +2120,9 @@ def _run_batch_account(job, acc_id, count, label):
     name = (account or {}).get("name") or acc_id
     skip = None
     with _batch_lock:
-        entry = job["accounts"][acc_id]
+        entry = (job.get("accounts") or {}).get(acc_id)
+        if entry is None:
+            return job.get("completed_accounts", 0)
         previous_created = int(entry.get("created", 0) or 0)
         action = _account_control_action(acc_id)
         if entry.get("status") == "paused" or action == "pause":
@@ -2135,8 +2150,10 @@ def _run_batch_account(job, acc_id, count, label):
     except _BatchAccountPaused:
         created = previous_created
         with _batch_lock:
-            created = int(job["accounts"][acc_id].get("created", 0) or 0)
-            entry = job["accounts"][acc_id]
+            entry = (job.get("accounts") or {}).get(acc_id)
+            if entry is None:
+                return job.get("completed_accounts", 0)
+            created = int(entry.get("created", 0) or 0)
             entry.update({
                 "status": "paused",
                 "created": created,
@@ -2155,8 +2172,10 @@ def _run_batch_account(job, acc_id, count, label):
     except _BatchAccountStopped:
         created = previous_created
         with _batch_lock:
-            created = int(job["accounts"][acc_id].get("created", 0) or 0)
-            entry = job["accounts"][acc_id]
+            entry = (job.get("accounts") or {}).get(acc_id)
+            if entry is None:
+                return job.get("completed_accounts", 0)
+            created = int(entry.get("created", 0) or 0)
             entry.update({
                 "status": "stopped",
                 "created": created,
@@ -2182,7 +2201,12 @@ def _run_batch_account(job, acc_id, count, label):
         results = [{"ok": False, "error": str(exc)[:200], "limited": False}]
 
     _sync_creation_journal(job, acc_id)
-    created = max(int(job["accounts"][acc_id].get("created", 0)),
+    with _batch_lock:
+        entry = (job.get("accounts") or {}).get(acc_id)
+        if entry is None:
+            return job.get("completed_accounts", 0)
+        previous_entry_created = int(entry.get("created", 0) or 0)
+    created = max(previous_entry_created,
                   previous_created + sum(1 for result in results if result.get("ok")))
     errors = [result for result in results if not result.get("ok")]
     limited = any(result.get("limited") for result in errors)
@@ -2226,13 +2250,41 @@ def _run_batch_account(job, acc_id, count, label):
     return completed_accounts
 
 
+def _mark_batch_account_failed(job, acc_id, error):
+    """Record an unexpected worker failure without aborting other accounts."""
+    with _batch_lock:
+        entry = (job.get("accounts") or {}).get(acc_id)
+        if entry is None:
+            return job.get("completed_accounts", 0)
+        entry.update({
+            "status": "failed",
+            "errors": int(entry.get("errors", 0) or 0) + 1,
+            "error": str(error)[:200],
+            "retry_at": None,
+            "finished_at": datetime.now(_BJ_TZ).isoformat(),
+        })
+        job["completed_accounts"] = sum(
+            1 for item in (job.get("accounts") or {}).values()
+            if item.get("finished_at")
+        )
+        job["total_errors"] = sum(
+            int(item.get("errors", 0) or 0)
+            for item in (job.get("accounts") or {}).values()
+        )
+        job["updated_at"] = datetime.now(_BJ_TZ).isoformat()
+        _save_batch_state_locked()
+        return job["completed_accounts"]
+
+
 def _run_batch_job(job_id):
     global _batch_active_id
     with _batch_lock:
         if job_id in _batch_runner_jobs:
             return
+        job = _batch_jobs.get(job_id)
+        if not job:
+            return
         _batch_runner_jobs.add(job_id)
-        job = _batch_jobs[job_id]
         job["status"] = "running"
         job["started_at"] = job.get("started_at") or datetime.now(_BJ_TZ).isoformat()
         _save_batch_state_locked()
@@ -2256,7 +2308,10 @@ def _run_batch_job(job_id):
                 with _batch_lock:
                     if _shutdown_event.is_set():
                         raise _BatchInterrupted()
-                    job = _batch_jobs[job_id]
+                    current_job = _batch_jobs.get(job_id)
+                    if not current_job:
+                        raise _BatchInterrupted()
+                    job = current_job
                     label = job.get("label") or ""
                     pending = _pending_batch_account_ids(job, set(futures.values()))
                     for acc_id in pending:
@@ -2269,8 +2324,12 @@ def _run_batch_job(job_id):
                 if not done:
                     continue
                 for future in done:
-                    futures.pop(future)
-                    completed_accounts = future.result()
+                    acc_id = futures.pop(future)
+                    try:
+                        completed_accounts = future.result()
+                    except Exception as exc:
+                        completed_accounts = _mark_batch_account_failed(job, acc_id, exc)
+                        _emit_log("error", f"[{acc_id}] 批量账号任务异常: {str(exc)[:200]}")
                     _update_state(
                         round_status=f"批量创建 {completed_accounts}/{total_accounts} 个账号"
                     )
