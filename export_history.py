@@ -51,26 +51,19 @@ class ExportHistoryStore:
         return str(email or "").strip().lower()
 
     def _load(self):
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                return {}
-            return {
-                self._key(email): dict(record)
-                for email, record in data.items()
-                if self._key(email) and isinstance(record, dict)
-            }
-        except (OSError, json.JSONDecodeError):
-            return {}
+        from durable_json import read_object
+        data = read_object(self.path)
+        if any(not isinstance(record, dict) for record in data.values()):
+            raise RuntimeError("导出记录文件结构损坏，请从备份恢复")
+        return {self._key(email): dict(record) for email, record in data.items()}
 
     def _save(self):
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        payload = json.dumps(self._records, ensure_ascii=False, indent=2)
-        with open(tmp, "w", encoding="utf-8") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, self.path)
+        from durable_json import write_object
+        try:
+            write_object(self.path, self._records)
+        except Exception:
+            self._records = self._load()
+            raise
 
     def get(self, email):
         with self._lock:

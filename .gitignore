@@ -1,28 +1,21 @@
-# Bytecode
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-
-# Virtual env
-.venv/
-
-# Internal
-.reasonix/
-
-# Backups
-backup/
-*.bak-*
-*.bak
-
-# Sensitive — never commit
-logs/
-results/
-cookies.json
-cookies.json.bak
-icloud_cookies.json
+# Secrets and per-installation state
 accounts.json
-scheduler_state.json
-latest_emails.txt
-mail_cache.json
-pickup_links.json
+results/
+logs/
+deploy-backups/
+subscription.url
+subscription.meta.json
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.db
+
+# Local test and browser artifacts
+__pycache__/
+.venv/
+.pytest_cache/
+.qa/
+*.png
+*.tar.gz
+*.tmp
+*.bak*

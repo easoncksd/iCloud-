@@ -32,6 +32,10 @@ IMAP_PORT = 993
 IMAP_TIMEOUT = 10
 
 
+class MailAuthenticationError(RuntimeError):
+    """The mail server rejected the supplied credentials."""
+
+
 class ICloudMail:
     """iCloud Mail IMAP 客户端"""
 
@@ -39,11 +43,16 @@ class ICloudMail:
         self.apple_id = apple_id
         self.app_password = app_password
         self.verbose = verbose
+        self.on_auth_failure = None
         self._conn: Optional[imaplib.IMAP4_SSL] = None
+        from network_proxy import load_config
+        self._network_config = load_config()
 
     def connect(self) -> bool:
         try:
-            self._conn = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT, timeout=IMAP_TIMEOUT)
+            from network_proxy import load_config, connect_imap
+            self._network_config = load_config()
+            self._conn = connect_imap(IMAP_SERVER, IMAP_PORT, IMAP_TIMEOUT, self._network_config)
             self._conn.login(self.apple_id, self.app_password)
             if self.verbose:
                 print(f"[IMAP] Connected as {self.apple_id}")
@@ -51,7 +60,10 @@ class ICloudMail:
         except imaplib.IMAP4.error as e:
             msg = str(e)
             if "authentication" in msg.lower() or "login" in msg.lower():
-                raise RuntimeError(
+                self.disconnect()
+                if self.on_auth_failure:
+                    self.on_auth_failure("IMAP 登录认证失败")
+                raise MailAuthenticationError(
                     f"IMAP 登录失败 — 请检查:\n"
                     f"  1. 应用专用密码是否正确\n"
                     f"  2. Apple ID: {self.apple_id}\n"
@@ -74,10 +86,15 @@ class ICloudMail:
         return self._conn is not None and self._conn.state == "SELECTED"
 
     def _ensure_connected(self):
+        from network_proxy import load_config
+        if self._conn and self._network_config != load_config():
+            self.disconnect()
         if not self._conn:
             self.connect()
         if self._conn.state != "SELECTED":
-            self._conn.select("INBOX", readonly=True)
+            status, _ = self._conn.select("INBOX", readonly=True)
+            if status != "OK":
+                raise RuntimeError("无法选中 INBOX")
 
     def check_inbox(self, limit: int = 50, days: int = 7) -> List[Dict]:
         self._ensure_connected()
@@ -122,7 +139,9 @@ class ICloudMail:
         self._ensure_connected()
         since = (datetime.now() - timedelta(days=days)).strftime("%d-%b-%Y")
         status, data = self._conn.uid("SEARCH", None, f'(SINCE "{since}")')
-        if status != "OK" or not data[0]:
+        if status != "OK":
+            raise RuntimeError("IMAP SEARCH 失败，请稍后重试")
+        if not data or not data[0]:
             return []
         uids = data[0].split()
         return list(reversed(uids[-limit:]))
@@ -136,7 +155,9 @@ class ICloudMail:
         since = (datetime.now() - timedelta(days=days)).strftime("%d-%b-%Y")
         full = f'(SINCE "{since}")'
         status, data = self._conn.uid("SEARCH", None, full)
-        if status != "OK" or not data[0]:
+        if status != "OK":
+            raise RuntimeError("IMAP SEARCH 失败，请稍后重试")
+        if not data or not data[0]:
             return
         uids = data[0].split()
         recent = uids[-limit:] if len(uids) > limit else uids
@@ -152,7 +173,9 @@ class ICloudMail:
         since = (datetime.now() - timedelta(days=days)).strftime("%d-%b-%Y")
         full = f'({criteria} SINCE "{since}")' if criteria else f'(SINCE "{since}")'
         status, data = self._conn.uid("SEARCH", None, full)
-        if status != "OK" or not data[0]:
+        if status != "OK":
+            raise RuntimeError("IMAP SEARCH 失败，请稍后重试")
+        if not data or not data[0]:
             return []
         uids = data[0].split()
         recent = uids[-limit:] if len(uids) > limit else uids
@@ -302,24 +325,9 @@ class ICloudMail:
     @staticmethod
     def _extract_body(data: list) -> Optional[bytes]:
         for item in data:
-            if isinstance(item, tuple):
-                for sub in item:
-                    if isinstance(sub, bytes) and len(sub) > 500:
-                        return sub
-        for item in data:
-            if isinstance(item, bytes) and len(item) > 500:
-                return item
-        best = None
-        for item in data:
-            if isinstance(item, bytes):
-                if best is None or len(item) > len(best):
-                    best = item
-            elif isinstance(item, tuple):
-                for sub in item:
-                    if isinstance(sub, bytes):
-                        if best is None or len(sub) > len(best):
-                            best = sub
-        return best if best and len(best) > 100 else None
+            if isinstance(item, tuple) and len(item) >= 2 and isinstance(item[1], bytes):
+                return item[1]
+        return None
 
     @staticmethod
     def _decode_header(value: str) -> str:

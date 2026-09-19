@@ -60,17 +60,12 @@ class MailBodyStore:
             return None
         try:
             value = json.loads(row[0])
-            return value if isinstance(value, dict) else None
+            return value if isinstance(value, dict) and ("body" in value or "html" in value) else None
         except (TypeError, ValueError, json.JSONDecodeError):
             return None
 
     def contains(self, account_id, message_id):
-        with self._lock:
-            return self._conn.execute(
-                "SELECT 1 FROM message_bodies "
-                "WHERE account_id=? AND message_id=?",
-                (self._key(account_id), self._key(message_id)),
-            ).fetchone() is not None
+        return self.get(account_id, message_id) is not None
 
     def put(self, account_id, message_id, message):
         payload = json.dumps(message, ensure_ascii=False, separators=(",", ":"))

@@ -101,11 +101,12 @@ class AccountManager:
                 pass
 
         if ACCOUNTS_FILE.exists():
-            try:
-                data = json.loads(ACCOUNTS_FILE.read_text(encoding="utf-8"))
-                self.accounts = data.get("accounts", {})
-            except (json.JSONDecodeError, OSError):
-                self.accounts = {}
+            from durable_json import read_object
+            data = read_object(ACCOUNTS_FILE)
+            accounts = data.get("accounts")
+            if not isinstance(accounts, dict) or any(not isinstance(a, dict) for a in accounts.values()):
+                raise RuntimeError("accounts.json 账号结构损坏，已停止操作以保护原文件")
+            self.accounts = accounts
 
     def _save(self):
         with self._lock:
@@ -558,9 +559,19 @@ class AccountManager:
         with self._lock:
             return self._mail_sync_locks.setdefault(acc_id, threading.Lock())
 
-    def get_mail_client(self, acc_id: str, verbose: bool = False):
+    def mail_sync_paused(self, acc_id):
+        account = self.accounts.get(acc_id) or {}
+        return bool(account.get("mail_sync_paused") or account.get("mail_status") == "auth_failed")
+
+    def _require_mail_sync(self, acc_id):
+        if self.mail_sync_paused(acc_id):
+            raise RuntimeError("收信已暂停，等待延迟复查或点击验证并恢复收信")
+
+    def get_mail_client(self, acc_id: str, verbose: bool = False, allow_paused=False):
         from icloud_mail import ICloudMail
 
+        if not allow_paused:
+            self._require_mail_sync(acc_id)
         account = self.accounts.get(acc_id)
         if not account:
             raise KeyError(f"账号不存在: {acc_id}")
@@ -583,7 +594,18 @@ class AccountManager:
                 "未设置 App 专用密码。\n"
                 "请点击下方按钮，输入 @icloud.com 邮箱和应用密码"
             )
-        return ICloudMail(imap_email, app_pwd, verbose=verbose)
+        mail = ICloudMail(imap_email, app_pwd, verbose=verbose)
+        def record_failure(error):
+            with self._lock:
+                current = self.accounts.get(acc_id)
+                if not current or current.get("app_password") != app_pwd:
+                    return
+                self.update_account(acc_id, mail_status="auth_failed",
+                    mail_sync_paused=True, mail_last_error=error,
+                    mail_last_checked=datetime.now().isoformat(),
+                    mail_next_retry_at=time.time() + max(3600, int(os.environ.get("MAIL_AUTH_RECHECK_SECONDS", "21600"))))
+        mail.on_auth_failure = record_failure
+        return mail
 
     def check_inbox(self, acc_id: str, limit: int = 50, days: int = 7,
                     force: bool = False) -> List[Dict]:
@@ -666,8 +688,7 @@ class AccountManager:
 
         results: Dict[str, List[Dict]] = {}
         for msg in all_inbox:
-            alias = self._match_alias(msg, alias_set)
-            if alias:
+            for alias in self._match_aliases(msg, alias_set):
                 if alias not in results:
                     results[alias] = []
                 if len(results[alias]) < limit_per:
@@ -700,10 +721,10 @@ class AccountManager:
         recovered_by_alias: Dict[str, List[Dict]] = {}
         for header in inbox_messages:
             msg_id = str(header.get("id", ""))
-            matched = self._match_alias(header, aliases)
-            if matched and msg_id not in known_ids:
-                recovered_by_alias.setdefault(matched, []).append(header)
-                known_ids.add(msg_id)
+            for matched in self._match_aliases(header, aliases):
+                alias_known = {str(m.get("id")) for m in cached_by_alias.get(matched, [])}
+                if msg_id not in alias_known:
+                    recovered_by_alias.setdefault(matched, []).append(header)
         known_ids.update(
             str(message.get("id", ""))
             for message in inbox_messages
@@ -711,6 +732,7 @@ class AccountManager:
         )
 
         with self._mail_sync_lock(acc_id):
+            self._require_mail_sync(acc_id)
             for attempt in range(2):
                 new_headers: List[Dict] = []
                 by_alias: Dict[str, List[Dict]] = {
@@ -733,10 +755,8 @@ class AccountManager:
                         if not header:
                             continue
                         new_headers.append(header)
-                        matched = self._match_alias(header, aliases)
-                        if not matched:
-                            continue
-                        by_alias.setdefault(matched, []).append(header)
+                        for matched in self._match_aliases(header, aliases):
+                            by_alias.setdefault(matched, []).append(header)
 
                     # The first item for each alias is the newest UID. Fetch its
                     # body while the authenticated IMAP connection is still open.
@@ -747,13 +767,15 @@ class AccountManager:
                         msg_id = str(message.get("id", ""))
                         if not msg_id:
                             continue
-                        full = mail.fetch_full(msg_id.encode()) or {}
-                        full.update(message)
-                        bodies[msg_id] = full
+                        full = mail.fetch_full(msg_id.encode())
+                        if full is not None and ("body" in full or "html" in full):
+                            full.update(message)
+                            bodies[msg_id] = full
                     break
-                except Exception:
+                except Exception as exc:
+                    from icloud_mail import MailAuthenticationError
                     self._drop_mail_client(acc_id)
-                    if attempt:
+                    if isinstance(exc, MailAuthenticationError) or attempt:
                         raise
 
         # Calling set_inbox even with no new messages advances last_checked.
@@ -764,6 +786,10 @@ class AccountManager:
 
     @staticmethod
     def _match_alias(header: Dict, aliases) -> Optional[str]:
+        return next(iter(AccountManager._match_aliases(header, aliases)), None)
+
+    @staticmethod
+    def _match_aliases(header: Dict, aliases) -> List[str]:
         recipients = {
             str(value).strip().lower()
             for value in header.get("recipients", [])
@@ -776,11 +802,12 @@ class AccountManager:
                 for _, address in getaddresses([header.get("to", "")])
                 if address
             }
-        return next((alias for alias in aliases if alias in recipients), None)
+        return sorted(alias for alias in aliases if alias in recipients)
 
     def fetch_pickup_message(self, acc_id: str, msg_id: str) -> Dict:
         """Fetch one full message through the account's persistent IMAP session."""
         with self._mail_sync_lock(acc_id):
+            self._require_mail_sync(acc_id)
             for attempt in range(2):
                 with self._lock:
                     mail = self._mail_clients.get(acc_id)
@@ -790,29 +817,54 @@ class AccountManager:
                         self._mail_clients[acc_id] = mail
                 try:
                     return mail.fetch_full(str(msg_id).encode()) or {}
-                except Exception:
+                except Exception as exc:
+                    from icloud_mail import MailAuthenticationError
                     self._drop_mail_client(acc_id)
-                    if attempt:
+                    if isinstance(exc, MailAuthenticationError) or attempt:
                         raise
         return {}
 
-    def test_imap_connection(self, acc_id: str) -> Dict:
+    def test_imap_connection(self, acc_id: str, allow_paused=False) -> Dict:
         try:
-            mail = self.get_mail_client(acc_id)
+            mail = self.get_mail_client(acc_id, allow_paused=allow_paused)
             result = mail.test_connection()
             mail.disconnect()
             return result
         except Exception as e:
             return {"ok": False, "error": str(e)[:200]}
 
+    @property
+    def creation_guard(self):
+        from create_guard import CreationGuard
+        with self._lock:
+            if not hasattr(self, "_creation_guard"):
+                self._creation_guard = CreationGuard(ACCOUNTS_FILE.parent / "results" / "creation_guard.json")
+            return self._creation_guard
+
     def create_aliases_for_account(
         self, acc_id: str, count: int = 1, label: str = "",
         progress_callback=None, should_stop=None, wait=None,
     ) -> List[Dict]:
-        with self._operation_lock(acc_id):
-            return self._create_aliases_for_account_unlocked(
-                acc_id, count, label, progress_callback, should_stop, wait
-            )
+        guard = self.creation_guard
+        # Same-account duplicates fail immediately; other accounts wait for a global slot.
+        with guard.lock:
+            if acc_id in guard.active or acc_id in guard.queued:
+                return [guard.result("busy", "该账号已有创建任务")]
+            guard.queued.add(acc_id)
+        try:
+            while not guard.claim(acc_id):
+                if callable(should_stop) and should_stop():
+                    return []
+                if callable(wait):
+                    wait(0.5)
+                else:
+                    time.sleep(0.5)
+            with self._operation_lock(acc_id):
+                return self._create_aliases_for_account_unlocked(
+                    acc_id, count, label, progress_callback, should_stop, wait
+                )
+        finally:
+            guard.release(acc_id)
 
     def _create_aliases_for_account_unlocked(
         self, acc_id: str, count: int = 1, label: str = "",
@@ -830,6 +882,9 @@ class AccountManager:
             verbose=False,
         )
 
+        guard = self.creation_guard
+        task_id = getattr(progress_callback, "task_id", None)
+        client.before_reserve = lambda email: guard.pending(acc_id, email, task_id)
         results: List[Dict] = []
         for i in range(count):
             if callable(should_stop) and should_stop():
@@ -839,22 +894,47 @@ class AccountManager:
                     f"{account.get('name', acc_id)} "
                     f"{datetime.now().strftime('%m%d%H%M')}-{i + 1}"
                 )
-                result = client.create_alias(label=alias_label, max_retries=3)
+                blocked = guard.check(acc_id, account)
+                if blocked:
+                    results.append(dict(blocked, account_id=acc_id))
+                    break
+                pending = guard.snapshot()["accounts"].get(acc_id, {}).get("pending")
+                if pending:
+                    pending_task = guard.snapshot()["accounts"][acc_id].get("pending_task")
+                    if pending_task and pending_task != task_id:
+                        raise RuntimeError("上次创建属于其他任务，请先恢复原任务核对结果")
+                    client._creation_mode = True
+                    try:
+                        aliases = client.list_aliases()
+                    finally:
+                        client._creation_mode = False
+                    match = next((a for a in aliases if a.get("email", "").lower() == pending.lower()), None)
+                    if not match:
+                        raise RuntimeError("未能确认上次保留结果，请人工核对，禁止重复创建")
+                    result = {"email": pending}
+                else:
+                    guard.attempt(acc_id)
+                    result = client.create_alias(label=alias_label, max_retries=1)
                 email = result.get("email", "")
                 if email:
                     created_at = result.get("created_at") or datetime.now().astimezone().isoformat()
-                    results.append({
-                        "email": email,
-                        "account_id": acc_id,
-                        "ok": True,
-                        "created_at": created_at,
-                    })
+                    completed = {"email": email, "account_id": acc_id,
+                                 "ok": True, "created_at": created_at}
                     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
                     with self._latest_emails_lock:
-                        with open(str(LATEST_EMAILS), "a", encoding="utf-8") as f:
-                            f.write(f"{email}\t{acc_id}\t{created_at}\n")
-                            f.flush()
-                            os.fsync(f.fileno())
+                        # A crash after the local append can leave a pending reserve.
+                        # Reconciliation must not append that address a second time.
+                        known = set()
+                        if pending and LATEST_EMAILS.exists():
+                            known = {line.split("\t", 1)[0].lower()
+                                     for line in LATEST_EMAILS.read_text(encoding="utf-8").splitlines()}
+                        if email.lower() not in known:
+                            with open(str(LATEST_EMAILS), "a", encoding="utf-8") as f:
+                                f.write(f"{email}\t{acc_id}\t{created_at}\n")
+                                f.flush()
+                                os.fsync(f.fileno())
+                    guard.success(acc_id, email, task_id)
+                    results.append(completed)
                     account["alias_total"] = account.get("alias_total", 0) + 1
                     account["alias_active"] = account.get("alias_active", 0) + 1
                     account["create_status"] = "available"
@@ -864,7 +944,8 @@ class AccountManager:
                         try:
                             progress_callback(dict(results[-1]))
                         except Exception:
-                            pass
+                            results.append(guard.result("local", "创建已记录，但任务进度保存失败；请检查存储后恢复"))
+                            break
                     if i < count - 1 and CREATE_ALIAS_INTERVAL_SECONDS > 0:
                         delay = (
                             CREATE_ALIAS_INTERVAL_SECONDS
@@ -877,40 +958,13 @@ class AccountManager:
                         if callable(should_stop) and should_stop():
                             break
                 else:
-                    results.append({
-                        "email": None,
-                        "account_id": acc_id,
-                        "ok": False,
-                        "error": "create_alias 返回空邮箱",
-                    })
+                    raise RuntimeError("create_alias 返回空邮箱，结果不明确")
             except Exception as e:
-                err_str = str(e)
-                lower = err_str.lower()
-                retryable = any(
-                    marker in lower for marker in self._CREATE_TEMPORARY_LIMIT_MARKERS
-                )
-                limited = retryable or any(
-                    marker in lower for marker in self._CREATE_LIMIT_MARKERS
-                )
-                retryable = retryable or any(
-                    marker in lower for marker in (
-                        "timeout", "timed out", "connection", "http 421",
-                        "http 401", "http 403", "trusttokens",
-                    )
-                )
-                limited = limited or retryable
-                results.append({
-                    "email": None,
-                    "account_id": acc_id,
-                    "ok": False,
-                    "error": err_str[:200],
-                    "limited": limited,
-                    "retryable": retryable,
-                })
-                account["create_last_error"] = err_str[:300]
-                if limited:
-                    account["create_status"] = "cooldown" if retryable else "limited"
-                    account["create_limited_at"] = datetime.now().isoformat()
+                failure = guard.failure(acc_id, e)
+                results.append(dict(failure, email=None, account_id=acc_id))
+                account["create_last_error"] = failure["error"]
+                account["create_status"] = "cooldown" if failure["retryable"] else "limited"
+                account["create_limited_at"] = datetime.now().isoformat()
                 break
 
         self._save()

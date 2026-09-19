@@ -18,20 +18,20 @@ class PickupLinkStore:
         self._reindex()
 
     def _load(self):
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else {}
-        except (OSError, json.JSONDecodeError):
-            return {}
+        from durable_json import read_object
+        data = read_object(self.path)
+        if any(not isinstance(record, dict) for record in data.values()):
+            raise RuntimeError("取件链接文件结构损坏，请从备份恢复")
+        return data
 
     def _save(self):
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        payload = json.dumps(self._links, ensure_ascii=False, indent=2)
-        with open(tmp, "w", encoding="utf-8") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, self.path)
+        from durable_json import write_object
+        try:
+            write_object(self.path, self._links)
+        except Exception:
+            self._links = self._load()
+            self._reindex()
+            raise
 
     def _normalize(self):
         """Collapse legacy duplicate records to one active token per alias."""

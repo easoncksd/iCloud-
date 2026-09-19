@@ -226,6 +226,9 @@ class ICloudHME:
         self.host = self._normalize_host(host)
         self.verbose = verbose
         self.session = requests.Session()
+        from network_proxy import load_config, configure_session
+        self.network_config = load_config()
+        configure_session(self.session, self.network_config)
         self.session.cookies.update(cookies)
         self._setup_url: Optional[str] = None
         self._service_url: Optional[str] = None
@@ -266,6 +269,8 @@ class ICloudHME:
 
     def _request(self, method: str, url: str, json_data: Any = None,
                  timeout: int = REQUEST_TIMEOUT, max_attempts: int = MAX_RETRIES) -> Any:
+        if getattr(self, "_creation_mode", False):
+            max_attempts = 1
         full_url = self._build_url(url)
         headers = {
             "Origin": self.origin,
@@ -298,6 +303,8 @@ class ICloudHME:
                     continue
                 raise last_err
             except requests.exceptions.ConnectionError as e:
+                if self.network_config['mode'] == 'proxy':
+                    raise RuntimeError('固定代理连接失败，请检查代理地址、认证和可用性') from None
                 last_err = RuntimeError(f"连接失败: {e}")
                 if attempt < max_attempts:
                     time.sleep(RETRY_DELAYS[min(attempt - 1, len(RETRY_DELAYS) - 1)])
@@ -392,40 +399,18 @@ class ICloudHME:
 
     def create_alias(self, label: Optional[str] = None, max_retries: int = 5) -> Dict:
         """生成 + 保留，一步创建。返回 {'email': ..., 'label': ...}"""
-        last_err = ""
-        for attempt in range(max_retries):
-            if attempt > 0:
-                self._service_url = None
-                self._setup_url = None
-                self._log(f"重试 {attempt+1}/{max_retries} ...")
-            try:
-                hme = self.generate()
-            except Exception as e:
-                last_err = f"generate 失败: {e}"
-                self._log(last_err)
-                if attempt < max_retries - 1:
-                    time.sleep(1)
-                    continue
-                break
-            try:
-                email = self.reserve(hme, label)
-                return {"email": email, "label": label or "", "created_at": datetime.now().isoformat()}
-            except Exception as e:
-                last_err = str(e)
-                self._log(f"reserve 失败: {last_err}")
-                lower = last_err.lower()
-                if any(marker in lower for marker in (
-                    "reached the limit of addresses",
-                    "maximum number of addresses",
-                    "address limit",
-                    "quota exceeded",
-                    "too many addresses",
-                )):
-                    break
-                if attempt < max_retries - 1:
-                    time.sleep(1)
-                    continue
-        raise RuntimeError(f"创建别名失败: {last_err}" if last_err else f"创建别名失败，已重试 {max_retries} 次")
+        self._creation_mode = True
+        try:
+            hme = self.generate()
+            if not hme:
+                raise RuntimeError("生成候选地址为空")
+            callback = getattr(self, "before_reserve", None)
+            if callback:
+                callback(hme)
+            email = self.reserve(hme, label)
+            return {"email": email, "label": label or "", "created_at": datetime.now().isoformat()}
+        finally:
+            self._creation_mode = False
 
     def delete(self, anonymous_id: str) -> bool:
         """删除别名 (必要时先停用再删除)"""
@@ -524,20 +509,18 @@ def _make_client(args) -> ICloudHME:
 
 def cmd_create(args):
     """创建隐私邮箱"""
-    client = _make_client(args)
+    from account_manager import AccountManager
+    mgr = AccountManager()
+    cookies = _load_cookies(args)
+    matches = [a for a in mgr.accounts.values() if a.get("cookies") == cookies]
+    if len(matches) != 1:
+        raise RuntimeError("请先在管理页导入此账号；命令行创建必须使用已管理账号及统一保护")
     count = args.count
-
-    results = []
-    for i in range(count):
-        if count > 1:
-            print(f"\n--- [{i+1}/{count}] ---")
-        try:
-            result = client.create_alias(label=args.label, max_retries=args.retry)
-            results.append(result)
-            print(f"  ✅ {result['email']}")
-        except Exception as e:
-            print(f"  ❌ 创建失败: {e}")
-            results.append({"email": None, "error": str(e)})
+    if type(count) is not int or not 1 <= count <= 750:
+        raise ValueError("创建数量必须为 1 到 750")
+    results = mgr.create_aliases_for_account(matches[0]["id"], count, args.label or "")
+    for result in results:
+        print(result.get("email") if result.get("ok") else result.get("error", "创建失败"))
 
     # 输出汇总
     successes = [r for r in results if r.get("email")]
