@@ -3,3 +3,4 @@ pycryptodome>=3.15
 pywin32>=305; platform_system == "Windows"
 flask>=3.0
 waitress>=3.0
+PyYAML>=6.0

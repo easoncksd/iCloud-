@@ -844,6 +844,7 @@ class AccountManager:
     def create_aliases_for_account(
         self, acc_id: str, count: int = 1, label: str = "",
         progress_callback=None, should_stop=None, wait=None,
+        interval_seconds=None,
     ) -> List[Dict]:
         guard = self.creation_guard
         # Same-account duplicates fail immediately; other accounts wait for a global slot.
@@ -861,7 +862,8 @@ class AccountManager:
                     time.sleep(0.5)
             with self._operation_lock(acc_id):
                 return self._create_aliases_for_account_unlocked(
-                    acc_id, count, label, progress_callback, should_stop, wait
+                    acc_id, count, label, progress_callback, should_stop, wait,
+                    interval_seconds,
                 )
         finally:
             guard.release(acc_id)
@@ -869,6 +871,7 @@ class AccountManager:
     def _create_aliases_for_account_unlocked(
         self, acc_id: str, count: int = 1, label: str = "",
         progress_callback=None, should_stop=None, wait=None,
+        interval_seconds=None,
     ) -> List[Dict]:
         from icloud_hme import ICloudHME
 
@@ -883,6 +886,14 @@ class AccountManager:
         )
 
         guard = self.creation_guard
+        try:
+            create_interval = (
+                CREATE_ALIAS_INTERVAL_SECONDS
+                if interval_seconds is None
+                else max(0.0, min(float(interval_seconds), 30.0))
+            )
+        except (TypeError, ValueError):
+            create_interval = CREATE_ALIAS_INTERVAL_SECONDS
         task_id = getattr(progress_callback, "task_id", None)
         client.before_reserve = lambda email: guard.pending(acc_id, email, task_id)
         results: List[Dict] = []
@@ -946,9 +957,9 @@ class AccountManager:
                         except Exception:
                             results.append(guard.result("local", "创建已记录，但任务进度保存失败；请检查存储后恢复"))
                             break
-                    if i < count - 1 and CREATE_ALIAS_INTERVAL_SECONDS > 0:
+                    if i < count - 1 and create_interval > 0:
                         delay = (
-                            CREATE_ALIAS_INTERVAL_SECONDS
+                            create_interval
                             + random.uniform(0, CREATE_ALIAS_JITTER_SECONDS)
                         )
                         if callable(wait):

@@ -1,21 +1,45 @@
-# Secrets and per-installation state
-accounts.json
-results/
+# Bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual env
+.venv/
+
+# Internal
+.reasonix/
+
+# Backups
+backup/
+*.bak-*
+*.bak
+
+# Sensitive — never commit
 logs/
-deploy-backups/
+results/
+cookies.json
+cookies.json.bak
+icloud_cookies.json
+accounts.json
+scheduler_state.json
+latest_emails.txt
+mail_cache.json
+pickup_links.json
+
+# Local audit and browser artifacts
+server-snapshots/
+.chrome-test-profile/
+.codex_fix_repo_*/
+.pytest_cache/
+
 subscription.url
 subscription.meta.json
 *.sqlite3
 *.sqlite3-shm
 *.sqlite3-wal
 *.db
-
-# Local test and browser artifacts
-__pycache__/
-.venv/
-.pytest_cache/
+deploy-backups/
 .qa/
-*.png
 *.tar.gz
 *.tmp
-*.bak*

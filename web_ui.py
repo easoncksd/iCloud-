@@ -121,9 +121,20 @@ _pickup_last_account_refresh = {}
 _pickup_refresh_errors = {}
 _pickup_error_log_state = {}
 _removed_account_ids = set()
-_pickup_executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix="pickup")
+def _env_int(name, default, minimum, maximum):
+    try:
+        value = int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+_pickup_executor = ThreadPoolExecutor(
+    max_workers=_env_int("PICKUP_WORKERS", 8, 2, 16),
+    thread_name_prefix="pickup",
+)
 _pickup_pending = 0
-_PICKUP_MAX_PENDING = 256
+_PICKUP_MAX_PENDING = _env_int("PICKUP_MAX_PENDING", 128, 16, 512)
 _PICKUP_SYNC_INTERVAL_SECONDS = max(
     1.0, float(os.environ.get("PICKUP_SYNC_INTERVAL_SECONDS", "15"))
 )
@@ -196,7 +207,7 @@ _batch_lock = threading.RLock()
 _BATCH_STATE_FILE = RESULTS_DIR / "batch_jobs.json"
 _BATCH_JOB_HISTORY = 20
 _BATCH_RETRY_DELAY_SECONDS = 30 * 60  # Fixed cooldown after each temporary creation limit.
-_BATCH_MAX_ACCOUNT_WORKERS = 100  # Waiting coordinators; CreationGuard limits actual creation concurrency.
+_BATCH_MAX_ACCOUNT_WORKERS = _env_int("BATCH_MAX_ACCOUNT_WORKERS", 12, 1, 20)
 _BATCH_CREATE_HEARTBEAT_SECONDS = max(
     5.0, float(os.environ.get("BATCH_CREATE_HEARTBEAT_SECONDS", "15"))
 )
@@ -1362,7 +1373,7 @@ setTimeout(loadNetworkProxy,1000);
 setTimeout(loadProxySubscription,1000);
 async function loadCreationGuard(){var d=await api('/api/creation-guard');if(!d.ok)return;var g=d.protection;E('guardConcurrency').value=g.settings.concurrency;E('guardDaily').value=g.settings.daily_limit;var h='<p>'+ (g.multi_account_alert?'多个账号出现同类异常，请检查；其他账号继续创建':'账号独立保护，其他账号不受牵连')+'</p>';Object.keys(g.accounts).forEach(function(id){var a=g.accounts[id];h+='<div style="padding:8px;border-bottom:1px solid #eee">'+esc(id)+' · 今日尝试 '+a.attempts+' / 成功 '+a.successes+' · '+esc(a.blocked||a.last_error_kind||'正常')+(a.retry_at>Date.now()/1000?' · 冷却至 '+new Date(a.retry_at*1000).toLocaleString():'')+(a.pending?' · 有待核对地址':'')+' <button class="btn btn-sm guard-release">检查后解除账号暂停</button></div>';});E('creationGuardStatus').innerHTML=h;Array.from(E('creationGuardStatus').querySelectorAll('.guard-release')).forEach(function(b,i){b.onclick=function(){releaseCreationGuard(Object.keys(g.accounts)[i]);};});}
 async function saveCreationGuard(){var d=await api('/api/creation-guard',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'settings',concurrency:Number(E('guardConcurrency').value),daily_limit:Number(E('guardDaily').value)})});toast(d.ok?'保护设置已保存':d.error,!d.ok);if(d.ok)loadCreationGuard();}
-async function releaseCreationGuard(id){var d=await api('/api/creation-guard',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'release',account_id:id||null})});toast(d.ok?'暂停已解除；冷却和待核对记录仍保留':d.error,!d.ok);if(d.ok)loadCreationGuard();}
+async function releaseCreationGuard(id,ask){if(id&&ask!==false&&!confirm('确认解除这个账号的创建暂停？解除后不会自动开始创建，需要你重新选择账号并点击“开始创建”。'))return;var d=await api('/api/creation-guard',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'release',account_id:id||null})});toast(d.ok?'暂停已解除；冷却和待核对记录仍保留':d.error,!d.ok);if(d.ok){await loadCreationGuard();await refreshAll();}}
 setTimeout(loadCreationGuard,1000);
 async function apiSlow(path,opts){return api(path,Object.assign({timeout:60000},opts||{}));}
 function fillMailWatch(){var n=parseInt((state&&state.mail_watch_hours)||1,10);if(!(n>=1&&n<=24))n=1;var input=E('mailWatchHours');if(input&&document.activeElement!==input)input.value=n;}async function saveMailWatch(){var n=parseInt(E('mailWatchHours').value,10);if(!(n>=1&&n<=24)){toast(t('settings.mail_watch_invalid'),true);return}var d=await api('/api/mail-watch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({interval_hours:n})});if(!d.ok){toast(d.error||t('error.unknown'),true);return}state.mail_watch_hours=d.interval_hours;fillMailWatch();toast(t('settings.mail_watch_saved',{n:d.interval_hours}));}async function refreshAll(){if(_refreshBusy)return;_refreshBusy=true;try{var _a=api('/api/accounts'),_s=api('/api/state');var a=await _a,s=await _s;accounts=a.accounts||[];state=s;renderSidebar();renderDashboard();updateEmptyState();if(curTab==='emails'){await refreshEmails();renderAliasTable();}if(curTab==='settings'){renderBatchPanel();fillMailWatch();}await loadLogs();updateInboxAccountSelect();}finally{_refreshBusy=false;}}
@@ -1443,7 +1454,7 @@ function jobDisplayStatus(job){var waiting=false,runningAcc=false,pausedAcc=fals
 function batchBusyAccountIds(job){var ids={};if(!job||(job.status!=='queued'&&job.status!=='running'&&job.status!=='paused'))return ids;Object.keys(job.accounts||{}).forEach(function(id){var st=(job.accounts[id]||{}).status;if(st==='queued'||st==='running'||st==='waiting')ids[id]=true;});return ids;}function batchPausedAccountIds(job){var ids={};if(!job)return ids;Object.keys(job.accounts||{}).forEach(function(id){if((job.accounts[id]||{}).status==='paused')ids[id]=true;});return ids;}function selectedBatchAccountIds(){var ids=[];document.querySelectorAll('#batchChkGroup input:checked').forEach(function(c){ids.push(c.value)});return ids;}function updateCreateControlButtons(){var pauseBtn=E('btnBatchPause'),stopBtn=E('btnBatchStop'),startBtn=E('btnBatchExec');if(!startBtn)return;var ids=selectedBatchAccountIds();var busy=batchBusyAccountIds(batchJob);var paused=batchPausedAccountIds(batchJob);var canStart=ids.some(function(id){return !busy[id];});var canPause=ids.some(function(id){return !!busy[id];});var canStop=ids.some(function(id){return !!busy[id]||!!paused[id];});startBtn.disabled=!ids.length||!canStart;if(pauseBtn)pauseBtn.disabled=!canPause;if(stopBtn)stopBtn.disabled=!canStop;}function batchAccountTarget(job,item){return parseInt((item||{}).target,10)||parseInt(job.count_per_account,10)||0;}function batchTargetCount(job){var accs=job.accounts||{};var ids=Object.keys(accs);var target=0;ids.forEach(function(id){target+=batchAccountTarget(job,accs[id]);});return target||((job.total_created||0)+(job.total_errors||0));}
 function progressBarHtml(created,errors,target,mode){var createdPct=target?Math.min(100,created*100/target):0;var errorPct=target?Math.min(100-createdPct,errors*100/target):0;if(created&&createdPct<1.2)createdPct=1.2;return '<div class="progress-bar'+(mode?(' '+mode):'')+'"><div class="fill ok" style="width:'+createdPct+'%"></div>'+(errorPct?('<div class="fill err" style="width:'+errorPct+'%"></div>'):'')+'</div>';}
 function retryLeftText(retryAt){if(!retryAt)return '';var deadline=Date.parse(retryAt);if(!deadline)return '';var sec=Math.max(0,Math.round((deadline-Date.now())/1000));if(sec<=0)return t('batch.retry_soon');if(sec<60)return t('batch.retry_sec',{n:sec});return t('batch.retry_min',{n:Math.ceil(sec/60)});}
-function renderBatchJob(job){var box=E('batchProgress');if(!job){box.innerHTML='';return}var total=job.total_accounts||0,done=job.completed_accounts||0,created=job.total_created||0,errors=job.total_errors||0,target=batchTargetCount(job)||0;var processed=target?Math.min(target,created+errors):created+errors;var pct=target?Math.round(processed*100/target):0;var displayStatus=jobDisplayStatus(job);var statusColor=displayStatus==='completed'?'var(--green)':(displayStatus==='failed'||displayStatus==='limited'||displayStatus==='waiting')?'var(--red)':'var(--ink)';var running=job.status==='queued'||job.status==='running';var barMode=displayStatus==='waiting'?'is-wait':(running?'is-run':'');var h='<div class="progress-card"><div class="progress-head"><strong style="color:'+statusColor+'">'+esc(batchStatusText(displayStatus))+'</strong><span>'+created+' / '+target+' · '+pct+'%</span></div>'+progressBarHtml(created,errors,target,barMode)+'<div class="progress-meta"><span>'+t('batch.accounts_done',{done:done,total:total})+'</span><span>'+t('batch.ok_fail',{created:created,errors:errors})+'</span></div>';Object.keys(job.accounts||{}).forEach(function(id){var item=job.accounts[id],color=item.status==='completed'?'var(--green)':(item.status==='limited'||item.status==='failed'||item.status==='waiting'||item.status==='stopped')?'var(--red)':(item.status==='paused'?'var(--ink)':'var(--muted)');var accTarget=batchAccountTarget(job,item),accCreated=item.created||0,accErrors=item.errors||0;var accMode=item.status==='waiting'?'is-wait':((item.status==='running'||item.status==='queued')?'is-run':'');var extra=retryLeftText(item.retry_at);var note=item.error||((item.status==='running'||item.status==='queued')?'正在向 Apple 申请':'');h+='<div class="progress-item"><div class="progress-head"><strong>'+esc(item.name||id)+'</strong><span style="color:'+color+'">'+esc(batchStatusText(item.status))+(accTarget?(' · '+accCreated+' / '+accTarget):(' · '+accCreated))+'</span></div>'+progressBarHtml(accCreated,accErrors,accTarget||Math.max(accCreated+accErrors,1),accMode)+((note||extra)?('<div class="progress-note" style="color:var(--red)">'+esc(note)+(extra?(' · '+esc(extra)):'' )+'</div>'):'')+'</div>';});h+='</div>';box.innerHTML=h;var busy=batchBusyAccountIds(job);var checks=document.querySelectorAll('#batchChkGroup input[type=checkbox]');var canStart=false;checks.forEach(function(box){if(!busy[box.value])canStart=true;});E('btnBatchExec').textContent=t('settings.start');updateCreateControlButtons();renderSidebar();if(curTab==='accounts')renderDashboard();}function scheduleBatchPoll(){if(batchPollTimer)clearTimeout(batchPollTimer);batchPollTimer=setTimeout(pollBatchJob,1200);}
+function renderBatchJob(job){var box=E('batchProgress');if(!job){box.innerHTML='';return}var total=job.total_accounts||0,done=job.completed_accounts||0,created=job.total_created||0,errors=job.total_errors||0,target=batchTargetCount(job)||0;var processed=target?Math.min(target,created+errors):created+errors;var pct=target?Math.round(processed*100/target):0;var displayStatus=jobDisplayStatus(job);var statusColor=displayStatus==='completed'?'var(--green)':(displayStatus==='failed'||displayStatus==='limited'||displayStatus==='waiting')?'var(--red)':'var(--ink)';var running=job.status==='queued'||job.status==='running';var barMode=displayStatus==='waiting'?'is-wait':(running?'is-run':'');var h='<div class="progress-card"><div class="progress-head"><strong style="color:'+statusColor+'">'+esc(batchStatusText(displayStatus))+'</strong><span>'+created+' / '+target+' · '+pct+'%</span></div>'+progressBarHtml(created,errors,target,barMode)+'<div class="progress-meta"><span>'+t('batch.accounts_done',{done:done,total:total})+'</span><span>'+t('batch.ok_fail',{created:created,errors:errors})+'</span></div>';Object.keys(job.accounts||{}).forEach(function(id){var item=job.accounts[id],color=item.status==='completed'?'var(--green)':(item.status==='limited'||item.status==='failed'||item.status==='waiting'||item.status==='stopped')?'var(--red)':(item.status==='paused'?'var(--ink)':'var(--muted)');var accTarget=batchAccountTarget(job,item),accCreated=item.created||0,accErrors=item.errors||0;var accMode=item.status==='waiting'?'is-wait':((item.status==='running'||item.status==='queued')?'is-run':'');var extra=retryLeftText(item.retry_at);var note=item.error||((item.status==='running'||item.status==='queued')?'正在向 Apple 申请':'');var canRelease=String(note).indexOf('创建已暂停：')===0||String(note).indexOf('创建已暂停:')===0;var releaseHtml=canRelease?' <button type="button" class="btn btn-outline btn-xs batch-release-guard" data-account-id="'+escAttr(id)+'">解除暂停</button>':'';h+='<div class="progress-item"><div class="progress-head"><strong>'+esc(item.name||id)+'</strong><span style="color:'+color+'">'+esc(batchStatusText(item.status))+(accTarget?(' · '+accCreated+' / '+accTarget):(' · '+accCreated))+'</span></div>'+progressBarHtml(accCreated,accErrors,accTarget||Math.max(accCreated+accErrors,1),accMode)+((note||extra)?('<div class="progress-note" style="color:var(--red)">'+esc(note)+(extra?(' · '+esc(extra)):'' )+releaseHtml+'</div>'):'')+'</div>';});h+='</div>';box.innerHTML=h;box.querySelectorAll('.batch-release-guard').forEach(function(btn){btn.onclick=function(){releaseCreationGuard(btn.dataset.accountId,true);};});var busy=batchBusyAccountIds(job);var checks=document.querySelectorAll('#batchChkGroup input[type=checkbox]');var canStart=false;checks.forEach(function(box){if(!busy[box.value])canStart=true;});E('btnBatchExec').textContent=t('settings.start');updateCreateControlButtons();renderSidebar();if(curTab==='accounts')renderDashboard();}function scheduleBatchPoll(){if(batchPollTimer)clearTimeout(batchPollTimer);batchPollTimer=setTimeout(pollBatchJob,1200);}
 async function pollBatchJob(){if(!batchJob||!batchJob.id)return;var d=await api('/api/create-batch/'+encodeURIComponent(batchJob.id));if(!d.ok){toast(t('batch.progress_fail',{err:d.error||t('error.unknown')}),true);return}batchJob=d.job;renderBatchJob(batchJob);if(batchJob.status==='queued'||batchJob.status==='running'){scheduleBatchPoll();return}if(batchJob.status==='paused'){await refreshAll();return}await refreshAll();if(batchJob.total_created){toast(t('batch.complete_n',{n:batchJob.total_created}));}else{toast(t('batch.none_created'),true);}}
 async function controlBatchCreate(action){var ids=selectedBatchAccountIds();if(!ids.length){toast(t('batch.need_account'),true);return}var busy=batchBusyAccountIds(batchJob);var paused=batchPausedAccountIds(batchJob);if(action==='pause'&&!ids.some(function(id){return !!busy[id];})){toast(t('batch.need_creating'),true);return}if(action==='stop'&&!ids.some(function(id){return !!busy[id]||!!paused[id];})){toast(t('batch.need_creating'),true);return}var pauseBtn=E('btnBatchPause'),stopBtn=E('btnBatchStop');if(pauseBtn)pauseBtn.disabled=true;if(stopBtn)stopBtn.disabled=true;var d=await api('/api/create-control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:action,account_ids:ids})});if(!d.ok){updateCreateControlButtons();toast(d.error||t('batch.control_fail'),true);return}if(d.job){batchJob=d.job;renderBatchJob(batchJob);if(batchJob.status==='queued'||batchJob.status==='running')scheduleBatchPoll();}toast(t(action==='pause'?'batch.paused_ok':'batch.stopped_ok',{n:(d.affected||ids).length}));updateCreateControlButtons();refreshAll();}
 async function execBatchCreate(){var checks=document.querySelectorAll('#batchChkGroup input:checked');var ids=[];checks.forEach(function(c){ids.push(c.value)});if(!ids.length){toast(t('batch.need_account'),true);return}var count=Math.max(1,Math.min(parseInt(E('batchCount').value)||5,750));E('batchCount').value=count;var label=E('batchLabel').value.trim();var btn=E('btnBatchExec');btn.disabled=true;btn.textContent=t('batch.starting');var d=await api('/api/create-batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({account_ids:ids,count_per_account:count,label:label})});if(!d.ok){btn.textContent=t('settings.start');updateCreateControlButtons();if(d.job_id){batchJob={id:d.job_id,status:'running'};scheduleBatchPoll();}toast(d.error||t('batch.start_fail'),true);return}batchJob=d.job;renderBatchJob(batchJob);scheduleBatchPoll();}
@@ -1800,7 +1811,7 @@ def api_validate_account(acc_id):
         if not ok:
             payload["error"] = account.get("last_error") or "账号校验失败"
         return jsonify(payload), 200 if ok else 400
-    except Exception as e: return jsonify({"ok":False,"error":str(e)})
+    except Exception as e: return jsonify({"ok":False,"error":str(e)}), 500
 
 def _ensure_pickup_for_created(result):
     if not result or not result.get("ok"):
@@ -1909,7 +1920,7 @@ def api_network_proxy():
             return jsonify(ok=False, error="无效操作"), 400
         # Finish an in-flight create with its existing route before changing it.
         with _account_mgr.creation_guard.lock:
-            if _account_mgr.creation_guard.active:
+            if _account_mgr.creation_guard.active or _account_mgr.creation_guard.queued:
                 return jsonify(ok=False, error="账号正在创建，请暂停创建任务后再保存代理配置"), 409
             config = network_proxy.save_config(data)
         _emit_log("info", "网络代理配置已更新（认证信息不写入日志）")
@@ -2045,10 +2056,25 @@ def _create_account_with_cooldown(job, acc_id, count, label, name):
             target=_heartbeat, daemon=True, name=f"create-hb-{acc_id}"
         ).start()
         try:
-            results = _account_mgr.create_aliases_for_account(
-                acc_id, remaining, label, progress_callback=record_progress,
+            create_kwargs = dict(
+                progress_callback=record_progress,
                 should_stop=_batch_should_stop,
-                wait=lambda seconds: _wait_account(acc_id, seconds),            )
+                wait=lambda seconds: _wait_account(acc_id, seconds),
+            )
+            try:
+                results = _account_mgr.create_aliases_for_account(
+                    acc_id, remaining, label,
+                    interval_seconds=job.get("interval"),
+                    **create_kwargs,
+                )
+            except TypeError as exc:
+                # Keep test doubles and older manager implementations usable
+                # while the deployed AccountManager supports the new option.
+                if "interval_seconds" not in str(exc):
+                    raise
+                results = _account_mgr.create_aliases_for_account(
+                    acc_id, remaining, label, **create_kwargs
+                )
         finally:
             stop_heartbeat.set()
         successful.extend(result for result in results if result.get("ok"))
@@ -2290,7 +2316,6 @@ def _run_batch_job(job_id):
         _save_batch_state_locked()
     total_accounts = len(job["account_ids"])
     count = job.get("count_per_account")
-    workers = min(_BATCH_MAX_ACCOUNT_WORKERS, max(1, total_accounts))
     _update_state(
         creating=True,
         round_status=f"批量创建 {job.get('completed_accounts', 0)}/{total_accounts} 个账号",
@@ -3503,7 +3528,13 @@ def main():
     try:
         from waitress import serve
         print(f"\n  Production → http://{args.host}:{args.port}\n")
-        serve(app, host=args.host, port=args.port, threads=96, connection_limit=2000)
+        serve(
+            app,
+            host=args.host,
+            port=args.port,
+            threads=_env_int("WEB_THREADS", 32, 8, 64),
+            connection_limit=2000,
+        )
     except ImportError:
         print(f"\n  Dev server → http://{args.host}:{args.port}\n")
         app.run(host=args.host, port=args.port, debug=False, threaded=True)
