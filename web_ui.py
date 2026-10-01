@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """iCloud HME Web UI — 多账号聚合管理平台 — Flask single-page app."""
-import sys, os, json, time, queue, secrets, threading, re, hashlib
+import sys, os, json, time, queue, secrets, threading, re, hashlib, math
+from contextlib import nullcontext
 from collections import OrderedDict, deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from datetime import datetime, timedelta
@@ -230,6 +231,16 @@ _TEMPORARY_CREATE_LIMIT_MARKERS = (
 )
 
 
+def _batch_terminal_status(job):
+    created = int(job.get('total_created', 0) or 0)
+    if not created:
+        return 'failed'
+    entries = list((job.get('accounts') or {}).values())
+    target = sum(int(e.get('target', e.get('count', e.get('target_count', job.get('count_per_account', 0)))) or 0) for e in entries)
+    incomplete = any(e.get('status') in ('failed', 'limited', 'partial', 'stopped') for e in entries)
+    return 'partial' if job.get('total_errors') or incomplete or created < target else 'completed'
+
+
 def _load_batch_state(path=_BATCH_STATE_FILE):
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -241,6 +252,9 @@ def _load_batch_state(path=_BATCH_STATE_FILE):
         )
         while len(jobs) > _BATCH_JOB_HISTORY:
             jobs.popitem(last=False)
+        for job in jobs.values():
+            if job.get('status') in ('completed', 'partial', 'failed'):
+                job['status'] = _batch_terminal_status(job)
         active_id = str(data.get("active_id") or "") or None
         if active_id not in jobs or jobs.get(active_id, {}).get("status") not in (
             "queued", "running", "paused"
@@ -560,6 +574,10 @@ def _health_loop():
             break
         for account in _account_mgr.list_accounts():
             acc_id = account["id"]
+            if _shutdown_event.is_set():
+                break
+            if float(account.get('health_retry_at') or 0) > time.time():
+                continue
             if _account_create_in_progress(acc_id):
                 continue
             try:
@@ -1371,7 +1389,7 @@ async function saveProxySubscription(){var url=E('proxySubscriptionUrl').value.t
 async function clearProxySubscription(){var d=await api('/api/proxy-subscription',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'clear'})});if(d.ok){toast('订阅地址已清除');loadProxySubscription();}else{E('proxySubscriptionStatus').textContent=d.error||'清除失败';toast(d.error||'清除失败',true);}}
 setTimeout(loadNetworkProxy,1000);
 setTimeout(loadProxySubscription,1000);
-async function loadCreationGuard(){var d=await api('/api/creation-guard');if(!d.ok)return;var g=d.protection;E('guardConcurrency').value=g.settings.concurrency;E('guardDaily').value=g.settings.daily_limit;var h='<p>'+ (g.multi_account_alert?'多个账号出现同类异常，请检查；其他账号继续创建':'账号独立保护，其他账号不受牵连')+'</p>';Object.keys(g.accounts).forEach(function(id){var a=g.accounts[id];h+='<div style="padding:8px;border-bottom:1px solid #eee">'+esc(id)+' · 今日尝试 '+a.attempts+' / 成功 '+a.successes+' · '+esc(a.blocked||a.last_error_kind||'正常')+(a.retry_at>Date.now()/1000?' · 冷却至 '+new Date(a.retry_at*1000).toLocaleString():'')+(a.pending?' · 有待核对地址':'')+' <button class="btn btn-sm guard-release">检查后解除账号暂停</button></div>';});E('creationGuardStatus').innerHTML=h;Array.from(E('creationGuardStatus').querySelectorAll('.guard-release')).forEach(function(b,i){b.onclick=function(){releaseCreationGuard(Object.keys(g.accounts)[i]);};});}
+async function loadCreationGuard(){var d=await api('/api/creation-guard');if(!d.ok)return;var g=d.protection;E('guardConcurrency').value=g.settings.concurrency;E('guardDaily').value=g.settings.daily_limit;var now=Date.now()/1000;var ids=Object.keys(g.accounts||{}).filter(function(id){var a=g.accounts[id]||{};return !!(a.blocked||a.pending||(a.retry_at||0)>now);});var h='<p>'+ (g.multi_account_alert?'多个账号出现同类异常，请检查；其他账号继续创建':'账号独立保护，其他账号不受牵连')+'</p>';if(!ids.length){h+='<p class="hint">当前没有需要处理的创建保护记录。</p>';}ids.forEach(function(id){var a=g.accounts[id]||{};var canRelease=!!a.blocked;h+='<div style="padding:8px;border-bottom:1px solid #eee">'+esc(id)+' · 今日尝试 '+(a.attempts||0)+' / 成功 '+(a.successes||0)+' · '+esc(a.blocked||a.last_error_kind||'冷却中')+((a.retry_at||0)>now?' · 冷却至 '+new Date(a.retry_at*1000).toLocaleString():'')+(a.pending?' · 有待核对地址':'')+(canRelease?' <button class="btn btn-sm guard-release" data-account-id="'+escAttr(id)+'">检查后解除账号暂停</button>':'')+'</div>';});E('creationGuardStatus').innerHTML=h;Array.from(E('creationGuardStatus').querySelectorAll('.guard-release')).forEach(function(b){b.onclick=function(){releaseCreationGuard(b.dataset.accountId,true);};});}
 async function saveCreationGuard(){var d=await api('/api/creation-guard',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'settings',concurrency:Number(E('guardConcurrency').value),daily_limit:Number(E('guardDaily').value)})});toast(d.ok?'保护设置已保存':d.error,!d.ok);if(d.ok)loadCreationGuard();}
 async function releaseCreationGuard(id,ask){if(id&&ask!==false&&!confirm('确认解除这个账号的创建暂停？解除后不会自动开始创建，需要你重新选择账号并点击“开始创建”。'))return;var d=await api('/api/creation-guard',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'release',account_id:id||null})});toast(d.ok?'暂停已解除；冷却和待核对记录仍保留':d.error,!d.ok);if(d.ok){await loadCreationGuard();await refreshAll();}}
 setTimeout(loadCreationGuard,1000);
@@ -1449,13 +1467,13 @@ async function handleRestoreTxtFile(input){var file=input&&input.files&&input.fi
 function renderAliasTable(){updateEmailFilter();var filtered=visibleAliases();var exportedCount=emails.filter(function(e){return e.exported}).length;var unexportedCount=emails.length-exportedCount;E('exportCountUnexported').textContent=t('export.unexported_n',{n:unexportedCount});E('exportCountExported').textContent=t('export.exported_n',{n:exportedCount});E('exportCountAll').textContent=t('export.all_n',{n:emails.length});E('emailCount').textContent=filtered.length+' / '+emails.length;updateAliasPager(filtered.length);var c=E('aliasTableContainer');if(!filtered.length){c.innerHTML='<div class="empty"><div class="icon"></div>'+(emails.length?t('emails.empty_filter'):t('emails.empty'))+'</div>';return;}if(!pickupLinksLoaded){c.innerHTML='<div class="empty">'+t('pickup.generating')+'</div>';loadPickupLinks().then(renderAliasTable);return;}var start=(aliasPage-1)*aliasPageSize;var pageItems=filtered.slice(start,start+aliasPageSize);var pages=Math.max(1,Math.ceil(filtered.length/aliasPageSize));var h='<table class="email-table"><thead><tr><th style="width:42px"><input type="checkbox" title="'+escAttr(t('table.select_page'))+'" onclick="toggleAllPickup()"></th><th>#</th><th>'+t('table.email')+'</th><th>'+t('table.lookup')+'</th><th>'+t('table.pickup')+'</th><th>'+t('table.account')+'</th><th>'+t('table.label')+'</th><th>'+t('table.created')+'</th><th>'+t('table.export')+'</th><th>'+t('table.status')+'</th></tr></thead><tbody>';pageItems.forEach(function(e,i){var key=String(e.email||'').toLowerCase();var url=pickupLinksByEmail[key]||'';var checked=pickupSelected[key]&&!e.exported?' checked':'';var disabled=e.exported?' disabled':'';var accName=e.account_name||e.account_email||e.account_id||'--';var activeHtml=e.hasOwnProperty('active')?(e.active?'<span style="color:var(--green)">'+t('status.active')+'</span>':'<span style="color:var(--red)">'+t('status.inactive')+'</span>'):'<span style="color:var(--muted)">--</span>';var exportHtml=e.exported?'<span style="color:var(--green)">'+t('export.exported')+'</span><div class="hint">'+esc(formatExportTime(e.exported_at))+'</div><button class="copy-btn" onclick="restoreExportedEmail(\''+escAttr(e.email||'')+'\')" title="'+escAttr(t('export.restore_title'))+'">'+t('export.restore')+'</button>':'<span style="color:var(--muted)">'+t('export.unexported')+'</span>';h+='<tr><td><input class="pickup-check" type="checkbox" data-email="'+escAttr(e.email||'')+'"'+checked+disabled+' onchange="togglePickupSelected(this.dataset.email,this.checked)"></td><td class="hint">'+(start+i+1)+'</td><td class="mono">'+esc(e.email||'')+'</td><td class="pickup-cell"><button class="copy-btn" onclick="openAliasInbox(\''+escAttr(e.email||'')+'\',\''+escAttr(e.account_id||'')+'\')" title="'+escAttr(t('lookup.this_alias'))+'">'+t('table.lookup')+'</button></td><td class="pickup-cell">'+(url?'<button class="copy-btn" onclick="copyPickup(\''+escAttr(url)+'\')" title="'+escAttr(url)+'">'+t('pickup.copy')+'</button>':'<span class="hint">'+t('pickup.failed')+'</span>')+'</td><td>'+esc(accName)+'</td><td class="hint">'+esc((e.label||'').substring(0,30))+'</td><td style="white-space:nowrap">'+esc(formatExportTime(e.created_at))+'</td><td>'+exportHtml+'</td><td>'+activeHtml+'</td></tr>';});h+='</tbody></table>';h+='<div class="pager pager-bottom"><span class="hint">'+(start+1)+'-'+(start+pageItems.length)+' / '+filtered.length+'</span><button class="btn btn-outline btn-sm" onclick="setAliasPage(aliasPage-1)"'+(aliasPage<=1?' disabled':'')+'>'+t('pager.prev')+'</button><button class="btn btn-outline btn-sm" onclick="setAliasPage(aliasPage+1)"'+(aliasPage>=pages?' disabled':'')+'>'+t('pager.next')+'</button></div>';c.innerHTML=h;}
 function batchStatusText(status){var labels={waiting:t('batch.wait_apple'),queued:t('batch.queued'),running:t('batch.running'),paused:t('batch.paused'),stopped:t('batch.stopped'),completed:t('batch.done'),partial:t('batch.partial'),limited:t('batch.limited'),failed:t('batch.failed')};return labels[status]||status||'--';}
 var batchSelectionInitialized=false;var batchSelection=new Set();function renderBatchPanel(){if(batchSelectionInitialized){document.querySelectorAll('#batchChkGroup input').forEach(function(b){if(b.checked)batchSelection.add(b.value);else batchSelection.delete(b.value);});}var activeAccs=accounts.filter(function(a){return a.status==='active'&&!a.mail_sync_paused&&a.mail_status!=='auth_failed'});E('batchAccCount').textContent=t('batch.available_n',{n:activeAccs.length});var g=E('batchChkGroup');if(!activeAccs.length){g.innerHTML='<span class="hint">'+t('batch.none')+'</span>';updateCreateControlButtons();}else{var busy=batchBusyAccountIds(batchJob);var paused=batchPausedAccountIds(batchJob);g.innerHTML=activeAccs.map(function(a){var email=a.real_email||a.name||a.id;var limited=a.create_status==='limited';var isBusy=!!busy[a.id];var isPaused=!!paused[a.id];var note=limited?'<span style="color:var(--red);font-size:12px">'+t('batch.retry_note')+'</span>':(isPaused?'<span style="color:var(--ink-faint);font-size:12px">'+t('batch.paused')+'</span>':(isBusy?'<span style="color:var(--ink-faint);font-size:12px">'+t('batch.running')+'</span>':''));var selected=pendingBatchAccountId?pendingBatchAccountId===a.id:batchSelectionInitialized?batchSelection.has(a.id):true;return'<label class="chk-item"><input type="checkbox" value="'+escAttr(a.id)+'"'+(selected?' checked':'')+'><span><strong>'+esc(a.name||email.substring(0,20))+'</strong> '+note+'</span></label>';}).join('');document.querySelectorAll('#batchChkGroup input').forEach(function(box){box.addEventListener('change',updateCreateControlButtons);});updateCreateControlButtons();}batchSelection=new Set(Array.from(document.querySelectorAll('#batchChkGroup input:checked')).map(function(b){return b.value;}));batchSelectionInitialized=true;pendingBatchAccountId=null;if(batchJob)renderBatchJob(batchJob);else loadCurrentBatchJob();}
-async function loadCurrentBatchJob(){var d=await api('/api/create-batch-current');if(d.ok&&d.job){batchJob=d.job;renderBatchJob(batchJob);if(batchJob.status==='queued'||batchJob.status==='running')scheduleBatchPoll();}}
+async function loadCurrentBatchJob(){var d=await api('/api/create-batch-current');if(d.ok){batchJob=d.job||null;renderBatchJob(batchJob);if(batchJob&&(batchJob.status==='queued'||batchJob.status==='running'))scheduleBatchPoll();}}
 function jobDisplayStatus(job){var waiting=false,runningAcc=false,pausedAcc=false;Object.keys(job.accounts||{}).forEach(function(id){var st=(job.accounts[id]||{}).status;if(st==='waiting')waiting=true;if(st==='running'||st==='queued')runningAcc=true;if(st==='paused')pausedAcc=true;});if((job.status==='queued'||job.status==='running')&&waiting&&!runningAcc)return 'waiting';if((job.status==='queued'||job.status==='running'||job.status==='paused')&&pausedAcc&&!runningAcc&&!waiting)return 'paused';return job.status;}
 function batchBusyAccountIds(job){var ids={};if(!job||(job.status!=='queued'&&job.status!=='running'&&job.status!=='paused'))return ids;Object.keys(job.accounts||{}).forEach(function(id){var st=(job.accounts[id]||{}).status;if(st==='queued'||st==='running'||st==='waiting')ids[id]=true;});return ids;}function batchPausedAccountIds(job){var ids={};if(!job)return ids;Object.keys(job.accounts||{}).forEach(function(id){if((job.accounts[id]||{}).status==='paused')ids[id]=true;});return ids;}function selectedBatchAccountIds(){var ids=[];document.querySelectorAll('#batchChkGroup input:checked').forEach(function(c){ids.push(c.value)});return ids;}function updateCreateControlButtons(){var pauseBtn=E('btnBatchPause'),stopBtn=E('btnBatchStop'),startBtn=E('btnBatchExec');if(!startBtn)return;var ids=selectedBatchAccountIds();var busy=batchBusyAccountIds(batchJob);var paused=batchPausedAccountIds(batchJob);var canStart=ids.some(function(id){return !busy[id];});var canPause=ids.some(function(id){return !!busy[id];});var canStop=ids.some(function(id){return !!busy[id]||!!paused[id];});startBtn.disabled=!ids.length||!canStart;if(pauseBtn)pauseBtn.disabled=!canPause;if(stopBtn)stopBtn.disabled=!canStop;}function batchAccountTarget(job,item){return parseInt((item||{}).target,10)||parseInt(job.count_per_account,10)||0;}function batchTargetCount(job){var accs=job.accounts||{};var ids=Object.keys(accs);var target=0;ids.forEach(function(id){target+=batchAccountTarget(job,accs[id]);});return target||((job.total_created||0)+(job.total_errors||0));}
 function progressBarHtml(created,errors,target,mode){var createdPct=target?Math.min(100,created*100/target):0;var errorPct=target?Math.min(100-createdPct,errors*100/target):0;if(created&&createdPct<1.2)createdPct=1.2;return '<div class="progress-bar'+(mode?(' '+mode):'')+'"><div class="fill ok" style="width:'+createdPct+'%"></div>'+(errorPct?('<div class="fill err" style="width:'+errorPct+'%"></div>'):'')+'</div>';}
 function retryLeftText(retryAt){if(!retryAt)return '';var deadline=Date.parse(retryAt);if(!deadline)return '';var sec=Math.max(0,Math.round((deadline-Date.now())/1000));if(sec<=0)return t('batch.retry_soon');if(sec<60)return t('batch.retry_sec',{n:sec});return t('batch.retry_min',{n:Math.ceil(sec/60)});}
-function renderBatchJob(job){var box=E('batchProgress');if(!job){box.innerHTML='';return}var total=job.total_accounts||0,done=job.completed_accounts||0,created=job.total_created||0,errors=job.total_errors||0,target=batchTargetCount(job)||0;var processed=target?Math.min(target,created+errors):created+errors;var pct=target?Math.round(processed*100/target):0;var displayStatus=jobDisplayStatus(job);var statusColor=displayStatus==='completed'?'var(--green)':(displayStatus==='failed'||displayStatus==='limited'||displayStatus==='waiting')?'var(--red)':'var(--ink)';var running=job.status==='queued'||job.status==='running';var barMode=displayStatus==='waiting'?'is-wait':(running?'is-run':'');var h='<div class="progress-card"><div class="progress-head"><strong style="color:'+statusColor+'">'+esc(batchStatusText(displayStatus))+'</strong><span>'+created+' / '+target+' · '+pct+'%</span></div>'+progressBarHtml(created,errors,target,barMode)+'<div class="progress-meta"><span>'+t('batch.accounts_done',{done:done,total:total})+'</span><span>'+t('batch.ok_fail',{created:created,errors:errors})+'</span></div>';Object.keys(job.accounts||{}).forEach(function(id){var item=job.accounts[id],color=item.status==='completed'?'var(--green)':(item.status==='limited'||item.status==='failed'||item.status==='waiting'||item.status==='stopped')?'var(--red)':(item.status==='paused'?'var(--ink)':'var(--muted)');var accTarget=batchAccountTarget(job,item),accCreated=item.created||0,accErrors=item.errors||0;var accMode=item.status==='waiting'?'is-wait':((item.status==='running'||item.status==='queued')?'is-run':'');var extra=retryLeftText(item.retry_at);var note=item.error||((item.status==='running'||item.status==='queued')?'正在向 Apple 申请':'');var canRelease=String(note).indexOf('创建已暂停：')===0||String(note).indexOf('创建已暂停:')===0;var releaseHtml=canRelease?' <button type="button" class="btn btn-outline btn-xs batch-release-guard" data-account-id="'+escAttr(id)+'">解除暂停</button>':'';h+='<div class="progress-item"><div class="progress-head"><strong>'+esc(item.name||id)+'</strong><span style="color:'+color+'">'+esc(batchStatusText(item.status))+(accTarget?(' · '+accCreated+' / '+accTarget):(' · '+accCreated))+'</span></div>'+progressBarHtml(accCreated,accErrors,accTarget||Math.max(accCreated+accErrors,1),accMode)+((note||extra)?('<div class="progress-note" style="color:var(--red)">'+esc(note)+(extra?(' · '+esc(extra)):'' )+releaseHtml+'</div>'):'')+'</div>';});h+='</div>';box.innerHTML=h;box.querySelectorAll('.batch-release-guard').forEach(function(btn){btn.onclick=function(){releaseCreationGuard(btn.dataset.accountId,true);};});var busy=batchBusyAccountIds(job);var checks=document.querySelectorAll('#batchChkGroup input[type=checkbox]');var canStart=false;checks.forEach(function(box){if(!busy[box.value])canStart=true;});E('btnBatchExec').textContent=t('settings.start');updateCreateControlButtons();renderSidebar();if(curTab==='accounts')renderDashboard();}function scheduleBatchPoll(){if(batchPollTimer)clearTimeout(batchPollTimer);batchPollTimer=setTimeout(pollBatchJob,1200);}
-async function pollBatchJob(){if(!batchJob||!batchJob.id)return;var d=await api('/api/create-batch/'+encodeURIComponent(batchJob.id));if(!d.ok){toast(t('batch.progress_fail',{err:d.error||t('error.unknown')}),true);return}batchJob=d.job;renderBatchJob(batchJob);if(batchJob.status==='queued'||batchJob.status==='running'){scheduleBatchPoll();return}if(batchJob.status==='paused'){await refreshAll();return}await refreshAll();if(batchJob.total_created){toast(t('batch.complete_n',{n:batchJob.total_created}));}else{toast(t('batch.none_created'),true);}}
+function renderBatchJob(job){var box=E('batchProgress');if(!job){box.innerHTML='';return}var total=job.total_accounts||0,done=job.completed_accounts||0,created=job.total_created||0,errors=job.total_errors||0,target=batchTargetCount(job)||0;var processed=target?Math.min(target,created+errors):created+errors;var pct=target?Math.round(processed*100/target):0;var displayStatus=jobDisplayStatus(job);var statusColor=displayStatus==='partial'?'#b7791f':displayStatus==='completed'?'var(--green)':(displayStatus==='failed'||displayStatus==='limited'||displayStatus==='waiting')?'var(--red)':'var(--ink)';var running=job.status==='queued'||job.status==='running';var barMode=displayStatus==='waiting'?'is-wait':(running?'is-run':'');var h='<div class="progress-card"><div class="progress-head"><strong style="color:'+statusColor+'">'+esc(batchStatusText(displayStatus))+'</strong><span>'+created+' / '+target+' · '+pct+'%</span></div>'+progressBarHtml(created,errors,target,barMode)+'<div class="progress-meta"><span>'+t('batch.accounts_done',{done:done,total:total})+'</span><span>'+t('batch.ok_fail',{created:created,errors:errors})+'</span></div>';Object.keys(job.accounts||{}).forEach(function(id){var item=job.accounts[id],color=item.status==='partial'?'#b7791f':item.status==='completed'?'var(--green)':(item.status==='limited'||item.status==='failed'||item.status==='waiting'||item.status==='stopped')?'var(--red)':(item.status==='paused'?'var(--ink)':'var(--muted)');var accTarget=batchAccountTarget(job,item),accCreated=item.created||0,accErrors=item.errors||0;var accMode=item.status==='waiting'?'is-wait':((item.status==='running'||item.status==='queued')?'is-run':'');var extra=retryLeftText(item.retry_at);var note=item.error||((item.status==='running'||item.status==='queued')?'正在向 Apple 申请':'');var canRelease=String(note).indexOf('创建已暂停：')===0||String(note).indexOf('创建已暂停:')===0;var releaseHtml=canRelease?' <button type="button" class="btn btn-outline btn-xs batch-release-guard" data-account-id="'+escAttr(id)+'">解除暂停</button>':'';h+='<div class="progress-item"><div class="progress-head"><strong>'+esc(item.name||id)+'</strong><span style="color:'+color+'">'+esc(batchStatusText(item.status))+(accTarget?(' · '+accCreated+' / '+accTarget):(' · '+accCreated))+'</span></div>'+progressBarHtml(accCreated,accErrors,accTarget||Math.max(accCreated+accErrors,1),accMode)+((note||extra)?('<div class="progress-note" style="color:var(--red)">'+esc(note)+(extra?(' · '+esc(extra)):'' )+releaseHtml+'</div>'):'')+'</div>';});h+='</div>';box.innerHTML=h;box.querySelectorAll('.batch-release-guard').forEach(function(btn){btn.onclick=function(){releaseCreationGuard(btn.dataset.accountId,true);};});var busy=batchBusyAccountIds(job);var checks=document.querySelectorAll('#batchChkGroup input[type=checkbox]');var canStart=false;checks.forEach(function(box){if(!busy[box.value])canStart=true;});E('btnBatchExec').textContent=t('settings.start');updateCreateControlButtons();renderSidebar();if(curTab==='accounts')renderDashboard();}function scheduleBatchPoll(){if(batchPollTimer)clearTimeout(batchPollTimer);batchPollTimer=setTimeout(pollBatchJob,1200);}
+async function pollBatchJob(){if(!batchJob||!batchJob.id)return;var d=await api('/api/create-batch/'+encodeURIComponent(batchJob.id));if(!d.ok){toast(t('batch.progress_fail',{err:d.error||t('error.unknown')}),true);return}batchJob=d.job;renderBatchJob(batchJob);if(batchJob.status==='queued'||batchJob.status==='running'){scheduleBatchPoll();return}if(batchJob.status==='paused'){await refreshAll();return}await refreshAll();if(batchJob.status==='partial'){toast(t('batch.partial')+' · '+t('batch.ok_fail',{created:batchJob.total_created||0,errors:batchJob.total_errors||0}),true);}else if(batchJob.total_created){toast(t('batch.complete_n',{n:batchJob.total_created}));}else{toast(t('batch.none_created'),true);}}
 async function controlBatchCreate(action){var ids=selectedBatchAccountIds();if(!ids.length){toast(t('batch.need_account'),true);return}var busy=batchBusyAccountIds(batchJob);var paused=batchPausedAccountIds(batchJob);if(action==='pause'&&!ids.some(function(id){return !!busy[id];})){toast(t('batch.need_creating'),true);return}if(action==='stop'&&!ids.some(function(id){return !!busy[id]||!!paused[id];})){toast(t('batch.need_creating'),true);return}var pauseBtn=E('btnBatchPause'),stopBtn=E('btnBatchStop');if(pauseBtn)pauseBtn.disabled=true;if(stopBtn)stopBtn.disabled=true;var d=await api('/api/create-control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:action,account_ids:ids})});if(!d.ok){updateCreateControlButtons();toast(d.error||t('batch.control_fail'),true);return}if(d.job){batchJob=d.job;renderBatchJob(batchJob);if(batchJob.status==='queued'||batchJob.status==='running')scheduleBatchPoll();}toast(t(action==='pause'?'batch.paused_ok':'batch.stopped_ok',{n:(d.affected||ids).length}));updateCreateControlButtons();refreshAll();}
 async function execBatchCreate(){var checks=document.querySelectorAll('#batchChkGroup input:checked');var ids=[];checks.forEach(function(c){ids.push(c.value)});if(!ids.length){toast(t('batch.need_account'),true);return}var count=Math.max(1,Math.min(parseInt(E('batchCount').value)||5,750));E('batchCount').value=count;var label=E('batchLabel').value.trim();var btn=E('btnBatchExec');btn.disabled=true;btn.textContent=t('batch.starting');var d=await api('/api/create-batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({account_ids:ids,count_per_account:count,label:label})});if(!d.ok){btn.textContent=t('settings.start');updateCreateControlButtons();if(d.job_id){batchJob={id:d.job_id,status:'running'};scheduleBatchPoll();}toast(d.error||t('batch.start_fail'),true);return}batchJob=d.job;renderBatchJob(batchJob);scheduleBatchPoll();}
 function setInboxBusy(busy){_inboxBusy=busy;['btnInboxSearch','btnInboxAll'].forEach(function(id){var btn=E(id);if(btn)btn.disabled=busy});}
@@ -1522,7 +1540,7 @@ async function setAppPassword(accId){var pwd=E('appPwdInput').value.trim();var e
 function setCreateBusy(accId,busy){if(busy)_createBusyByAccount[accId]=true;else delete _createBusyByAccount[accId];document.querySelectorAll('.acc-actions button').forEach(function(btn){var action=btn.getAttribute('onclick')||'';if(action.indexOf("createForAccount('"+accId+"'")>=0)btn.disabled=busy;});}
 async function createForAccount(accId,count){if(_createBusyByAccount[accId]){toast(t('create.busy'),true);return}setCreateBusy(accId,true);try{var d=await api('/api/accounts/'+encodeURIComponent(accId)+'/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({count:count})});if(d.ok)toast(t('create.ok',{n:d.created}));else toast(d.error||t('create.fail'),true);}finally{setCreateBusy(accId,false);await refreshAll();}}
 async function validateAccount(accId){toast(t('status.checking_login'));var d=await api('/api/accounts/'+encodeURIComponent(accId)+'/validate',{method:'POST'});if(d.ok)toast(t('status.login_ok_email',{email:d.real_email}));else toast(d.error||t('status.login_expired'),true);refreshAll();}
-async function removeAccount(accId){if(!confirm(t('account.delete_confirm')))return;var d=await api('/api/accounts/'+encodeURIComponent(accId)+'/remove',{method:'POST'});if(d.ok)toast(t('account.deleted'));refreshAll();}
+async function removeAccount(accId){if(!confirm(t('account.delete_confirm')))return;var d=await api('/api/accounts/'+encodeURIComponent(accId)+'/remove',{method:'POST'});if(!d.ok){toast(d.error||t('error.unknown'),true);return;}if(batchPollTimer){clearTimeout(batchPollTimer);batchPollTimer=null;}batchJob=null;renderBatchJob(null);toast(t('account.deleted'));await refreshAll();await loadCurrentBatchJob();}
 async function toggleScheduler(){var act=state.running?'stop':'start';var d=await api('/api/scheduler/'+act,{method:'POST'});if(d.ok)toast(state.running?t('auto.stopped'):t('auto.started'));refreshAll();}
 function copyOne(email){copyText(email,t('copy.one',{email:email}));}
 function copyAll(){var filtered=visibleAliases();if(!filtered.length){toast(t('emails.empty_filter'),true);return}copyText(filtered.map(function(e){return e.email}).join('\n'),t('copy.n',{n:filtered.length}));}
@@ -1777,24 +1795,133 @@ def _purge_account_data(acc_id):
                 _pickup_body_refreshing.discard(key)
     return stats
 
+def _remove_account_from_batch_jobs(acc_id):
+    """Remove a deleted account from all durable batch snapshots."""
+    global _batch_active_id
+    changed = 0
+    with _batch_lock:
+        for job_id, job in list(_batch_jobs.items()):
+            accounts = job.get("accounts") or {}
+            ids = job.get("account_ids") or []
+            if acc_id not in accounts and acc_id not in ids:
+                continue
+            accounts.pop(acc_id, None)
+            job["accounts"] = accounts
+            job["account_ids"] = [item for item in ids if item != acc_id]
+            job["total_accounts"] = len(accounts)
+            job["completed_accounts"] = sum(
+                1 for entry in accounts.values() if entry.get("finished_at")
+            )
+            job["total_created"] = sum(int(e.get("created", 0) or 0) for e in accounts.values())
+            job["total_errors"] = sum(int(e.get("errors", 0) or 0) for e in accounts.values())
+            job["updated_at"] = datetime.now(_BJ_TZ).isoformat()
+            if not accounts and not job["account_ids"]:
+                del _batch_jobs[job_id]
+                if _batch_active_id == job_id:
+                    _batch_active_id = None
+            else:
+                _sync_job_status_locked(job)
+            changed += 1
+        if changed:
+            _save_batch_state_locked()
+    return changed
+
+
+def _prune_deleted_batch_accounts():
+    """Repair snapshots left behind by deletions in older releases."""
+    with _batch_lock:
+        stale_ids = {
+            acc_id
+            for job in _batch_jobs.values()
+            for acc_id in set(job.get("account_ids") or []) | set(job.get("accounts") or {})
+            if _account_mgr.get_account(acc_id) is None
+        }
+        return sum(_remove_account_from_batch_jobs(acc_id) for acc_id in stale_ids)
+
+
+def _prune_deleted_creation_guard_accounts():
+    """Repair protection records left behind by deletions in older releases."""
+    guard = getattr(_account_mgr, "creation_guard", None)
+    if guard is None:
+        return 0
+    return guard.prune_accounts(account["id"] for account in _account_mgr.list_accounts())
+
 @app.route("/api/accounts/<acc_id>/remove", methods=["POST"])
 def api_remove_account(acc_id):
-    if not _account_mgr.get_account(acc_id):
+    pending = _load_account_deletions()
+    if not _account_mgr.get_account(acc_id) and acc_id not in pending:
         return jsonify({"ok":False,"error":"账号不存在"}), 404
     with _manual_create_lock:
-        manual_busy = acc_id in _manual_creating_accounts
-    if manual_busy or _batch_uses_account(acc_id):
-        return jsonify({"ok":False,"error":"账号正在创建邮箱，暂时不能删除"}), 409
-    with _pickup_refresh_lock:
-        _removed_account_ids.add(acc_id)
-    ok = _account_mgr.remove_account(acc_id)
-    if not ok:
-        with _pickup_refresh_lock:
-            _removed_account_ids.discard(acc_id)
-        return jsonify({"ok":False,"error":"账号不存在"}), 404
-    cleanup = _purge_account_data(acc_id)
+        if acc_id in _manual_creating_accounts or _batch_uses_account(acc_id):
+            return jsonify({"ok":False,"error":"账号正在创建邮箱，暂时不能删除"}), 409
+    try:
+        _set_account_deletion(acc_id, True)
+        cleanup = _finish_account_deletion(acc_id)
+    except Exception:
+        _emit_log('warn', f'账号删除尚未完成，将在重启或再次删除时重试: {acc_id}')
+        return jsonify(ok=False, cleanup_pending=True,
+                       error='删除清理尚未完成，已保留恢复记录，请稍后重试'), 503
     _emit_log("info", f"删除账号并清理本地数据: {acc_id}")
     return jsonify({"ok":True,"cleanup":cleanup})
+
+
+_deletion_lock = threading.RLock()
+
+
+def _load_account_deletions():
+    from durable_json import read_object
+    with _deletion_lock:
+        return read_object(RESULTS_DIR / 'account_deletions.json').get('pending', {})
+
+
+def _set_account_deletion(acc_id, pending):
+    from durable_json import write_object
+    with _deletion_lock:
+        entries = _load_account_deletions()
+        if pending:
+            entries[acc_id] = True
+        else:
+            entries.pop(acc_id, None)
+        write_object(RESULTS_DIR / 'account_deletions.json', {'pending': entries})
+
+
+def _account_removed(acc_id):
+    if acc_id in _removed_account_ids:
+        return True
+    getter = getattr(_account_mgr, 'get_account', None)
+    if getter:
+        return getter(acc_id) is None
+    return acc_id not in getattr(_account_mgr, 'accounts', {})
+
+
+def _finish_account_deletion(acc_id):
+    # A durable forward-recovery journal spans the independent JSON/SQLite stores.
+    # Never remove lock entries while waiters can still hold the same lock object.
+    operation = getattr(_account_mgr, '_operation_lock', lambda _: nullcontext())(acc_id)
+    mail_sync = getattr(_account_mgr, '_mail_sync_lock', lambda _: nullcontext())(acc_id)
+    with operation:
+        _account_mgr.remove_account(acc_id)
+        with mail_sync:
+            with _pickup_refresh_lock:
+                _removed_account_ids.add(acc_id)
+            cleanup = _purge_account_data(acc_id)
+            cleanup['batch_jobs'] = _remove_account_from_batch_jobs(acc_id)
+            guard = getattr(_account_mgr, 'creation_guard', None)
+            if guard is not None:
+                cleanup['creation_guard'] = guard.remove_account(acc_id)
+            with _account_control_lock:
+                _account_controls.pop(acc_id, None)
+                _paused_account_ids.discard(acc_id)
+                _save_create_controls_locked()
+            _set_account_deletion(acc_id, False)
+            with _pickup_refresh_lock:
+                _removed_account_ids.discard(acc_id)
+            return cleanup
+
+
+def _recover_account_deletions():
+    for acc_id in _load_account_deletions():
+        _finish_account_deletion(acc_id)
 
 @app.route("/api/accounts/<acc_id>/validate", methods=["POST"])
 def api_validate_account(acc_id):
@@ -1878,6 +2005,9 @@ def api_create_for_account(acc_id):
 @app.route("/api/creation-guard", methods=["GET", "POST"])
 def api_creation_guard():
     guard = _account_mgr.creation_guard
+    # Older versions did not remove guard records when an account was deleted.
+    # Prune those records on every read so the settings page stays actionable.
+    guard.prune_accounts(account["id"] for account in _account_mgr.list_accounts())
     if request.method == "POST":
         data = request.get_json(silent=True) or {}
         try:
@@ -1886,6 +2016,11 @@ def api_creation_guard():
                 if acc_id and not _account_mgr.get_account(acc_id):
                     return jsonify(ok=False, error="账号不存在"), 404
                 guard.unblock(acc_id)
+                if acc_id:
+                    account = _account_mgr.get_account(acc_id)
+                    if account and account.get("create_status") == "limited":
+                        _account_mgr.update_account(acc_id, create_status="available",
+                            create_last_error=None, create_limited_at=None)
                 _emit_log("info", "管理员更新创建保护状态" + (f": {acc_id}" if acc_id else "（清除多账号异常提醒）"))
             elif data.get("action") == "settings":
                 guard.configure(data.get("concurrency"), data.get("daily_limit"))
@@ -1958,6 +2093,7 @@ def api_proxy_subscription():
 
 
 def _batch_job_snapshot(job_id):
+    _prune_deleted_batch_accounts()
     with _batch_lock:
         job = _batch_jobs.get(job_id)
         return json.loads(json.dumps(job, ensure_ascii=False)) if job else None
@@ -2325,9 +2461,10 @@ def _run_batch_job(job_id):
     )
 
     try:
-        with ThreadPoolExecutor(
+        executor = ThreadPoolExecutor(
             max_workers=_BATCH_MAX_ACCOUNT_WORKERS, thread_name_prefix="batch-account"
-        ) as executor:
+        )
+        try:
             futures = {}
             while True:
                 with _batch_lock:
@@ -2358,6 +2495,10 @@ def _run_batch_job(job_id):
                     _update_state(
                         round_status=f"批量创建 {completed_accounts}/{total_accounts} 个账号"
                     )
+        finally:
+            # In-flight workers checkpoint their own state. Do not let the
+            # executor context manager indefinitely block the SIGTERM path.
+            executor.shutdown(wait=not _shutdown_event.is_set(), cancel_futures=True)
 
         with _batch_lock:
             paused_left = any(
@@ -2375,7 +2516,7 @@ def _run_batch_job(job_id):
                 job["finished_at"] = None
                 final_status = "paused"
             else:
-                job["status"] = "completed" if total_created else "failed"
+                job["status"] = _batch_terminal_status(job)
                 job["finished_at"] = datetime.now(_BJ_TZ).isoformat()
                 final_status = job["status"]
             job["updated_at"] = datetime.now(_BJ_TZ).isoformat()
@@ -2383,7 +2524,7 @@ def _run_batch_job(job_id):
         if final_status != "paused":
             _increment_state(today_created=total_created, total_created=total_created)
         _emit_log(
-            "info" if final_status == "paused" else ("success" if total_created else "warn"),
+            "info" if final_status == "paused" else ("success" if final_status == 'completed' else "warn"),
             (
                 f"批量任务已暂停: {total_created} 成功 / {total_errors} 失败"
                 if final_status == "paused"
@@ -2448,9 +2589,15 @@ def api_create_batch():
         return jsonify({"ok": False, "error": "请选择至少一个账号"}), 400
     if len(account_ids) > 100:
         return jsonify({"ok": False, "error": "单次最多选择 100 个主账号"}), 400
+    missing = [acc_id for acc_id in account_ids if _account_mgr.get_account(acc_id) is None]
+    if missing:
+        return jsonify(ok=False, error="所选账号不存在或已删除，请刷新列表", account_ids=missing), 400
     try:
         count = int(data.get("count_per_account", 5))
-        interval = max(0.0, min(float(data.get("interval", 3.0)), 30.0))
+        interval = float(data.get("interval", 3.0))
+        if not math.isfinite(interval):
+            raise ValueError()
+        interval = max(0.0, min(interval, 30.0))
     except (TypeError, ValueError):
         return jsonify({"ok": False, "error": "创建数量或间隔无效"}), 400
     if count < 1 or count > 750:
@@ -2573,7 +2720,7 @@ def _sync_job_status_locked(job):
         job["status"] = "paused"
         job["finished_at"] = None
         return
-    job["status"] = "completed" if job.get("total_created") else "failed"
+    job["status"] = _batch_terminal_status(job)
     job["finished_at"] = datetime.now(_BJ_TZ).isoformat()
     if _batch_active_id == job.get("id"):
         _batch_active_id = None
@@ -2733,6 +2880,7 @@ def api_create_control():
 
 @app.route("/api/create-batch-current")
 def api_create_batch_current():
+    _prune_deleted_batch_accounts()
     with _batch_lock:
         job_id = _batch_active_id or (next(reversed(_batch_jobs), None) if _batch_jobs else None)
     return jsonify({"ok": True, "job": _batch_job_snapshot(job_id) if job_id else None})
@@ -2755,11 +2903,9 @@ def api_set_app_password(acc_id):
         result = ICloudMail(target_email, pwd).test_connection()
         if not result.get("ok"):
             return jsonify(result), 400
-        _account_mgr._drop_mail_client(acc_id)
-        _account_mgr.update_account(
+        _account_mgr.set_mail_credentials(
             acc_id,
-            app_password=pwd,
-            icloud_email=target_email,
+            pwd, target_email,
             mail_status="ok",
             mail_sync_paused=False,
             mail_next_retry_at=None,
@@ -3065,7 +3211,7 @@ def _prepare_pickup_message(message):
 def _store_pickup_body(account_id, msg_id, message):
     prepared = _prepare_pickup_message(message)
     with _pickup_refresh_lock:
-        if account_id in _removed_account_ids:
+        if _account_removed(account_id):
             return prepared
     _pickup_body_store.put(account_id, str(msg_id), prepared)
     with _pickup_refresh_lock:
@@ -3077,7 +3223,7 @@ def _refresh_pickup_account(account_id):
     global _pickup_pending
     try:
         with _pickup_refresh_lock:
-            if account_id in _removed_account_ids:
+            if _account_removed(account_id):
                 return
         # Pickup links already contain the alias mapping. Avoid the iCloud HME
         # API here so an expired browser cookie cannot block IMAP delivery.
@@ -3085,7 +3231,7 @@ def _refresh_pickup_account(account_id):
         aliases = [item.get("alias_email", "") for item in links]
         synced = _account_mgr.sync_pickup_mail(account_id, aliases, scan_limit=100, days=30)
         with _pickup_refresh_lock:
-            removed = account_id in _removed_account_ids
+            removed = _account_removed(account_id)
         if removed:
             _account_mgr._cache.clear_account(account_id)
             _pickup_body_store.delete_account(account_id)
@@ -3157,7 +3303,7 @@ def _schedule_pickup_account_refresh(account_id):
     if _mail_account_paused(account_id):
         return False
     with _pickup_refresh_lock:
-        if account_id in _removed_account_ids:
+        if _account_removed(account_id):
             return False
         if account_id in _mail_watch_hold_accounts:
             return False
@@ -3469,6 +3615,17 @@ def main():
     if not args.no_sync:
         offset = _sync_time()
         if abs(offset)>0.5: print(f"[*] Time sync: offset {offset:.1f}s")
+    _recover_account_deletions()
+    _prune_deleted_batch_accounts()
+    _prune_deleted_creation_guard_accounts()
+    _account_mgr._cache.prune_accounts(_account_mgr.accounts)
+    with _account_control_lock:
+        _paused_account_ids.intersection_update(_account_mgr.accounts)
+        _save_create_controls_locked()
+    # Upgrade legacy plaintext before starting any concurrent workers.
+    _account_mgr._save()
+    with _batch_lock:
+        _save_batch_state_locked()
     _initialize_mail_pauses()
     threading.Thread(target=_health_loop, daemon=True).start()
     threading.Thread(target=_mail_watch_loop, daemon=True).start()

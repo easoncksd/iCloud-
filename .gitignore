@@ -16,6 +16,9 @@ backup/
 *.bak
 
 # Sensitive — never commit
+.credentials.key
+*.key
+*.pem
 logs/
 results/
 cookies.json

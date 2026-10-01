@@ -365,7 +365,7 @@ def test_async_batch_skips_limited_account_and_continues():
             if job["status"] not in ("queued", "running"):
                 break
             time.sleep(0.02)
-        assert job["status"] == "completed"
+        assert job["status"] == "partial"
         assert job["total_created"] == 2
         assert job["accounts"]["limited"]["status"] == "limited"
         assert job["accounts"]["working"]["status"] == "completed"
@@ -913,6 +913,9 @@ def test_pickup_uses_persistent_body_and_deduplicates_sync():
     class FakeManager:
         _cache = FakeCache()
 
+        def get_account(self, account_id):
+            return {'id': account_id}
+
     class FakeBodyStore:
         def get(self, account_id, message_id):
             if account_id == "acc" and message_id == "7":
@@ -1259,6 +1262,7 @@ def test_remove_account_purges_all_local_data():
                 "pickup_links": 2,
                 "latest_emails": 1,
                 "export_history": 2,
+                "batch_jobs": 0,
             }
             assert pickup.revoked == ["one"]
             assert exports.deleted == ["one"]
@@ -1770,8 +1774,9 @@ def test_reimport_keeps_account_and_rejects_mismatch():
             assert updated["alias_total"] == 1
             assert updated["last_error"] is None
             saved = json.loads(account_manager.ACCOUNTS_FILE.read_text(encoding="utf-8"))
-            assert saved["accounts"]["acc"]["cookies"] == {"a": "new-cookie"}
-            assert saved["accounts"]["acc"]["app_password"] == "secret-app-password"
+            assert 'cookies' not in saved["accounts"]["acc"]
+            assert account_manager.AccountManager().accounts['acc']['cookies'] == {"a": "new-cookie"}
+            assert 'app_password' not in saved["accounts"]["acc"]
 
             FakeHME.info = {"appleId": "other@163.com"}
             try:

@@ -89,6 +89,52 @@ class CreationGuard:
             self.active.discard(acc_id)
             self.queued.discard(acc_id)
 
+    def remove_account(self, acc_id):
+        """Forget durable protection state for an account that was deleted."""
+        acc_id = str(acc_id or "")
+        if not acc_id:
+            return False
+        with self.lock:
+            removed = self.data['accounts'].pop(acc_id, None) is not None
+            changed = self._prune_history(set(self.data['accounts']))
+            self.active.discard(acc_id)
+            self.queued.discard(acc_id)
+            if removed or changed:
+                self.save()
+            return removed
+
+    def prune_accounts(self, valid_ids):
+        """Remove protection records whose accounts no longer exist."""
+        valid = {str(acc_id) for acc_id in (valid_ids or ()) if acc_id}
+        with self.lock:
+            stale = [acc_id for acc_id in self.data['accounts'] if acc_id not in valid]
+            for acc_id in stale:
+                self.data['accounts'].pop(acc_id, None)
+                self.active.discard(acc_id)
+                self.queued.discard(acc_id)
+            changed = self._prune_history(valid)
+            self.active.intersection_update(valid)
+            self.queued.intersection_update(valid)
+            if stale or changed:
+                self.save()
+            return len(stale)
+
+    def _prune_history(self, valid):
+        before = json.dumps(self.data, sort_keys=True)
+        now = time.time()
+        self.data['events'] = [e for e in self.data.get('events', [])
+                               if e.get('account_id') in valid and e.get('at', 0) >= now - 600]
+        for task_id, counts in list(self.data.get('task_successes', {}).items()):
+            self.data['task_successes'][task_id] = {k: v for k, v in counts.items() if k in valid}
+            if not self.data['task_successes'][task_id]:
+                self.data['task_successes'].pop(task_id)
+        alert = self.data.get('multi_account_alert')
+        if alert:
+            recent = {e['account_id'] for e in self.data['events']
+                      if e['kind'] == alert['kind'] and e['at'] > self.data.get('circuit_reset_at', 0)}
+            self.data['multi_account_alert'] = dict(alert, accounts=len(recent)) if len(recent) >= 3 else None
+        return json.dumps(self.data, sort_keys=True) != before
+
     def attempt(self, acc_id):
         with self.lock:
             e = self.account(acc_id)

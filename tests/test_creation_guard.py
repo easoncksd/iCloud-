@@ -56,6 +56,18 @@ def test_legacy_global_pause_no_longer_blocks_other_accounts(tmp_path):
     assert guard.check('bad', {})['error_kind'] == 'blocked'
 
 
+def test_deleted_accounts_can_be_removed_and_pruned(tmp_path):
+    guard = CreationGuard(tmp_path / 'guard.json')
+    guard.attempt('keep')
+    guard.attempt('deleted')
+    assert guard.remove_account('deleted')
+    assert 'deleted' not in guard.snapshot()['accounts']
+    assert not guard.remove_account('deleted')
+    guard.attempt('stale')
+    assert guard.prune_accounts({'keep'}) == 1
+    assert set(guard.snapshot()['accounts']) == {'keep'}
+
+
 def test_failed_attempts_count_toward_daily_limit(tmp_path):
     guard = CreationGuard(tmp_path / 'guard.json')
     guard.configure(1, 1)

@@ -87,10 +87,15 @@ def run_one_round(mgr: AccountManager, logger: logging.Logger, label: str = "", 
                         time.sleep(_random.uniform(10, 30))
                     else:
                         errors += 1
-                        if is_limit_error(r.get("error","")): logger.info(f"limit hit: {r.get('error','')[:60]}"); break
-                else: errors += 1
+                        error_text = str(r.get("error") or "create_alias returned an unsuccessful result")
+                        round_result.errors.append({"account_id": acc_id, "error": error_text})
+                        if is_limit_error(error_text): logger.info(f"limit hit: {error_text[:60]}"); break
+                else:
+                    errors += 1
+                    round_result.errors.append({"account_id": acc_id, "error": "create_alias returned no results"})
             except Exception as e:
                 err_str = str(e); errors += 1
+                round_result.errors.append({"account_id": acc_id, "error": err_str})
                 if is_limit_error(err_str): logger.info(f"limit hit: {err_str[:60]}"); break
                 if any(kw in err_str.lower() for kw in ["401","403","cookie","session","validate"]):
                     logger.error(f"fatal {acc_name}: {err_str[:200]}"); mgr.update_account(acc_id, status="error", last_error=err_str[:300]); round_result.fatal_error = err_str; break
@@ -105,12 +110,12 @@ def save_round_result(round_result: CreateRound, logger: logging.Logger):
     ts = round_result.start_time.strftime("%Y%m%d_%H%M%S"); result_file = RESULT_DIR / f"round_{ts}.json"
     result_file.write_text(json.dumps({"start_time":round_result.start_time.isoformat(),"end_time":round_result.end_time.isoformat() if round_result.end_time else None,"created_count":len(round_result.created),"created":round_result.created,"errors":round_result.errors,"hit_limit":round_result.hit_limit,"fatal_error":round_result.fatal_error}, indent=2, ensure_ascii=False), encoding="utf-8")
 
-def wait_interval(logger: logging.Logger, seconds: float = 3600):
+def wait_interval(logger: logging.Logger, seconds: float = 3600, should_stop=None):
     target = datetime.now() + timedelta(seconds=seconds)
     logger.info(f"next round: {target.strftime('%H:%M:%S')} ({seconds/60:.0f}min)")
     while True:
         rem = (target - datetime.now()).total_seconds()
-        if rem <= 0: break
+        if rem <= 0 or (callable(should_stop) and should_stop()): break
         time.sleep(min(rem, 30))
 
 class Scheduler:
@@ -128,7 +133,7 @@ class Scheduler:
             now = datetime.now(ZoneInfo('Asia/Shanghai'))
             if now.hour < 7 or now.hour >= 20:
                 self.logger.info(f"outside window BJ {now.hour}:00")
-                wait_interval(self.logger, 1800)
+                wait_interval(self.logger, 1800, should_stop=lambda: not self._running)
                 continue
             round_num += 1
             label = f"{self.label_prefix}R{round_num} {now.strftime('%m%d%H%M')}" if self.label_prefix else f"R{round_num} {now.strftime('%m%d%H%M')}"
@@ -140,7 +145,7 @@ class Scheduler:
             self._state["last_error"] = round_result.fatal_error; save_state(self._state)
             if round_result.fatal_error: self.logger.error(f"fatal exit: {round_result.fatal_error[:200]}"); self._running = False; break
             if not self._running: break
-            wait_interval(self.logger, random.randint(3600, 5400))
+            wait_interval(self.logger, random.randint(3600, 5400), should_stop=lambda: not self._running)
         self.logger.info(f"scheduler stopped. total: {self._state.get('total_created',0)}"); save_state(self._state)
 
 def main():

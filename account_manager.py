@@ -25,6 +25,7 @@ import random
 import time
 import uuid
 import threading
+import weakref
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -86,8 +87,9 @@ class AccountManager:
         # _save() also takes this lock; use RLock for callers that update then persist.
         self._lock = threading.RLock()
         self._mail_clients: Dict[str, Any] = {}
-        self._mail_sync_locks: Dict[str, threading.Lock] = {}
-        self._operation_locks: Dict[str, threading.RLock] = {}
+        # Keep lock identity while any worker holds it, without retaining deleted IDs.
+        self._mail_sync_locks = weakref.WeakValueDictionary()
+        self._operation_locks = weakref.WeakValueDictionary()
         self._latest_emails_lock = threading.Lock()
         self._cache = get_cache()
         self._load()
@@ -107,15 +109,30 @@ class AccountManager:
             if not isinstance(accounts, dict) or any(not isinstance(a, dict) for a in accounts.values()):
                 raise RuntimeError("accounts.json 账号结构损坏，已停止操作以保护原文件")
             self.accounts = accounts
+            from credential_store import unseal
+            for acc_id, account in accounts.items():
+                if 'credentials_encrypted' in account:
+                    account.update(unseal(acc_id, account.pop('credentials_encrypted'),
+                                          ACCOUNTS_FILE.with_name('.credentials.key')))
 
     def _save(self):
         with self._lock:
+            from credential_store import seal
+            stored = {}
+            for acc_id, account in self.accounts.items():
+                item = dict(account)
+                credentials = {key: item.pop(key) for key in ('cookies', 'app_password') if key in item}
+                if credentials:
+                    item['credentials_encrypted'] = seal(acc_id, credentials,
+                                                         ACCOUNTS_FILE.with_name('.credentials.key'))
+                stored[acc_id] = item
             payload = json.dumps({
-                    "accounts": self.accounts,
+                    "accounts": stored,
                     "updated_at": datetime.now().isoformat(),
                 }, indent=2, ensure_ascii=False)
             tmp = ACCOUNTS_FILE.with_suffix(ACCOUNTS_FILE.suffix + ".tmp")
-            with open(tmp, "w", encoding="utf-8") as handle:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
@@ -363,7 +380,7 @@ class AccountManager:
         if host not in ("icloud.com", "icloud.com.cn"):
             host = self.detect_icloud_host(cookie_input)
 
-        with self._operation_lock(acc_id):
+        with self._operation_lock(acc_id), self._mail_sync_lock(acc_id):
             account = self.accounts.get(acc_id)
             if not account:
                 raise KeyError(f"账号不存在: {acc_id}")
@@ -400,6 +417,8 @@ class AccountManager:
                 account["status"] = "active"
                 account["last_error"] = None
                 account["last_validated"] = datetime.now().isoformat()
+                account.update(last_error_kind=None, health_failures=0, health_retry_at=None,
+                               credential_generation=uuid.uuid4().hex)
                 if new_email:
                     account["real_email"] = new_email
                 derived = self._derive_icloud_email(info)
@@ -416,12 +435,16 @@ class AccountManager:
             return dict(account)
 
     def remove_account(self, acc_id: str) -> bool:
-        with self._operation_lock(acc_id):
+        with self._operation_lock(acc_id), self._mail_sync_lock(acc_id):
             self._drop_mail_client(acc_id)
             with self._lock:
                 if acc_id in self.accounts:
-                    del self.accounts[acc_id]
-                    self._save()
+                    removed = self.accounts.pop(acc_id)
+                    try:
+                        self._save()
+                    except Exception:
+                        self.accounts[acc_id] = removed
+                        raise
                     return True
                 return False
 
@@ -501,9 +524,16 @@ class AccountManager:
             account["status"] = "active"
             account["last_validated"] = datetime.now().isoformat()
             account["last_error"] = None
+            account.update(last_error_kind=None, health_failures=0, health_retry_at=None)
         except Exception as e:
+            from create_guard import classify
+            kind = classify(e)
             account["status"] = "error"
             account["last_error"] = str(e)[:300]
+            failures = int(account.get('health_failures', 0)) + 1
+            account.update(last_error_kind=kind, health_failures=failures,
+                           health_retry_at=time.time() + (21600 if kind == 'auth' else
+                                                         min(3600, 300 * 2 ** min(failures - 1, 4))))
 
         self._save()
         if aliases:
@@ -542,12 +572,26 @@ class AccountManager:
         )
 
     def set_app_password(self, acc_id: str, app_password: str):
-        self._drop_mail_client(acc_id)
-        with self._lock:
-            if acc_id not in self.accounts:
-                raise KeyError(f"账号不存在: {acc_id}")
-            self.accounts[acc_id]["app_password"] = app_password
-            self._save()
+        self.set_mail_credentials(acc_id, app_password)
+
+    def set_mail_credentials(self, acc_id, app_password, icloud_email=None, **updates):
+        with self._operation_lock(acc_id), self._mail_sync_lock(acc_id):
+            self._drop_mail_client(acc_id)
+            with self._lock:
+                if acc_id not in self.accounts:
+                    raise KeyError(f"账号不存在: {acc_id}")
+                account = self.accounts[acc_id]
+                before = dict(account)
+                account.update(app_password=app_password, **updates)
+                account['credential_generation'] = uuid.uuid4().hex
+                if icloud_email is not None:
+                    account['icloud_email'] = icloud_email
+                try:
+                    self._save()
+                except Exception:
+                    account.clear()
+                    account.update(before)
+                    raise
 
     def _drop_mail_client(self, acc_id: str):
         with self._lock:
@@ -595,10 +639,13 @@ class AccountManager:
                 "请点击下方按钮，输入 @icloud.com 邮箱和应用密码"
             )
         mail = ICloudMail(imap_email, app_pwd, verbose=verbose)
+        generation = account.get('credential_generation')
         def record_failure(error):
             with self._lock:
                 current = self.accounts.get(acc_id)
-                if not current or current.get("app_password") != app_pwd:
+                if (not current or current.get("app_password") != app_pwd or
+                        current.get('credential_generation') != generation or
+                        (current.get('icloud_email') or current.get('real_email')) != imap_email):
                     return
                 self.update_account(acc_id, mail_status="auth_failed",
                     mail_sync_paused=True, mail_last_error=error,

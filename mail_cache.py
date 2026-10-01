@@ -55,10 +55,13 @@ class MailCache:
     def _load(self):
         CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
         if CACHE_FILE.exists():
-            try:
-                self._data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
-            except Exception:
-                self._data = {}
+            from durable_json import read_object
+            self._data = read_object(CACHE_FILE)
+            if any(not isinstance(entry, dict) or
+                   not isinstance(entry.get('inbox_emails', []), list) or
+                   not isinstance(entry.get('alias_emails', {}), dict)
+                   for entry in self._data.values()):
+                raise RuntimeError('mail_cache.json 结构损坏，请从备份恢复')
 
     def _save(self):
         with self._lock:
@@ -99,8 +102,7 @@ class MailCache:
                 self._data[acc_id]["inbox_emails"] = \
                     sort_messages_newest(self._data[acc_id]["inbox_emails"])[:MAX_INBOX_MESSAGES]
             self._data[acc_id]["last_checked"] = datetime.now().isoformat()
-            if new_emails:
-                self._save()
+            self._save()
 
     def get_alias_mail(self, acc_id: str, alias_email: str) -> List[Dict]:
         with self._lock:
@@ -179,6 +181,20 @@ class MailCache:
         with self._lock:
             self._data = {}
             self._save()
+
+    def prune_accounts(self, valid_ids):
+        with self._lock:
+            stale = set(self._data) - set(valid_ids)
+            before = dict(self._data)
+            for acc_id in stale:
+                self._data.pop(acc_id, None)
+            if stale:
+                try:
+                    self._save()
+                except Exception:
+                    self._data = before
+                    raise
+            return len(stale)
 
     def rebind_accounts(self, account_mapping: Dict[str, str]) -> int:
         """Merge cache partitions after an account is re-imported with a new ID."""
