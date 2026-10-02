@@ -39,6 +39,25 @@ def test_completion_journal_failure_keeps_pending(manager, monkeypatch):
     assert guard.task_count('task', 'a') == 0
 
 
+def test_requeue_finished_account_starts_a_new_incremental_segment(manager, monkeypatch):
+    import web_ui as w
+
+    monkeypatch.setattr(w, '_account_mgr', manager)
+    guard = manager.creation_guard
+    guard.pending('a', 'old@icloud.com', 'job')
+    guard.success('a', 'old@icloud.com', 'job')
+    job = {'id': 'job', 'accounts': {'a': {'created': 20}}}
+
+    replacement = w._requeue_finished_batch_account(
+        job, 'a', 1, {'created': 20, 'status': 'partial', 'finished_at': 'done'}
+    )
+
+    assert replacement['created'] == 20
+    assert replacement['target'] == 21
+    assert replacement['journal_base_created'] == 20
+    assert guard.task_count('job', 'a') == 0
+
+
 def test_duplicate_completion_is_idempotent(manager):
     guard = manager.creation_guard
     guard.pending('a', 'candidate@icloud.com', 'task')

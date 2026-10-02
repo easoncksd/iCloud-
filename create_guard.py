@@ -169,6 +169,22 @@ class CreationGuard:
         with self.lock:
             return self.data.get('task_successes', {}).get(task_id, {}).get(acc_id, 0)
 
+    def reset_task_account(self, task_id, acc_id):
+        """Forget journal completions before deliberately retrying a finished item."""
+        task_id = str(task_id or "")
+        acc_id = str(acc_id or "")
+        if not task_id or not acc_id:
+            return False
+        with self.lock:
+            counts = self.data.get('task_successes', {}).get(task_id)
+            if not isinstance(counts, dict) or acc_id not in counts:
+                return False
+            counts.pop(acc_id, None)
+            if not counts:
+                self.data.get('task_successes', {}).pop(task_id, None)
+            self.save()
+            return True
+
     def failure(self, acc_id, error):
         kind = classify(error)
         with self.lock:

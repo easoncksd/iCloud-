@@ -1703,6 +1703,18 @@ def _new_batch_account_entry(acc_id, count):
     }
 
 
+def _requeue_finished_batch_account(job, acc_id, count, previous):
+    """Create a fresh incremental segment for a finished account."""
+    previous_created = max(0, int(previous.get("created", 0) or 0))
+    guard = getattr(_account_mgr, "creation_guard", None)
+    if guard is not None:
+        guard.reset_task_account(job.get("id"), acc_id)
+    replacement = _new_batch_account_entry(acc_id, previous_created + int(count))
+    replacement["created"] = previous_created
+    replacement["journal_base_created"] = previous_created
+    return replacement
+
+
 def _pending_batch_account_ids(job, inflight_ids=None):
     inflight_ids = inflight_ids or set()
     pending = []
@@ -2619,6 +2631,7 @@ def api_create_batch():
                 overlap = []
                 new_ids = []
                 resumed_ids = []
+                requeued_ids = []
                 for acc_id in account_ids:
                     item = (active.get("accounts") or {}).get(acc_id) or {}
                     if item.get("status") in _ACTIVE_BATCH_ACCOUNT_STATUSES:
@@ -2631,9 +2644,14 @@ def api_create_batch():
                         resumed_ids.append(acc_id)
                         _paused_account_ids.discard(acc_id)
                         _set_account_control(acc_id, None)
+                    elif item.get("status") in _FINISHED_BATCH_ACCOUNT_STATUSES and item.get("finished_at"):
+                        active["accounts"][acc_id] = _requeue_finished_batch_account(
+                            active, acc_id, count, item
+                        )
+                        requeued_ids.append(acc_id)
                     else:
                         new_ids.append(acc_id)
-                if not new_ids and not resumed_ids:
+                if not new_ids and not resumed_ids and not requeued_ids:
                     return jsonify({
                         "ok": False,
                         "error": "所选账号已在创建中",
@@ -2641,7 +2659,7 @@ def api_create_batch():
                         "job_id": _batch_active_id,
                     }), 409
                 now = datetime.now(_BJ_TZ).isoformat()
-                if resumed_ids:
+                if resumed_ids or requeued_ids:
                     if active.get("status") == "paused":
                         active["status"] = "queued"
                     _save_create_controls_locked()
@@ -2652,6 +2670,14 @@ def api_create_batch():
                 active["total_accounts"] = len(active["account_ids"])
                 active["completed_accounts"] = sum(
                     1 for entry in active["accounts"].values() if entry.get("finished_at")
+                )
+                active["total_created"] = sum(
+                    int(entry.get("created", 0) or 0)
+                    for entry in active["accounts"].values()
+                )
+                active["total_errors"] = sum(
+                    int(entry.get("errors", 0) or 0)
+                    for entry in active["accounts"].values()
                 )
                 if label:
                     active["label"] = label
