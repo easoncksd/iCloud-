@@ -2426,6 +2426,9 @@ def _run_batch_account(job, acc_id, count, label):
 
 def _mark_batch_account_failed(job, acc_id, error):
     """Record an unexpected worker failure without aborting other accounts."""
+    error_text = str(error).strip()
+    if not error_text:
+        error_text = f"{type(error).__name__}: 未提供错误信息"
     with _batch_lock:
         entry = (job.get("accounts") or {}).get(acc_id)
         if entry is None:
@@ -2433,7 +2436,7 @@ def _mark_batch_account_failed(job, acc_id, error):
         entry.update({
             "status": "failed",
             "errors": int(entry.get("errors", 0) or 0) + 1,
-            "error": str(error)[:200],
+            "error": error_text[:200],
             "retry_at": None,
             "finished_at": datetime.now(_BJ_TZ).isoformat(),
         })
@@ -2501,9 +2504,25 @@ def _run_batch_job(job_id):
                     acc_id = futures.pop(future)
                     try:
                         completed_accounts = future.result()
+                    except _BatchInterrupted:
+                        # A service stop/restart is not an account failure. Keep
+                        # the item queued so startup recovery can continue it.
+                        with _batch_lock:
+                            entry = (job.get("accounts") or {}).get(acc_id)
+                            if entry is not None and not entry.get("finished_at"):
+                                entry.update({
+                                    "status": "queued",
+                                    "error": "服务重启，任务等待恢复",
+                                    "retry_at": None,
+                                })
+                                job["updated_at"] = datetime.now(_BJ_TZ).isoformat()
+                                _save_batch_state_locked()
+                            completed_accounts = job.get("completed_accounts", 0)
+                        _emit_log("info", f"[{acc_id}] 服务重启，账号任务已保留等待恢复")
                     except Exception as exc:
                         completed_accounts = _mark_batch_account_failed(job, acc_id, exc)
-                        _emit_log("error", f"[{acc_id}] 批量账号任务异常: {str(exc)[:200]}")
+                        detail = str(exc).strip() or f"{type(exc).__name__}: 未提供错误信息"
+                        _emit_log("error", f"[{acc_id}] 批量账号任务异常: {detail[:200]}")
                     _update_state(
                         round_status=f"批量创建 {completed_accounts}/{total_accounts} 个账号"
                     )

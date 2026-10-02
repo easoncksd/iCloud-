@@ -37,6 +37,12 @@ def test_batch_worker_failure_is_recorded_per_account(monkeypatch, tmp_path):
     assert job["accounts"]["acc"]["errors"] == 1
     assert job["total_errors"] == 1
 
+    empty_error = {"completed_accounts": 0, "total_errors": 0, "accounts": {
+        "acc": {"status": "running", "created": 0, "errors": 0, "finished_at": None}
+    }}
+    web_ui._mark_batch_account_failed(empty_error, "acc", web_ui._BatchInterrupted())
+    assert "_BatchInterrupted" in empty_error["accounts"]["acc"]["error"]
+
 
 def test_deleted_account_is_removed_from_batch_snapshot(monkeypatch, tmp_path):
     import web_ui
