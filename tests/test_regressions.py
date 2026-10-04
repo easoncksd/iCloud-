@@ -450,6 +450,74 @@ def test_async_batch_retries_temporary_limit_after_cooldown():
     print("  PASS test_async_batch_retries_temporary_limit_after_cooldown")
 
 
+def test_async_batch_retries_transient_network_error_without_sticking():
+    """网络短暂中断时应自动重试，而不是把账号留在已完成状态。"""
+    import web_ui
+
+    class FakeManager:
+        calls = 0
+
+        def get_account(self, _account_id):
+            return {"id": "network", "name": "network", "status": "active"}
+
+        def create_aliases_for_account(self, account_id, count, _label, **_kwargs):
+            self.calls += 1
+            if self.calls < 3:
+                return [{
+                    "ok": False,
+                    "limited": False,
+                    "retryable": False,
+                    "error_kind": "network",
+                    "error": "网络异常，连接失败",
+                }]
+            return [
+                {"ok": True, "email": f"network-{index}@icloud.com", "account_id": account_id}
+                for index in range(count)
+            ]
+
+    original_manager = web_ui._account_mgr
+    original_delay = web_ui._BATCH_NETWORK_RETRY_DELAY_SECONDS
+    original_state_file = web_ui._BATCH_STATE_FILE
+    temp_dir = tempfile.TemporaryDirectory()
+    web_ui._BATCH_STATE_FILE = Path(temp_dir.name) / "batch_jobs.json"
+    with web_ui._batch_lock:
+        original_jobs = web_ui._batch_jobs
+        original_active = web_ui._batch_active_id
+        web_ui._batch_jobs = web_ui.OrderedDict()
+        web_ui._batch_active_id = None
+    web_ui._account_mgr = FakeManager()
+    web_ui._BATCH_NETWORK_RETRY_DELAY_SECONDS = 0.01
+    client = web_ui.app.test_client()
+    try:
+        started = client.post("/api/create-batch", json={
+            "account_ids": ["network"],
+            "count_per_account": 2,
+            "interval": 0,
+        })
+        assert started.status_code == 202
+        job_id = started.get_json()["job_id"]
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            job = client.get(f"/api/create-batch/{job_id}").get_json()["job"]
+            if job["status"] not in ("queued", "running"):
+                break
+            time.sleep(0.01)
+        assert job["status"] == "completed"
+        assert job["total_created"] == 2
+        assert job["total_errors"] == 0
+        assert job["accounts"]["network"]["network_retry_count"] == 0
+        assert web_ui._account_mgr.calls == 3
+    finally:
+        web_ui._account_mgr = original_manager
+        web_ui._BATCH_NETWORK_RETRY_DELAY_SECONDS = original_delay
+        with web_ui._batch_lock:
+            web_ui._batch_jobs = original_jobs
+            web_ui._batch_active_id = original_active
+        web_ui._BATCH_STATE_FILE = original_state_file
+        temp_dir.cleanup()
+    print("  PASS test_async_batch_retries_transient_network_error_without_sticking")
+
+
 def test_batch_retries_every_minute_after_repeated_limit():
     """首次限制短探测，连续限制后应按小时窗口等待。"""
     import web_ui

@@ -208,6 +208,8 @@ _batch_lock = threading.RLock()
 _BATCH_STATE_FILE = RESULTS_DIR / "batch_jobs.json"
 _BATCH_JOB_HISTORY = 20
 _BATCH_RETRY_DELAY_SECONDS = 30 * 60  # Fixed cooldown after each temporary creation limit.
+_BATCH_NETWORK_RETRY_DELAY_SECONDS = 30
+_BATCH_NETWORK_RETRY_LIMIT = 3
 _BATCH_MAX_ACCOUNT_WORKERS = _env_int("BATCH_MAX_ACCOUNT_WORKERS", 12, 1, 20)
 _BATCH_CREATE_HEARTBEAT_SECONDS = max(
     5.0, float(os.environ.get("BATCH_CREATE_HEARTBEAT_SECONDS", "15"))
@@ -412,6 +414,16 @@ def _format_retry_delay(seconds):
 def _is_temporary_create_limit(error):
     from create_guard import classify
     return classify(error) == "throttle"
+
+
+def _is_network_create_error(result):
+    """Return whether a failed create result is a transient network failure."""
+    if not isinstance(result, dict):
+        return False
+    if result.get("error_kind") == "network":
+        return True
+    from create_guard import classify
+    return classify(result.get("error") or "") == "network"
 
 
 _RATE_LIMIT_KW = ["limit","exceeded","maximum","quota","429","too many","try again","unavailable","上限","超过","过多","频繁","rate limit","throttle","blocked"]
@@ -1696,6 +1708,7 @@ def _new_batch_account_entry(acc_id, count):
         "limited": False,
         "error": "",
         "retry_count": 0,
+        "network_retry_count": 0,
         "retry_delay_seconds": 0,
         "retry_at": None,
         "finished_at": None,
@@ -2228,6 +2241,15 @@ def _create_account_with_cooldown(job, acc_id, count, label, name):
         successful.extend(result for result in results if result.get("ok"))
         _raise_if_halted()
         errors = [result for result in results if not result.get("ok")]
+        if successful:
+            # A successful request proves the route recovered.  Network retry
+            # attempts are consecutive failures, not a permanent account state.
+            with _batch_lock:
+                entry = (job.get("accounts") or {}).get(acc_id)
+                if entry is not None:
+                    entry["network_retry_count"] = 0
+                    job["updated_at"] = datetime.now(_BJ_TZ).isoformat()
+                    _save_batch_state_locked()
         if not errors:
             if already_created + len(successful) >= count:
                 return successful
@@ -2238,8 +2260,14 @@ def _create_account_with_cooldown(job, acc_id, count, label, name):
             }]
 
         first_error = str(errors[0].get("error") or "")
+        network_error = any(_is_network_create_error(result) for result in errors)
         retryable = any(result.get("retryable") for result in errors)
-        if not retryable and (any(r.get("error_kind") for r in errors) or not _is_temporary_create_limit(first_error)):
+        with _batch_lock:
+            entry = (job.get("accounts") or {}).get(acc_id)
+            network_retries = int((entry or {}).get("network_retry_count", 0) or 0)
+        if network_error and network_retries >= _BATCH_NETWORK_RETRY_LIMIT:
+            return successful + errors
+        if not network_error and not retryable and (any(r.get("error_kind") for r in errors) or not _is_temporary_create_limit(first_error)):
             return successful + errors
 
         remaining_after_limit = count - already_created - len(successful)
@@ -2249,7 +2277,12 @@ def _create_account_with_cooldown(job, acc_id, count, label, name):
             if entry is None:
                 return successful + [{"ok": False, "error": "批量任务缺少账号状态记录", "limited": False}]
             previous_retries = int(entry.get("retry_count", 0) or 0)
-            retry_delay = float(errors[0].get("retry_after_seconds", _BATCH_RETRY_DELAY_SECONDS))
+            if network_error:
+                network_retries = int(entry.get("network_retry_count", 0) or 0) + 1
+                entry["network_retry_count"] = network_retries
+                retry_delay = float(_BATCH_NETWORK_RETRY_DELAY_SECONDS)
+            else:
+                retry_delay = float(errors[0].get("retry_after_seconds", _BATCH_RETRY_DELAY_SECONDS))
             retry_at = datetime.now(_BJ_TZ) + timedelta(seconds=retry_delay)
             retry_at_text = retry_at.strftime("%Y-%m-%d %H:%M:%S")
             retry_delay_text = _format_retry_delay(retry_delay)
@@ -2258,16 +2291,34 @@ def _create_account_with_cooldown(job, acc_id, count, label, name):
             entry["retry_count"] = previous_retries + 1
             entry["retry_delay_seconds"] = retry_delay
             entry["retry_at"] = retry_at.isoformat()
-            entry["error"] = (
-                f"Apple 临时限制，等待 {retry_delay_text}，"
-                f"{retry_at_text} 自动继续"
-            )
+            if network_error:
+                entry["error"] = (
+                    f"网络异常，等待 {retry_delay_text} 后自动重试 "
+                    f"（第 {network_retries}/{_BATCH_NETWORK_RETRY_LIMIT} 次）"
+                )
+            else:
+                entry["error"] = (
+                    f"Apple 临时限制，等待 {retry_delay_text}，"
+                    f"{retry_at_text} 自动继续"
+                )
             job["updated_at"] = datetime.now(_BJ_TZ).isoformat()
             _save_batch_state_locked()
-        _emit_log(
-            "warn",
-            f"[{name}] Apple 临时限制，等待 {retry_delay_text} 后继续剩余 {remaining_after_limit} 个",
-        )
+        if network_error:
+            guard = getattr(_account_mgr, "creation_guard", None)
+            if guard is not None:
+                # CreationGuard blocks network failures to protect against
+                # duplicates; this retry is deliberately bounded and may clear
+                # only the transient network block before trying again.
+                guard.unblock(acc_id)
+            _emit_log(
+                "warn",
+                f"[{name}] 网络异常，{retry_delay_text} 后自动重试（第 {network_retries}/{_BATCH_NETWORK_RETRY_LIMIT} 次），剩余 {remaining_after_limit} 个",
+            )
+        else:
+            _emit_log(
+                "warn",
+                f"[{name}] Apple 临时限制，等待 {retry_delay_text} 后继续剩余 {remaining_after_limit} 个",
+            )
 
         if _wait_account(acc_id, retry_delay):
             _raise_if_halted()
