@@ -234,6 +234,28 @@ class ICloudHME:
         self._service_url: Optional[str] = None
         self._account_info: Optional[Dict] = None
 
+    def close(self):
+        """Release the requests connection pool held by this client."""
+        session = getattr(self, "session", None)
+        if session is not None:
+            try:
+                session.close()
+            finally:
+                self.session = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+    def __del__(self):
+        # Best-effort fallback for legacy callers that did not use close().
+        try:
+            self.close()
+        except Exception:
+            pass
+
     # ---- 内部 ----
 
     @staticmethod

@@ -1,48 +1,53 @@
-# Bytecode
+# Bytecode and local environments
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-
-# Virtual env
 .venv/
+.pytest_cache/
 
-# Internal
+# Internal and backups
 .reasonix/
-
-# Backups
 backup/
 *.bak-*
 *.bak
+deploy-backups/
+*.tar.gz
 
-# Sensitive — never commit
+# Sensitive runtime state - never commit
 .credentials.key
 *.key
 *.pem
 logs/
 results/
-cookies.json
-cookies.json.bak
-icloud_cookies.json
 accounts.json
 scheduler_state.json
 latest_emails.txt
 mail_cache.json
 pickup_links.json
-
-# Local audit and browser artifacts
-server-snapshots/
-.chrome-test-profile/
-.codex_fix_repo_*/
-.pytest_cache/
-
+cookies.json
+cookies.json.bak
+icloud_cookies.json
 subscription.url
 subscription.meta.json
 *.sqlite3
 *.sqlite3-shm
 *.sqlite3-wal
 *.db
-deploy-backups/
-.qa/
-*.tar.gz
 *.tmp
+*.lock
+
+# Local audit and browser artifacts
+server-snapshots/
+.chrome-test-profile/
+.codex_fix_repo_*/
+.qa/
+*.before.py
+*.github-merge.py
+*.pre-requeue-fix
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

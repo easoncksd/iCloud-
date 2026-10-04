@@ -45,6 +45,7 @@ class ICloudMail:
         self.verbose = verbose
         self.on_auth_failure = None
         self._conn: Optional[imaplib.IMAP4_SSL] = None
+        self.uidvalidity = None
         from network_proxy import load_config
         self._network_config = load_config()
 
@@ -69,8 +70,10 @@ class ICloudMail:
                     f"  2. Apple ID: {self.apple_id}\n"
                     f"  3. 是否已在 appleid.apple.com 生成密码"
                 )
+            self.disconnect()
             raise RuntimeError(f"IMAP 连接失败: {msg}")
         except Exception as e:
+            self.disconnect()
             raise RuntimeError(f"IMAP 连接失败: {e}")
 
     def disconnect(self):
@@ -95,6 +98,12 @@ class ICloudMail:
             status, _ = self._conn.select("INBOX", readonly=True)
             if status != "OK":
                 raise RuntimeError("无法选中 INBOX")
+            status, values = self._conn.response("UIDVALIDITY")
+            if status == "OK" and values and values[0]:
+                try:
+                    self.uidvalidity = int(values[0])
+                except (TypeError, ValueError):
+                    self.uidvalidity = str(values[0])
 
     def check_inbox(self, limit: int = 50, days: int = 7) -> List[Dict]:
         self._ensure_connected()
@@ -134,7 +143,7 @@ class ICloudMail:
         matched.sort(key=lambda message: str(message.get("date") or ""), reverse=True)
         return matched[:limit]
 
-    def recent_uids(self, limit: int = 100, days: int = 30) -> List[bytes]:
+    def recent_uids(self, limit: Optional[int] = None, days: int = 30) -> List[bytes]:
         """Return recent message UIDs newest first without fetching message data."""
         self._ensure_connected()
         since = (datetime.now() - timedelta(days=days)).strftime("%d-%b-%Y")
@@ -144,7 +153,10 @@ class ICloudMail:
         if not data or not data[0]:
             return []
         uids = data[0].split()
-        return list(reversed(uids[-limit:]))
+        if limit is not None:
+            limit = max(1, int(limit))
+            uids = uids[-limit:]
+        return list(reversed(uids))
 
     def fetch_header(self, uid: bytes) -> Optional[Dict]:
         self._ensure_connected()

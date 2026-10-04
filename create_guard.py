@@ -18,27 +18,145 @@ def classify(error):
     if any(s in text for s in ('quota', 'address limit', 'maximum number of addresses',
                                'too many addresses', 'reached the limit of addresses', '达到上限', '超过上限')):
         return 'quota'
-    if any(s in text for s in ('timeout', 'timed out', 'connection', '超时', '连接失败', 'http 5')):
+    if any(s in text for s in (
+        'timeout', 'timed out', 'connection', 'connection reset',
+        'connection refused', 'connection aborted', 'reset by peer',
+        'dns', 'name or service not known', 'temporary failure in name',
+        'ssl error', 'ssl:', 'certificate verify failed', 'eof',
+        'broken pipe', 'unreachable', '超时', '连接失败', '网络异常',
+        '域名解析', '证书错误', 'http 5',
+    )):
         return 'network'
     return 'unknown'
 
 
 class CreationGuard:
+    _MAX_EVENTS = 500
+    _MAX_TASK_SUCCESS_JOURNAL = 1000
+
     def __init__(self, path):
         self.path = Path(path)
         self.lock = threading.RLock()
         self.active = set()
         self.queued = set()
         if self.path.exists():
-            self.data = json.loads(self.path.read_text(encoding='utf-8'))
-            if not isinstance(self.data.get('accounts'), dict):
+            try:
+                raw = json.loads(self.path.read_text(encoding='utf-8'))
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                raise ValueError('创建保护记录损坏，请检查后恢复') from None
+            if not isinstance(raw, dict):
                 raise ValueError('创建保护记录损坏，请检查后恢复')
+            self.data = self._normalize(raw)
         else:
             self.data = {'accounts': {}, 'events': [], 'global_paused': False,
-                         'settings': {'concurrency': 3, 'daily_limit': 50}}
+                         'settings': {'concurrency': 3, 'daily_limit': 50},
+                         'task_successes': {}, 'multi_account_alert': None,
+                         'circuit_reset_at': 0}
         # Older releases used a cross-account circuit breaker. Accounts now isolate
         # their failures; retain the compatibility field without enforcing it.
         self.data['global_paused'] = False
+
+    @classmethod
+    def _normalize(cls, raw):
+        """Validate the durable shape while supplying safe defaults.
+
+        Completion journals are intentionally bounded, but task ids referenced
+        by an unresolved reserve are retained so crash recovery remains
+        idempotent.
+        """
+        accounts = raw.get('accounts', {})
+        if not isinstance(accounts, dict) or any(not isinstance(v, dict) for v in accounts.values()):
+            raise ValueError('创建保护记录损坏，请检查后恢复')
+        events = raw.get('events', [])
+        if not isinstance(events, list):
+            raise ValueError('创建保护记录损坏，请检查后恢复')
+        settings = raw.get('settings', {})
+        if not isinstance(settings, dict):
+            raise ValueError('创建保护记录损坏，请检查后恢复')
+        try:
+            concurrency = int(settings.get('concurrency', 3))
+            daily_limit = int(settings.get('daily_limit', 50))
+        except (TypeError, ValueError):
+            raise ValueError('创建保护参数损坏，请检查后恢复') from None
+        if not 1 <= concurrency <= 10 or not 1 <= daily_limit <= 750:
+            raise ValueError('创建保护参数超出范围，请检查后恢复')
+
+        normalized_accounts = {}
+        for acc_id, value in accounts.items():
+            item = dict(value)
+            item.setdefault('attempts', 0)
+            item.setdefault('successes', 0)
+            item.setdefault('pending', None)
+            item.setdefault('pending_task', None)
+            item.setdefault('retry_at', 0)
+            item.setdefault('blocked', None)
+            for key in ('attempts', 'successes'):
+                try:
+                    item[key] = max(0, int(item[key] or 0))
+                except (TypeError, ValueError):
+                    raise ValueError('创建保护账号计数损坏，请检查后恢复') from None
+            normalized_accounts[str(acc_id)] = item
+
+        task_successes = raw.get('task_successes', {})
+        if not isinstance(task_successes, dict):
+            raise ValueError('创建保护任务记录损坏，请检查后恢复')
+        normalized_tasks = {}
+        for task_id, counts in task_successes.items():
+            if not isinstance(counts, dict):
+                raise ValueError('创建保护任务记录损坏，请检查后恢复')
+            clean_counts = {}
+            for acc_id, count in counts.items():
+                try:
+                    clean_counts[str(acc_id)] = max(0, int(count or 0))
+                except (TypeError, ValueError):
+                    raise ValueError('创建保护任务计数损坏，请检查后恢复') from None
+            if clean_counts:
+                normalized_tasks[str(task_id)] = clean_counts
+        active_tasks = {
+            str(item.get('pending_task'))
+            for item in normalized_accounts.values()
+            if item.get('pending_task')
+        }
+        if len(normalized_tasks) > cls._MAX_TASK_SUCCESS_JOURNAL:
+            items = list(normalized_tasks.items())
+            keep = dict(items[-cls._MAX_TASK_SUCCESS_JOURNAL:])
+            for task_id in active_tasks:
+                if task_id in normalized_tasks:
+                    keep[task_id] = normalized_tasks[task_id]
+            # Drop oldest completed tasks first; active pending tasks are never
+            # discarded even when the journal is over its normal bound.
+            while len(keep) > cls._MAX_TASK_SUCCESS_JOURNAL:
+                candidate = next((key for key in keep if key not in active_tasks), None)
+                if candidate is None:
+                    break
+                keep.pop(candidate, None)
+            normalized_tasks = keep
+
+        clean_events = [event for event in events if isinstance(event, dict)]
+        return {
+            'accounts': normalized_accounts,
+            'events': clean_events[-cls._MAX_EVENTS:],
+            'global_paused': bool(raw.get('global_paused', False)),
+            'settings': {'concurrency': concurrency, 'daily_limit': daily_limit},
+            'task_successes': normalized_tasks,
+            'multi_account_alert': raw.get('multi_account_alert') if isinstance(raw.get('multi_account_alert'), dict) else None,
+            'circuit_reset_at': float(raw.get('circuit_reset_at', 0) or 0),
+        }
+
+    def _prune_task_successes_locked(self):
+        tasks = self.data.setdefault('task_successes', {})
+        if len(tasks) <= self._MAX_TASK_SUCCESS_JOURNAL:
+            return
+        active = {
+            str(item.get('pending_task'))
+            for item in self.data.get('accounts', {}).values()
+            if item.get('pending_task')
+        }
+        for task_id in list(tasks):
+            if len(tasks) <= self._MAX_TASK_SUCCESS_JOURNAL:
+                break
+            if task_id not in active:
+                tasks.pop(task_id, None)
 
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -157,6 +275,7 @@ class CreationGuard:
                 if task_id:
                     counts = self.data.setdefault('task_successes', {}).setdefault(task_id, {})
                     counts[acc_id] = counts.get(acc_id, 0) + 1
+                self._prune_task_successes_locked()
             e.update(pending=None, pending_task=None, retry_at=0, blocked=None,
                      last_success_at=time.time(), last_success_email=email)
             try:

@@ -14,7 +14,7 @@ iCloud Hide My Email — 定时自动创建调度器
     SIGTERM 同上
 """
 
-import sys, os, json, time, signal, logging, argparse
+import sys, os, json, time, signal, logging, argparse, atexit
 import random
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -24,6 +24,8 @@ from typing import Optional, Dict, List
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path: sys.path.insert(0, str(HERE))
 from account_manager import AccountManager
+from durable_json import read_object, write_object
+from process_lock import LockAlreadyHeld, service_process_lock
 
 LOG_DIR = HERE / "logs"
 RESULT_DIR = HERE / "results"
@@ -41,13 +43,24 @@ def setup_logging(verbose: bool = True) -> logging.Logger:
     return logger
 
 def load_state() -> Dict:
-    if STATE_FILE.exists():
-        try: return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        except: pass
-    return {"total_created": 0, "rounds": [], "last_error": None}
+    data = read_object(STATE_FILE)
+    if not data:
+        return {"total_created": 0, "rounds": [], "last_error": None}
+    rounds = data.get("rounds", [])
+    if not isinstance(rounds, list):
+        raise RuntimeError("scheduler_state.json 结构损坏，请从备份恢复")
+    try:
+        total_created = max(0, int(data.get("total_created", 0) or 0))
+    except (TypeError, ValueError):
+        raise RuntimeError("scheduler_state.json 结构损坏，请从备份恢复") from None
+    return {
+        "total_created": total_created,
+        "rounds": rounds[-200:],
+        "last_error": data.get("last_error"),
+    }
 
 def save_state(state: Dict):
-    STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+    write_object(STATE_FILE, state)
 
 class CreateRound:
     def __init__(self):
@@ -155,16 +168,30 @@ def main():
     parser.add_argument("--quiet","-q",action="store_true",help="less output")
     parser.add_argument("--daemon","-d",action="store_true",help="daemon (not Windows)")
     args = parser.parse_args()
-    mgr = AccountManager(); summary = mgr.get_summary()
-    if summary["active_accounts"] == 0: print("no active accounts"); sys.exit(1)
-    print(f"loaded {summary['account_count']} accounts ({summary['active_accounts']} active)")
     if args.daemon:
         if sys.platform == "win32": print("--daemon not supported on Windows"); sys.exit(1)
         pid = os.fork()
         if pid > 0: print(f"daemon PID={pid}"); sys.exit(0)
         os.setsid(); os.umask(0)
-    scheduler = Scheduler(mgr=mgr, label_prefix=args.label, interval_sec=args.interval, verbose=not args.quiet)
-    try: scheduler.run()
-    except KeyboardInterrupt: print("interrupted")
+    service_lock = service_process_lock()
+    try:
+        service_lock.acquire()
+    except LockAlreadyHeld:
+        print("another iCloud HME service or scheduler instance is already running", file=sys.stderr)
+        raise SystemExit(2)
+    atexit.register(service_lock.release)
+    try:
+        mgr = AccountManager(); summary = mgr.get_summary()
+        if summary["active_accounts"] == 0:
+            print("no active accounts")
+            raise SystemExit(1)
+        print(f"loaded {summary['account_count']} accounts ({summary['active_accounts']} active)")
+        scheduler = Scheduler(mgr=mgr, label_prefix=args.label, interval_sec=args.interval, verbose=not args.quiet)
+        try:
+            scheduler.run()
+        except KeyboardInterrupt:
+            print("interrupted")
+    finally:
+        service_lock.release()
 
 if __name__ == "__main__": main()

@@ -24,6 +24,7 @@ import os
 import random
 import time
 import uuid
+import copy
 import threading
 import weakref
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -91,6 +92,9 @@ class AccountManager:
         self._mail_sync_locks = weakref.WeakValueDictionary()
         self._operation_locks = weakref.WeakValueDictionary()
         self._latest_emails_lock = threading.Lock()
+        # web_ui installs a checker so duplicate imports cannot replace an
+        # account while a durable batch entry is waiting on Apple's cooldown.
+        self._creation_activity_checker = None
         self._cache = get_cache()
         self._load()
 
@@ -309,6 +313,7 @@ class AccountManager:
             host = self.detect_icloud_host(cookie_input)
         acc_id = self._generate_id()
         aliases: List[Dict] = []
+        client = None
 
         account: Dict[str, Any] = {
             "id": acc_id,
@@ -349,8 +354,24 @@ class AccountManager:
             account["last_error"] = None
         except Exception as e:
             raise ValueError(str(e)[:300]) from e
+        finally:
+            if client is not None:
+                close = getattr(client, "close", None)
+                if callable(close):
+                    close()
 
         with self._lock:
+            existing_id = self._existing_account_id_locked(account.get("real_email", ""))
+        # Do not invoke the application callback while holding _lock: the
+        # web-layer checker takes its batch lock and status readers take the
+        # locks in the opposite order.
+        if existing_id and self._account_creation_in_progress(existing_id):
+            raise ValueError("该账号已有创建任务，结束后再重新导入")
+        with self._lock:
+            # Re-check identity after the callback in case another import won
+            # the race while we were validating the new credentials. The
+            # activity check intentionally stays outside this lock to avoid a
+            # lock-order inversion with web_ui's batch status readers.
             existing_id = self._existing_account_id_locked(account.get("real_email", ""))
             if existing_id:
                 old = self.accounts[existing_id]
@@ -371,6 +392,29 @@ class AccountManager:
             self.record_known_aliases(acc_id, aliases)
         return account
 
+    def set_creation_activity_checker(self, checker):
+        """Install an optional application-level checker for queued batches."""
+        if checker is not None and not callable(checker):
+            raise TypeError("creation activity checker must be callable")
+        with self._lock:
+            self._creation_activity_checker = checker
+
+    def _account_creation_in_progress(self, acc_id):
+        checker = self._creation_activity_checker
+        if checker is not None:
+            try:
+                if checker(acc_id):
+                    return True
+            except Exception:
+                # A checker must never make account import unsafe by failing
+                # open; the guard below still covers active/queued workers.
+                return True
+        guard = getattr(self, "_creation_guard", None)
+        if guard is not None:
+            with guard.lock:
+                return acc_id in guard.active or acc_id in guard.queued
+        return False
+
     def reimport_account(
         self, acc_id: str, cookie_input: str, host: str = "icloud.com"
     ) -> Dict:
@@ -384,28 +428,38 @@ class AccountManager:
             account = self.accounts.get(acc_id)
             if not account:
                 raise KeyError(f"账号不存在: {acc_id}")
+            if self._account_creation_in_progress(acc_id):
+                raise ValueError("该账号已有创建任务，结束后再重新导入")
 
+            client = None
             try:
                 client = ICloudHME(cookies, host=host, verbose=False)
                 client.validate_session()
                 info = client.get_account_info() or {}
+
+                new_email = (
+                    str(info.get("appleId") or info.get("primaryEmail") or "")
+                ).strip()
+                old_email = str(account.get("real_email") or "").strip()
+                if old_email and new_email and old_email.lower() != new_email.lower():
+                    raise ValueError(
+                        f"Cookie 属于 {new_email}，与当前账号 {old_email} 不一致"
+                    )
+
+                aliases: List[Dict] = []
+                try:
+                    aliases = client.list_aliases()
+                except Exception:
+                    aliases = []
             except Exception as e:
+                if isinstance(e, ValueError) and str(e).startswith("Cookie 属于"):
+                    raise
                 raise ValueError(str(e)[:300]) from e
-
-            new_email = (
-                str(info.get("appleId") or info.get("primaryEmail") or "")
-            ).strip()
-            old_email = str(account.get("real_email") or "").strip()
-            if old_email and new_email and old_email.lower() != new_email.lower():
-                raise ValueError(
-                    f"Cookie 属于 {new_email}，与当前账号 {old_email} 不一致"
-                )
-
-            aliases: List[Dict] = []
-            try:
-                aliases = client.list_aliases()
-            except Exception:
-                aliases = []
+            finally:
+                if client is not None:
+                    close = getattr(client, "close", None)
+                    if callable(close):
+                        close()
 
             self._drop_mail_client(acc_id)
             with self._lock:
@@ -449,13 +503,14 @@ class AccountManager:
                 return False
 
     def get_account(self, acc_id: str) -> Optional[Dict]:
-        return self.accounts.get(acc_id)
+        with self._lock:
+            account = self.accounts.get(acc_id)
+            return copy.deepcopy(account) if account is not None else None
 
     def list_accounts(self) -> List[Dict]:
-        return sorted(
-            self.accounts.values(),
-            key=lambda a: (a.get("status") != "active", a.get("created_at", "")),
-        )
+        with self._lock:
+            accounts = [copy.deepcopy(account) for account in self.accounts.values()]
+        return sorted(accounts, key=lambda a: (a.get("status") != "active", a.get("created_at", "")))
 
     def update_account(self, acc_id: str, **kwargs) -> Optional[Dict]:
         with self._lock:
@@ -496,6 +551,7 @@ class AccountManager:
             raise KeyError(f"账号不存在: {acc_id}")
 
         aliases: List[Dict] = []
+        client = None
         try:
             client = ICloudHME(
                 account["cookies"],
@@ -534,6 +590,11 @@ class AccountManager:
             account.update(last_error_kind=kind, health_failures=failures,
                            health_retry_at=time.time() + (21600 if kind == 'auth' else
                                                          min(3600, 300 * 2 ** min(failures - 1, 4))))
+        finally:
+            if client is not None:
+                close = getattr(client, "close", None)
+                if callable(close):
+                    close()
 
         self._save()
         if aliases:
@@ -664,8 +725,10 @@ class AccountManager:
 
         try:
             mail = self.get_mail_client(acc_id)
-            new_msgs = mail.check_inbox(limit=max(limit, 50), days=days)
-            mail.disconnect()
+            try:
+                new_msgs = mail.check_inbox(limit=max(limit, 50), days=days)
+            finally:
+                mail.disconnect()
         except Exception:
             if force or not cached:
                 raise
@@ -685,8 +748,10 @@ class AccountManager:
 
         try:
             mail = self.get_mail_client(acc_id)
-            new_msgs = mail.find_by_recipient(alias_email, limit=limit, days=days)
-            mail.disconnect()
+            try:
+                new_msgs = mail.find_by_recipient(alias_email, limit=limit, days=days)
+            finally:
+                mail.disconnect()
         except Exception:
             if force or not cached:
                 raise
@@ -714,7 +779,12 @@ class AccountManager:
 
         try:
             client = self.get_client(acc_id, verbose=False)
-            aliases = client.list_aliases()
+            try:
+                aliases = client.list_aliases()
+            finally:
+                close = getattr(client, "close", None)
+                if callable(close):
+                    close()
         except Exception:
             if cached:
                 return cached_slice()
@@ -726,8 +796,10 @@ class AccountManager:
 
         try:
             mail = self.get_mail_client(acc_id)
-            all_inbox = mail.check_inbox(limit=100, days=days)
-            mail.disconnect()
+            try:
+                all_inbox = mail.check_inbox(limit=100, days=days)
+            finally:
+                mail.disconnect()
         except Exception:
             if cached:
                 return cached_slice()
@@ -744,7 +816,9 @@ class AccountManager:
         if results:
             self._cache.set_alias_mail_batch(acc_id, results)
 
-        return results
+        # A successful scan with no newly matched messages must not erase the
+        # cached history shown to users.
+        return results or cached_slice()
 
     def sync_pickup_mail(self, acc_id: str, alias_emails: List[str],
                          scan_limit: int = 100, days: int = 30) -> Dict:
@@ -793,8 +867,30 @@ class AccountManager:
                     mail = self.get_mail_client(acc_id)
                     with self._lock:
                         self._mail_clients[acc_id] = mail
+                # Establish SELECTED state so the client can expose the
+                # server's UIDVALIDITY before we build the local known-id set.
+                ensure_connected = getattr(mail, "_ensure_connected", None)
+                if callable(ensure_connected):
+                    ensure_connected()
+                uidvalidity = getattr(mail, "uidvalidity", None)
+                account = self.get_account(acc_id) or {}
+                previous_uidvalidity = account.get("mail_uidvalidity")
+                if uidvalidity is not None and previous_uidvalidity is not None and str(uidvalidity) != str(previous_uidvalidity):
+                    # IMAP UIDs are only stable within a UIDVALIDITY.  A
+                    # mailbox reset can reuse numbers, so discard headers
+                    # before scanning or new mail could be skipped forever.
+                    self._cache.clear_account(acc_id)
+                    inbox_messages = []
+                    cached_by_alias = {}
+                    recovered_by_alias = {}
+                    known_ids.clear()
+                if uidvalidity is not None and str(uidvalidity) != str(previous_uidvalidity):
+                    self.update_account(acc_id, mail_uidvalidity=uidvalidity)
                 try:
-                    for uid in mail.recent_uids(limit=scan_limit, days=days):
+                    # Do not cap this incremental UID scan at 100: a mailbox
+                    # can receive more messages than the cache warm-up limit
+                    # between polls.  Known UIDs are cheap to skip locally.
+                    for uid in mail.recent_uids(limit=None, days=days):
                         uid_text = uid.decode() if isinstance(uid, bytes) else str(uid)
                         if uid_text in known_ids:
                             continue
@@ -1025,7 +1121,12 @@ class AccountManager:
                 account["create_limited_at"] = datetime.now().isoformat()
                 break
 
-        self._save()
+        try:
+            self._save()
+        finally:
+            close = getattr(client, "close", None)
+            if callable(close):
+                close()
         return results
 
     def create_aliases_batch(
@@ -1066,7 +1167,12 @@ class AccountManager:
         try:
             with self._operation_lock(acc_id):
                 client = self.get_client(acc_id, verbose=False)
-                return client.list_aliases()
+                try:
+                    return client.list_aliases()
+                finally:
+                    close = getattr(client, "close", None)
+                    if callable(close):
+                        close()
         except Exception:
             if raise_errors:
                 raise

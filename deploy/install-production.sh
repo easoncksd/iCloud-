@@ -15,11 +15,47 @@ if [[ $(id -u) -ne 0 ]]; then
 fi
 
 cd "$SOURCE_DIR"
-/root/iCloud/.venv/bin/python -m py_compile \
-    account_manager.py export_history.py icloud_hme.py icloud_mail.py mail_body_store.py mail_cache.py \
-    pickup_links.py scheduler.py web_ui.py
-mkdir -p results
-/root/iCloud/.venv/bin/python tests/test_regressions.py
+PYTHON_BIN=${PYTHON_BIN:-/root/iCloud/.venv/bin/python}
+if [[ ! -x "$PYTHON_BIN" ]]; then
+    PYTHON_BIN=$(command -v python3 || true)
+fi
+[[ -n "$PYTHON_BIN" && -x "$PYTHON_BIN" ]] || {
+    echo "python3 is required for compileall and tests" >&2
+    exit 1
+}
+
+# Validate every Python source file and run the complete test suite before any
+# service files are changed.  Running one regression script is not enough: it
+# misses the standalone tests for persistence, proxy handling, and cleanup.
+"$PYTHON_BIN" -m compileall -q .
+"$PYTHON_BIN" -c 'import pytest' 2>/dev/null || {
+    echo "pytest is required; install requirements-dev.txt in the deploy venv" >&2
+    exit 1
+}
+"$PYTHON_BIN" -m pytest -q
+
+if ! command -v rsync >/dev/null 2>&1; then
+    echo "rsync is required for complete source deployment" >&2
+    exit 1
+fi
+
+build_source_manifest() {
+    local root=$1 output=$2
+    (
+        cd "$root"
+        find . -type f \
+            ! -path './results/*' ! -path './logs/*' \
+            ! -path './.git/*' ! -path './.venv/*' \
+            ! -path './.pytest_cache/*' ! -path '*/__pycache__/*' \
+            ! -name 'accounts.json' ! -name '.credentials.key' \
+            ! -name '*.tmp' ! -name '*.pyc' \
+            -print0 | sort -z | xargs -0 sha256sum
+    ) > "$output"
+}
+
+SOURCE_MANIFEST=$(mktemp)
+trap 'rm -f "$SOURCE_MANIFEST"' EXIT
+build_source_manifest "$SOURCE_DIR" "$SOURCE_MANIFEST"
 
 mkdir -m 700 "$BACKUP_DIR"
 cp -a "$PROJECT_DIR" "$BACKUP_DIR/project"
@@ -56,16 +92,28 @@ rollback() {
 }
 trap rollback ERR
 
-for file in README.md requirements.txt requirements-dev.txt \
-    account_manager.py export_history.py icloud_hme.py icloud_mail.py mail_body_store.py mail_cache.py \
-    pickup_links.py scheduler.py web_ui.py; do
-    install -m 644 "$file" "$PROJECT_DIR/$file"
-done
-mkdir -p "$PROJECT_DIR/tests" "$PROJECT_DIR/.github/workflows" "$PROJECT_DIR/deploy"
-install -m 644 tests/*.py "$PROJECT_DIR/tests/"
-install -m 644 .github/workflows/tests.yml "$PROJECT_DIR/.github/workflows/tests.yml"
-install -m 644 deploy/*.conf "$PROJECT_DIR/deploy/"
-install -m 755 deploy/install-production.sh "$PROJECT_DIR/deploy/install-production.sh"
+mkdir -p "$PROJECT_DIR"
+rsync -a --delete \
+    --exclude='/results/***' --exclude='/logs/***' \
+    --exclude='/accounts.json' --exclude='/.credentials.key' \
+    --exclude='/.git/***' --exclude='/.venv/***' \
+    --exclude='/.pytest_cache/***' --exclude='*/__pycache__/***' \
+    --exclude='*.pyc' --exclude='*.tmp' \
+    "$SOURCE_DIR/" "$PROJECT_DIR/"
+
+# Older source checkouts did not carry the optional GitHub workflow.  Keep the
+# production deploy compatible with those checkouts instead of failing while
+# trying to install a nonexistent file; the source manifest still records all
+# files that were actually deployed.
+if [[ -f "$SOURCE_DIR/.github/workflows/tests.yml" ]]; then
+    install -m 644 "$SOURCE_DIR/.github/workflows/tests.yml" "$PROJECT_DIR/.github/workflows/tests.yml"
+fi
+build_source_manifest "$PROJECT_DIR" "$BACKUP_DIR/source-manifest.remote.sha256"
+if ! diff -u "$SOURCE_MANIFEST" "$BACKUP_DIR/source-manifest.remote.sha256"; then
+    echo "deployed source manifest does not match source checkout" >&2
+    exit 1
+fi
+install -m 600 "$SOURCE_MANIFEST" "$BACKUP_DIR/source-manifest.sha256"
 install -m 600 deploy/icloud-pickup.conf "$NGINX_VHOST"
 install -m 600 deploy/00-icloud-security-zones.conf "$NGINX_ZONES"
 install -m 600 deploy/icloud-hme-override.conf "$SYSTEMD_OVERRIDE"

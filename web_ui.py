@@ -13,6 +13,7 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path: sys.path.insert(0, str(HERE))
 
 from flask import Flask, Response, request, jsonify, render_template_string, redirect
+from werkzeug.exceptions import HTTPException
 from icloud_hme import ICloudHME, extract_chrome_cookies
 from account_manager import AccountManager
 from export_history import ExportHistoryStore, parse_export_txt
@@ -26,12 +27,56 @@ RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
 ADMIN_ACCESS_TOKEN = os.environ.get("ADMIN_ACCESS_TOKEN", "").strip()
 _ADMIN_COOKIE_NAME = "__Host-icloud_admin"
 _ADMIN_COOKIE_VALUE = (
     hashlib.sha256(("icloud-admin-cookie:" + ADMIN_ACCESS_TOKEN).encode()).hexdigest()
     if ADMIN_ACCESS_TOKEN else ""
 )
+
+_MAX_COOKIE_INPUT = 1024 * 1024
+_MAX_NAME_LENGTH = 120
+_MAX_LABEL_LENGTH = 100
+_MAX_EMAIL_LENGTH = 320
+_MAX_APP_PASSWORD_LENGTH = 256
+_MAX_PAGE_LIMIT = 100
+_MAX_PAGE_DAYS = 365
+
+
+def _request_id():
+    """Return a short per-request correlation id without exposing credentials."""
+    value = request.environ.get("icloud.request_id")
+    if not value:
+        value = secrets.token_hex(8)
+        request.environ["icloud.request_id"] = value
+    return value
+
+
+def _api_error(message, status=500):
+    return jsonify({"ok": False, "error": str(message), "request_id": _request_id()}), status
+
+
+def _json_object():
+    """Parse JSON objects consistently; malformed/non-object payloads are rejected."""
+    data = request.get_json(silent=True)
+    return data if isinstance(data, dict) else {}
+
+
+def _bounded_query_int(name, default, minimum=0, maximum=_MAX_PAGE_LIMIT):
+    value = request.args.get(name, default, type=int)
+    if value is None:
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+def _bounded_text(value, limit, default=""):
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value if len(value) <= limit else None
 
 
 
@@ -45,8 +90,9 @@ def _public_bind_blocked(host: str, token: str = "") -> bool:
 
 @app.before_request
 def _require_admin_access():
+    _request_id()
     if globals().get("_shutdown_event") and _shutdown_event.is_set() and request.method not in ("GET", "HEAD"):
-        return jsonify(ok=False, error="服务正在重启，请稍后重试"), 503
+        return _api_error("服务正在重启，请稍后重试", 503) if request.path.startswith("/api/") else ("服务正在重启，请稍后重试", 503)
     if request.path.startswith("/pickup/") or request.path == "/healthz":
         return None
     if not ADMIN_ACCESS_TOKEN:
@@ -72,7 +118,40 @@ def _require_admin_access():
         response.headers["Referrer-Policy"] = "no-referrer"
         return response
 
-    return Response("Not Found", status=404, mimetype="text/plain")
+    return _api_error("未授权或资源不存在", 404) if request.path.startswith("/api/") else Response("Not Found", status=404, mimetype="text/plain")
+
+
+@app.after_request
+def _security_headers(response):
+    """Prevent browser/proxy caching of account, mail, logs and bearer URLs."""
+    path = request.path or ""
+    if path.startswith("/api/") or path.startswith("/pickup/"):
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Request-ID", _request_id())
+    return response
+
+
+@app.errorhandler(HTTPException)
+def _http_error(error):
+    if request.path.startswith("/api/"):
+        return _api_error(error.description or "请求失败", error.code or 500)
+    return error
+
+
+@app.errorhandler(Exception)
+def _unexpected_error(error):
+    if isinstance(error, HTTPException):
+        return _http_error(error)
+    if request.path.startswith("/api/"):
+        # Never return Apple/IMAP/proxy exception strings from an API 500.
+        return _api_error("服务器暂时无法处理请求", 500)
+    # Let Flask's default HTML error page be replaced with a small generic
+    # response for non-API requests as well.  Re-raising from an error handler
+    # can recurse when an exception occurs while rendering the error page.
+    return Response("Internal Server Error", status=500, mimetype="text/plain")
 
 
 @app.route("/healthz")
@@ -164,7 +243,12 @@ def _migrate_stale_account_data():
     rewritten = 0
     if latest_file.exists():
         output = []
-        for raw_line in latest_file.read_text(encoding="utf-8").splitlines():
+        try:
+            latest_lines = latest_file.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError):
+            # This is a derived display cache; it must never prevent startup.
+            latest_lines = []
+        for raw_line in latest_lines:
             parts = raw_line.split("\t")
             if not parts or not parts[0].strip():
                 output.append(raw_line)
@@ -243,10 +327,18 @@ def _batch_terminal_status(job):
     return 'partial' if job.get('total_errors') or incomplete or created < target else 'completed'
 
 
+_BATCH_STATE_LOAD_FAILED = False
+
+
 def _load_batch_state(path=_BATCH_STATE_FILE):
+    global _BATCH_STATE_LOAD_FAILED
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("batch state schema")
         raw_jobs = data.get("jobs", {})
+        if not isinstance(raw_jobs, dict):
+            raise ValueError("batch jobs schema")
         jobs = OrderedDict(
             (str(job_id), job)
             for job_id, job in raw_jobs.items()
@@ -270,7 +362,10 @@ def _load_batch_state(path=_BATCH_STATE_FILE):
                 None,
             )
         return jobs, active_id
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    except (OSError, UnicodeError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
+        # Keep the corrupt file for recovery instead of silently overwriting it
+        # with an empty snapshot during startup.
+        _BATCH_STATE_LOAD_FAILED = True
         return OrderedDict(), None
 
 
@@ -278,14 +373,19 @@ _batch_jobs, _batch_active_id = _load_batch_state()
 _manual_create_lock = threading.RLock()
 _manual_creating_accounts = set()
 _SCHEDULER_FLAG_FILE = RESULTS_DIR / "scheduler_enabled.json"
+_SCHEDULER_FLAG_LOAD_FAILED = False
 
 
 def _load_scheduler_enabled(path=None):
+    global _SCHEDULER_FLAG_LOAD_FAILED
     target = Path(path or _SCHEDULER_FLAG_FILE)
     try:
         data = json.loads(target.read_text(encoding="utf-8"))
-        return bool(isinstance(data, dict) and data.get("enabled"))
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        if not isinstance(data, dict) or not isinstance(data.get("enabled"), bool):
+            raise ValueError("scheduler flag schema")
+        return data["enabled"]
+    except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+        _SCHEDULER_FLAG_LOAD_FAILED = True
         return False
 
 
@@ -335,13 +435,20 @@ _account_controls = {}
 _paused_account_ids = set()
 
 
+_CREATE_CONTROL_LOAD_FAILED = False
+
+
 def _load_create_controls(path=None):
+    global _CREATE_CONTROL_LOAD_FAILED
     target = Path(path or _CREATE_CONTROL_FILE)
     try:
         data = json.loads(target.read_text(encoding="utf-8"))
-        paused = data.get("paused") if isinstance(data, dict) else []
-        return {str(item) for item in paused or [] if item}
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        if not isinstance(data, dict) or not isinstance(data.get("paused", []), list):
+            raise ValueError("create_controls schema")
+        paused = data.get("paused") or []
+        return {str(item) for item in paused if item}
+    except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+        _CREATE_CONTROL_LOAD_FAILED = True
         return set()
 
 
@@ -747,7 +854,10 @@ def _initialize_mail_pauses():
 
 def _apply_mail_watch_result(acc_id, ok, error_text="", verified=False):
     acc_id = str(acc_id or "")
-    account = _account_mgr.get_account(acc_id) if acc_id else None
+    getter = getattr(_account_mgr, "get_account", None)
+    account = getter(acc_id) if callable(getter) and acc_id else None
+    if account is None:
+        account = getattr(_account_mgr, "accounts", {}).get(acc_id) or None
     if not account or not account.get("app_password"):
         return "skip"
     now = datetime.now().isoformat()
@@ -1327,8 +1437,8 @@ var state={running:false,creating:false,round_status:'',total_created:0,today_cr
 var accounts=[],emails=[],logs=[],logCursor=0,sseTimer=null;
 var curTab='emails',sseConn=null;
 var pickupLinksByEmail={};var pickupLinksLoaded=false;var pickupSelected={};var exportFilter='unexported';var aliasPage=1;var aliasPageSize=50;
-var batchJob=null;var batchPollTimer=null;var pendingBatchAccountId=null;
-var _refreshBusy=false;var _createBusyByAccount={};var _aliasesBusy=false;
+var batchJob=null;var batchPollTimer=null;var pendingBatchAccountId=null;var _batchGeneration=0;var _batchPollBusy=false;
+var _refreshBusy=false;var _refreshQueued=false;var _refreshGeneration=0;var _refreshLastError='';var _createBusyByAccount={};var _aliasesBusy=false;var _uiBusy={};
 var _inboxBusy=false;var _inboxSse=null;var _inboxStreamMsgs=[];
 var _inboxRequestSeq=0;var _inboxRenderedAccount='';var _expandedEmail=null;
 var pendingAliasQuery=null;var _aliasSuggestIndex=-1;
@@ -1389,16 +1499,16 @@ function updateEmptyState(){
   if(!accounts.length){btn.textContent=t('action.add_account');btn.onclick=showAddAccountModal;}
   else {btn.textContent=t('action.create_alias');btn.onclick=showCreateDrawer;}
 }
-async function api(path,opts){var timeout=(opts||{}).timeout||60000;if(opts)delete opts.timeout;var ctrl=new AbortController();var timeoutId=setTimeout(function(){ctrl.abort()},timeout);try{var r=await fetch(path,Object.assign({signal:ctrl.signal},opts||{}));clearTimeout(timeoutId);return r.json();}catch(e){clearTimeout(timeoutId);var msg=(e.name==='AbortError')?t('api.timeout',{n:timeout/1000}):(e.message||t('api.network'));return{ok:false,error:msg};}}
+async function api(path,opts){opts=Object.assign({},opts||{});var timeout=opts.timeout||60000;delete opts.timeout;var ctrl=new AbortController();var timeoutId=setTimeout(function(){ctrl.abort()},timeout);try{var r=await fetch(path,Object.assign({signal:ctrl.signal},opts));clearTimeout(timeoutId);var text=await r.text(),data={};try{data=text?JSON.parse(text):{};}catch(_){data={};}if(!data||typeof data!=='object')data={};if(!r.ok){var msg=r.status===401||r.status===403?'未授权，请重新打开管理页面':r.status===404?'数据不存在或已删除':(data.error||('请求失败（HTTP '+r.status+'）'));return Object.assign({},data,{ok:false,error:msg,status:r.status,request_id:r.headers.get('X-Request-ID')||data.request_id||''});}return data;}catch(e){clearTimeout(timeoutId);var msg=(e.name==='AbortError')?t('api.timeout',{n:timeout/1000}):(e.message||t('api.network'));return{ok:false,error:msg};}}
 async function loadAutoProxyStatus(){var d=await api('/api/network-proxy/status');var box=E('autoProxyStatus');if(!d.ok||!d.status){box.textContent=d.error||'自动代理状态读取失败';return;}var s=d.status;if(!s.installed){box.textContent='尚未安装自动代理，仍可使用下方固定代理配置。';return;}if(!s.running){box.textContent=s.error||'代理服务暂时不可用';return;}var c=s.current||{};var h='<p><strong>'+(s.enabled&&s.automatic?'自动切换已启用':s.enabled?'已连接代理，当前不是自动选择模式':'代理服务运行中，项目尚未接入此入口')+'</strong></p><p>当前节点：'+esc(c.name||'等待选择')+' · 延迟：'+(c.delay_ms?esc(c.delay_ms)+' ms':'暂无有效结果')+'</p><p>每 '+esc(s.interval_seconds)+' 秒检测 · 超时 '+esc(s.timeout_ms/1000)+' 秒 · 切换容差 '+esc(s.tolerance_ms)+' ms</p><p>候选节点 '+(s.nodes||[]).length+' 个；仅按网络状况切换，不因账号限流或认证失败换节点。</p>';(s.nodes||[]).forEach(function(n){h+='<div style="padding:4px 0">'+(n.selected?'● ':'○ ')+esc(n.name)+' — '+(n.delay_ms?esc(n.delay_ms)+' ms':'超时或尚未测得')+'</div>';});box.innerHTML=h;}
 setTimeout(loadAutoProxyStatus,1000);setInterval(function(){if(curTab==='settings')loadAutoProxyStatus();},20000);
 function proxyForm(action){return {action:action,mode:E('proxyMode').value,protocol:E('proxyProtocol').value,host:E('proxyHost').value.trim(),port:Number(E('proxyPort').value),username:E('proxyUsername').value,password:E('proxyPassword').value,clear_password:E('proxyClearPassword').checked};}
 async function loadNetworkProxy(){var d=await api('/api/network-proxy');if(!d.ok||!d.config){E('proxyStatus').textContent=d.error||'配置读取失败';return;}var c=d.config;E('proxyMode').value=c.mode;E('proxyProtocol').value=c.protocol;E('proxyHost').value=c.host;E('proxyPort').value=c.port;E('proxyUsername').value=c.username;E('proxyPassword').value='';E('proxyClearPassword').checked=false;E('proxyStatus').textContent=(c.mode==='proxy'?'已启用固定代理':c.mode==='direct'?'直接连接':'保持现有网络方式')+(c.password_set?'；已保存认证密码':'；未保存认证密码');}
-async function testNetworkProxy(){E('proxyStatus').textContent='正在测试 HTTPS 和 IMAP 连接…';var d=await api('/api/network-proxy',{method:'POST',timeout:45000,headers:{'Content-Type':'application/json'},body:JSON.stringify(proxyForm('test'))});var r=d.results;E('proxyStatus').textContent=r?('HTTPS：'+(r.https.ok?'可连接（HTTP '+r.https.status+'）':r.https.error)+'；IMAP：'+(r.imap.ok?'可连接':r.imap.error)):(d.error||'测试失败');}
-async function saveNetworkProxy(){var d=await api('/api/network-proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(proxyForm('save'))});if(d.ok){toast('网络配置已保存');loadNetworkProxy();}else{E('proxyStatus').textContent=d.error||'保存失败';toast(d.error||'保存失败',true);}}
+async function testNetworkProxy(){if(_uiBusy.proxyTest)return;_uiBusy.proxyTest=true;try{E('proxyStatus').textContent='正在测试 HTTPS 和 IMAP 连接…';var d=await api('/api/network-proxy',{method:'POST',timeout:45000,headers:{'Content-Type':'application/json'},body:JSON.stringify(proxyForm('test'))});var r=d.results;E('proxyStatus').textContent=r?('HTTPS：'+(r.https.ok?'可连接（HTTP '+r.https.status+'）':r.https.error)+'；IMAP：'+(r.imap.ok?'可连接':r.imap.error)):(d.error||'测试失败');}finally{_uiBusy.proxyTest=false;}}
+async function saveNetworkProxy(){if(_uiBusy.proxySave)return;_uiBusy.proxySave=true;try{var d=await api('/api/network-proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(proxyForm('save'))});if(d.ok){toast('网络配置已保存');loadNetworkProxy();}else{E('proxyStatus').textContent=d.error||'保存失败';toast(d.error||'保存失败',true);}}finally{_uiBusy.proxySave=false;}}
 async function loadProxySubscription(){var d=await api('/api/proxy-subscription');var box=E('proxySubscriptionStatus');if(!d.ok||!d.subscription){box.textContent=d.error||'订阅配置读取失败';return;}var s=d.subscription;box.textContent=s.configured?('已保存（主机：'+esc(s.host)+'；保存时间：'+esc(s.saved_at||'未知')+'）'):'尚未保存订阅地址';E('proxySubscriptionUrl').value='';}
-async function saveProxySubscription(){var url=E('proxySubscriptionUrl').value.trim();var d=await api('/api/proxy-subscription',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'save',url:url})});if(d.ok){toast('订阅地址已保存');loadProxySubscription();}else{E('proxySubscriptionStatus').textContent=d.error||'保存失败';toast(d.error||'保存失败',true);}}
-async function clearProxySubscription(){var d=await api('/api/proxy-subscription',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'clear'})});if(d.ok){toast('订阅地址已清除');loadProxySubscription();}else{E('proxySubscriptionStatus').textContent=d.error||'清除失败';toast(d.error||'清除失败',true);}}
+async function saveProxySubscription(){if(_uiBusy.subSave)return;_uiBusy.subSave=true;try{var url=E('proxySubscriptionUrl').value.trim();var d=await api('/api/proxy-subscription',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'save',url:url})});if(d.ok){toast('订阅地址已保存');loadProxySubscription();}else{E('proxySubscriptionStatus').textContent=d.error||'保存失败';toast(d.error||'保存失败',true);}}finally{_uiBusy.subSave=false;}}
+async function clearProxySubscription(){if(_uiBusy.subClear)return;_uiBusy.subClear=true;try{var d=await api('/api/proxy-subscription',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'clear'})});if(d.ok){toast('订阅地址已清除');loadProxySubscription();}else{E('proxySubscriptionStatus').textContent=d.error||'清除失败';toast(d.error||'清除失败',true);}}finally{_uiBusy.subClear=false;}}
 setTimeout(loadNetworkProxy,1000);
 setTimeout(loadProxySubscription,1000);
 async function loadCreationGuard(){var d=await api('/api/creation-guard');if(!d.ok)return;var g=d.protection;E('guardConcurrency').value=g.settings.concurrency;E('guardDaily').value=g.settings.daily_limit;var now=Date.now()/1000;var ids=Object.keys(g.accounts||{}).filter(function(id){var a=g.accounts[id]||{};return !!(a.blocked||a.pending||(a.retry_at||0)>now);});var h='<p>'+ (g.multi_account_alert?'多个账号出现同类异常，请检查；其他账号继续创建':'账号独立保护，其他账号不受牵连')+'</p>';if(!ids.length){h+='<p class="hint">当前没有需要处理的创建保护记录。</p>';}ids.forEach(function(id){var a=g.accounts[id]||{};var canRelease=!!a.blocked;h+='<div style="padding:8px;border-bottom:1px solid #eee">'+esc(id)+' · 今日尝试 '+(a.attempts||0)+' / 成功 '+(a.successes||0)+' · '+esc(a.blocked||a.last_error_kind||'冷却中')+((a.retry_at||0)>now?' · 冷却至 '+new Date(a.retry_at*1000).toLocaleString():'')+(a.pending?' · 有待核对地址':'')+(canRelease?' <button class="btn btn-sm guard-release" data-account-id="'+escAttr(id)+'">检查后解除账号暂停</button>':'')+'</div>';});E('creationGuardStatus').innerHTML=h;Array.from(E('creationGuardStatus').querySelectorAll('.guard-release')).forEach(function(b){b.onclick=function(){releaseCreationGuard(b.dataset.accountId,true);};});}
@@ -1406,9 +1516,9 @@ async function saveCreationGuard(){var d=await api('/api/creation-guard',{method
 async function releaseCreationGuard(id,ask){if(id&&ask!==false&&!confirm('确认解除这个账号的创建暂停？解除后不会自动开始创建，需要你重新选择账号并点击“开始创建”。'))return;var d=await api('/api/creation-guard',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'release',account_id:id||null})});toast(d.ok?'暂停已解除；冷却和待核对记录仍保留':d.error,!d.ok);if(d.ok){await loadCreationGuard();await refreshAll();}}
 setTimeout(loadCreationGuard,1000);
 async function apiSlow(path,opts){return api(path,Object.assign({timeout:60000},opts||{}));}
-function fillMailWatch(){var n=parseInt((state&&state.mail_watch_hours)||1,10);if(!(n>=1&&n<=24))n=1;var input=E('mailWatchHours');if(input&&document.activeElement!==input)input.value=n;}async function saveMailWatch(){var n=parseInt(E('mailWatchHours').value,10);if(!(n>=1&&n<=24)){toast(t('settings.mail_watch_invalid'),true);return}var d=await api('/api/mail-watch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({interval_hours:n})});if(!d.ok){toast(d.error||t('error.unknown'),true);return}state.mail_watch_hours=d.interval_hours;fillMailWatch();toast(t('settings.mail_watch_saved',{n:d.interval_hours}));}async function refreshAll(){if(_refreshBusy)return;_refreshBusy=true;try{var _a=api('/api/accounts'),_s=api('/api/state');var a=await _a,s=await _s;accounts=a.accounts||[];state=s;renderSidebar();renderDashboard();updateEmptyState();if(curTab==='emails'){await refreshEmails();renderAliasTable();}if(curTab==='settings'){renderBatchPanel();fillMailWatch();}await loadLogs();updateInboxAccountSelect();}finally{_refreshBusy=false;}}
-async function refreshLight(){if(_refreshBusy)return;var s=await api('/api/state');state=s;renderSidebar();}
-async function refreshEmails(){var d=await api('/api/emails');emails=d.emails||[];pickupLinksByEmail={};emails.forEach(function(e){if(e.pickup_url)pickupLinksByEmail[String(e.email||'').toLowerCase()]=e.pickup_url;var acc=accounts.find(function(a){return a.id===e.account_id});e.account_name=acc?(acc.name||acc.real_email||''):(e.account_id||'');e.account_email=acc?(acc.real_email||''):'';});pickupLinksLoaded=true;E('emailCount').textContent=emails.length;updateEmailFilter();}
+function fillMailWatch(){var n=parseInt((state&&state.mail_watch_hours)||1,10);if(!(n>=1&&n<=24))n=1;var input=E('mailWatchHours');if(input&&document.activeElement!==input)input.value=n;}async function saveMailWatch(){var n=parseInt(E('mailWatchHours').value,10);if(!(n>=1&&n<=24)){toast(t('settings.mail_watch_invalid'),true);return}var d=await api('/api/mail-watch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({interval_hours:n})});if(!d.ok){toast(d.error||t('error.unknown'),true);return}state.mail_watch_hours=d.interval_hours;fillMailWatch();toast(t('settings.mail_watch_saved',{n:d.interval_hours}));}async function refreshAll(force){if(_refreshBusy){if(force)_refreshQueued=true;return} _refreshBusy=true;var generation=++_refreshGeneration;try{var results=await Promise.all([api('/api/accounts'),api('/api/state')]);var a=results[0],s=results[1];if(generation!==_refreshGeneration)return;if(a.ok!==false&&Array.isArray(a.accounts)){accounts=a.accounts;}else{_refreshLastError=a.error||'账号列表读取失败';}if(s.ok!==false&&s&&typeof s==='object'){state=s;}else{_refreshLastError=s.error||'状态读取失败';}renderSidebar();renderDashboard();updateEmptyState();if(curTab==='emails'){await refreshEmails();renderAliasTable();}if(curTab==='settings'){renderBatchPanel();fillMailWatch();}await loadLogs();updateInboxAccountSelect();}finally{_refreshBusy=false;if(_refreshQueued){_refreshQueued=false;refreshAll(true);}}}
+async function refreshLight(){if(_refreshBusy)return;var s=await api('/api/state');if(s.ok===false)return;state=s;renderSidebar();}
+async function refreshEmails(){var d=await api('/api/emails');if(d.ok===false||!Array.isArray(d.emails)){_refreshLastError=d.error||'邮箱列表读取失败';return false;}emails=d.emails;pickupLinksByEmail={};emails.forEach(function(e){if(e.pickup_url)pickupLinksByEmail[String(e.email||'').toLowerCase()]=e.pickup_url;var acc=accounts.find(function(a){return a.id===e.account_id});e.account_name=acc?(acc.name||acc.real_email||''):(e.account_id||'');e.account_email=acc?(acc.real_email||''):'';});pickupLinksLoaded=true;E('emailCount').textContent=emails.length;updateEmailFilter();return true;}
 
 function renderSidebar(){
   var running=state.running;
@@ -1479,15 +1589,15 @@ async function handleRestoreTxtFile(input){var file=input&&input.files&&input.fi
 function renderAliasTable(){updateEmailFilter();var filtered=visibleAliases();var exportedCount=emails.filter(function(e){return e.exported}).length;var unexportedCount=emails.length-exportedCount;E('exportCountUnexported').textContent=t('export.unexported_n',{n:unexportedCount});E('exportCountExported').textContent=t('export.exported_n',{n:exportedCount});E('exportCountAll').textContent=t('export.all_n',{n:emails.length});E('emailCount').textContent=filtered.length+' / '+emails.length;updateAliasPager(filtered.length);var c=E('aliasTableContainer');if(!filtered.length){c.innerHTML='<div class="empty"><div class="icon"></div>'+(emails.length?t('emails.empty_filter'):t('emails.empty'))+'</div>';return;}if(!pickupLinksLoaded){c.innerHTML='<div class="empty">'+t('pickup.generating')+'</div>';loadPickupLinks().then(renderAliasTable);return;}var start=(aliasPage-1)*aliasPageSize;var pageItems=filtered.slice(start,start+aliasPageSize);var pages=Math.max(1,Math.ceil(filtered.length/aliasPageSize));var h='<table class="email-table"><thead><tr><th style="width:42px"><input type="checkbox" title="'+escAttr(t('table.select_page'))+'" onclick="toggleAllPickup()"></th><th>#</th><th>'+t('table.email')+'</th><th>'+t('table.lookup')+'</th><th>'+t('table.pickup')+'</th><th>'+t('table.account')+'</th><th>'+t('table.label')+'</th><th>'+t('table.created')+'</th><th>'+t('table.export')+'</th><th>'+t('table.status')+'</th></tr></thead><tbody>';pageItems.forEach(function(e,i){var key=String(e.email||'').toLowerCase();var url=pickupLinksByEmail[key]||'';var checked=pickupSelected[key]&&!e.exported?' checked':'';var disabled=e.exported?' disabled':'';var accName=e.account_name||e.account_email||e.account_id||'--';var activeHtml=e.hasOwnProperty('active')?(e.active?'<span style="color:var(--green)">'+t('status.active')+'</span>':'<span style="color:var(--red)">'+t('status.inactive')+'</span>'):'<span style="color:var(--muted)">--</span>';var exportHtml=e.exported?'<span style="color:var(--green)">'+t('export.exported')+'</span><div class="hint">'+esc(formatExportTime(e.exported_at))+'</div><button class="copy-btn" onclick="restoreExportedEmail(\''+escAttr(e.email||'')+'\')" title="'+escAttr(t('export.restore_title'))+'">'+t('export.restore')+'</button>':'<span style="color:var(--muted)">'+t('export.unexported')+'</span>';h+='<tr><td><input class="pickup-check" type="checkbox" data-email="'+escAttr(e.email||'')+'"'+checked+disabled+' onchange="togglePickupSelected(this.dataset.email,this.checked)"></td><td class="hint">'+(start+i+1)+'</td><td class="mono">'+esc(e.email||'')+'</td><td class="pickup-cell"><button class="copy-btn" onclick="openAliasInbox(\''+escAttr(e.email||'')+'\',\''+escAttr(e.account_id||'')+'\')" title="'+escAttr(t('lookup.this_alias'))+'">'+t('table.lookup')+'</button></td><td class="pickup-cell">'+(url?'<button class="copy-btn" onclick="copyPickup(\''+escAttr(url)+'\')" title="'+escAttr(url)+'">'+t('pickup.copy')+'</button>':'<span class="hint">'+t('pickup.failed')+'</span>')+'</td><td>'+esc(accName)+'</td><td class="hint">'+esc((e.label||'').substring(0,30))+'</td><td style="white-space:nowrap">'+esc(formatExportTime(e.created_at))+'</td><td>'+exportHtml+'</td><td>'+activeHtml+'</td></tr>';});h+='</tbody></table>';h+='<div class="pager pager-bottom"><span class="hint">'+(start+1)+'-'+(start+pageItems.length)+' / '+filtered.length+'</span><button class="btn btn-outline btn-sm" onclick="setAliasPage(aliasPage-1)"'+(aliasPage<=1?' disabled':'')+'>'+t('pager.prev')+'</button><button class="btn btn-outline btn-sm" onclick="setAliasPage(aliasPage+1)"'+(aliasPage>=pages?' disabled':'')+'>'+t('pager.next')+'</button></div>';c.innerHTML=h;}
 function batchStatusText(status){var labels={waiting:t('batch.wait_apple'),queued:t('batch.queued'),running:t('batch.running'),paused:t('batch.paused'),stopped:t('batch.stopped'),completed:t('batch.done'),partial:t('batch.partial'),limited:t('batch.limited'),failed:t('batch.failed')};return labels[status]||status||'--';}
 var batchSelectionInitialized=false;var batchSelection=new Set();function renderBatchPanel(){if(batchSelectionInitialized){document.querySelectorAll('#batchChkGroup input').forEach(function(b){if(b.checked)batchSelection.add(b.value);else batchSelection.delete(b.value);});}var activeAccs=accounts.filter(function(a){return a.status==='active'&&!a.mail_sync_paused&&a.mail_status!=='auth_failed'});E('batchAccCount').textContent=t('batch.available_n',{n:activeAccs.length});var g=E('batchChkGroup');if(!activeAccs.length){g.innerHTML='<span class="hint">'+t('batch.none')+'</span>';updateCreateControlButtons();}else{var busy=batchBusyAccountIds(batchJob);var paused=batchPausedAccountIds(batchJob);g.innerHTML=activeAccs.map(function(a){var email=a.real_email||a.name||a.id;var limited=a.create_status==='limited';var isBusy=!!busy[a.id];var isPaused=!!paused[a.id];var note=limited?'<span style="color:var(--red);font-size:12px">'+t('batch.retry_note')+'</span>':(isPaused?'<span style="color:var(--ink-faint);font-size:12px">'+t('batch.paused')+'</span>':(isBusy?'<span style="color:var(--ink-faint);font-size:12px">'+t('batch.running')+'</span>':''));var selected=pendingBatchAccountId?pendingBatchAccountId===a.id:batchSelectionInitialized?batchSelection.has(a.id):true;return'<label class="chk-item"><input type="checkbox" value="'+escAttr(a.id)+'"'+(selected?' checked':'')+'><span><strong>'+esc(a.name||email.substring(0,20))+'</strong> '+note+'</span></label>';}).join('');document.querySelectorAll('#batchChkGroup input').forEach(function(box){box.addEventListener('change',updateCreateControlButtons);});updateCreateControlButtons();}batchSelection=new Set(Array.from(document.querySelectorAll('#batchChkGroup input:checked')).map(function(b){return b.value;}));batchSelectionInitialized=true;pendingBatchAccountId=null;if(batchJob)renderBatchJob(batchJob);else loadCurrentBatchJob();}
-async function loadCurrentBatchJob(){var d=await api('/api/create-batch-current');if(d.ok){batchJob=d.job||null;renderBatchJob(batchJob);if(batchJob&&(batchJob.status==='queued'||batchJob.status==='running'))scheduleBatchPoll();}}
+async function loadCurrentBatchJob(){var generation=++_batchGeneration;var d=await api('/api/create-batch-current');if(generation!==_batchGeneration)return;if(d.ok){batchJob=d.job||null;renderBatchJob(batchJob);if(batchJob&&(batchJob.status==='queued'||batchJob.status==='running'))scheduleBatchPoll();}}
 function jobDisplayStatus(job){var waiting=false,runningAcc=false,pausedAcc=false;Object.keys(job.accounts||{}).forEach(function(id){var st=(job.accounts[id]||{}).status;if(st==='waiting')waiting=true;if(st==='running'||st==='queued')runningAcc=true;if(st==='paused')pausedAcc=true;});if((job.status==='queued'||job.status==='running')&&waiting&&!runningAcc)return 'waiting';if((job.status==='queued'||job.status==='running'||job.status==='paused')&&pausedAcc&&!runningAcc&&!waiting)return 'paused';return job.status;}
 function batchBusyAccountIds(job){var ids={};if(!job||(job.status!=='queued'&&job.status!=='running'&&job.status!=='paused'))return ids;Object.keys(job.accounts||{}).forEach(function(id){var st=(job.accounts[id]||{}).status;if(st==='queued'||st==='running'||st==='waiting')ids[id]=true;});return ids;}function batchPausedAccountIds(job){var ids={};if(!job)return ids;Object.keys(job.accounts||{}).forEach(function(id){if((job.accounts[id]||{}).status==='paused')ids[id]=true;});return ids;}function selectedBatchAccountIds(){var ids=[];document.querySelectorAll('#batchChkGroup input:checked').forEach(function(c){ids.push(c.value)});return ids;}function updateCreateControlButtons(){var pauseBtn=E('btnBatchPause'),stopBtn=E('btnBatchStop'),startBtn=E('btnBatchExec');if(!startBtn)return;var ids=selectedBatchAccountIds();var busy=batchBusyAccountIds(batchJob);var paused=batchPausedAccountIds(batchJob);var canStart=ids.some(function(id){return !busy[id];});var canPause=ids.some(function(id){return !!busy[id];});var canStop=ids.some(function(id){return !!busy[id]||!!paused[id];});startBtn.disabled=!ids.length||!canStart;if(pauseBtn)pauseBtn.disabled=!canPause;if(stopBtn)stopBtn.disabled=!canStop;}function batchAccountTarget(job,item){return parseInt((item||{}).target,10)||parseInt(job.count_per_account,10)||0;}function batchTargetCount(job){var accs=job.accounts||{};var ids=Object.keys(accs);var target=0;ids.forEach(function(id){target+=batchAccountTarget(job,accs[id]);});return target||((job.total_created||0)+(job.total_errors||0));}
 function progressBarHtml(created,errors,target,mode){var createdPct=target?Math.min(100,created*100/target):0;var errorPct=target?Math.min(100-createdPct,errors*100/target):0;if(created&&createdPct<1.2)createdPct=1.2;return '<div class="progress-bar'+(mode?(' '+mode):'')+'"><div class="fill ok" style="width:'+createdPct+'%"></div>'+(errorPct?('<div class="fill err" style="width:'+errorPct+'%"></div>'):'')+'</div>';}
 function retryLeftText(retryAt){if(!retryAt)return '';var deadline=Date.parse(retryAt);if(!deadline)return '';var sec=Math.max(0,Math.round((deadline-Date.now())/1000));if(sec<=0)return t('batch.retry_soon');if(sec<60)return t('batch.retry_sec',{n:sec});return t('batch.retry_min',{n:Math.ceil(sec/60)});}
-function renderBatchJob(job){var box=E('batchProgress');if(!job){box.innerHTML='';return}var total=job.total_accounts||0,done=job.completed_accounts||0,created=job.total_created||0,errors=job.total_errors||0,target=batchTargetCount(job)||0;var processed=target?Math.min(target,created+errors):created+errors;var pct=target?Math.round(processed*100/target):0;var displayStatus=jobDisplayStatus(job);var statusColor=displayStatus==='partial'?'#b7791f':displayStatus==='completed'?'var(--green)':(displayStatus==='failed'||displayStatus==='limited'||displayStatus==='waiting')?'var(--red)':'var(--ink)';var running=job.status==='queued'||job.status==='running';var barMode=displayStatus==='waiting'?'is-wait':(running?'is-run':'');var h='<div class="progress-card"><div class="progress-head"><strong style="color:'+statusColor+'">'+esc(batchStatusText(displayStatus))+'</strong><span>'+created+' / '+target+' · '+pct+'%</span></div>'+progressBarHtml(created,errors,target,barMode)+'<div class="progress-meta"><span>'+t('batch.accounts_done',{done:done,total:total})+'</span><span>'+t('batch.ok_fail',{created:created,errors:errors})+'</span></div>';Object.keys(job.accounts||{}).forEach(function(id){var item=job.accounts[id],color=item.status==='partial'?'#b7791f':item.status==='completed'?'var(--green)':(item.status==='limited'||item.status==='failed'||item.status==='waiting'||item.status==='stopped')?'var(--red)':(item.status==='paused'?'var(--ink)':'var(--muted)');var accTarget=batchAccountTarget(job,item),accCreated=item.created||0,accErrors=item.errors||0;var accMode=item.status==='waiting'?'is-wait':((item.status==='running'||item.status==='queued')?'is-run':'');var extra=retryLeftText(item.retry_at);var note=item.error||((item.status==='running'||item.status==='queued')?'正在向 Apple 申请':'');var canRelease=String(note).indexOf('创建已暂停：')===0||String(note).indexOf('创建已暂停:')===0;var releaseHtml=canRelease?' <button type="button" class="btn btn-outline btn-xs batch-release-guard" data-account-id="'+escAttr(id)+'">解除暂停</button>':'';h+='<div class="progress-item"><div class="progress-head"><strong>'+esc(item.name||id)+'</strong><span style="color:'+color+'">'+esc(batchStatusText(item.status))+(accTarget?(' · '+accCreated+' / '+accTarget):(' · '+accCreated))+'</span></div>'+progressBarHtml(accCreated,accErrors,accTarget||Math.max(accCreated+accErrors,1),accMode)+((note||extra)?('<div class="progress-note" style="color:var(--red)">'+esc(note)+(extra?(' · '+esc(extra)):'' )+releaseHtml+'</div>'):'')+'</div>';});h+='</div>';box.innerHTML=h;box.querySelectorAll('.batch-release-guard').forEach(function(btn){btn.onclick=function(){releaseCreationGuard(btn.dataset.accountId,true);};});var busy=batchBusyAccountIds(job);var checks=document.querySelectorAll('#batchChkGroup input[type=checkbox]');var canStart=false;checks.forEach(function(box){if(!busy[box.value])canStart=true;});E('btnBatchExec').textContent=t('settings.start');updateCreateControlButtons();renderSidebar();if(curTab==='accounts')renderDashboard();}function scheduleBatchPoll(){if(batchPollTimer)clearTimeout(batchPollTimer);batchPollTimer=setTimeout(pollBatchJob,1200);}
-async function pollBatchJob(){if(!batchJob||!batchJob.id)return;var d=await api('/api/create-batch/'+encodeURIComponent(batchJob.id));if(!d.ok){toast(t('batch.progress_fail',{err:d.error||t('error.unknown')}),true);return}batchJob=d.job;renderBatchJob(batchJob);if(batchJob.status==='queued'||batchJob.status==='running'){scheduleBatchPoll();return}if(batchJob.status==='paused'){await refreshAll();return}await refreshAll();if(batchJob.status==='partial'){toast(t('batch.partial')+' · '+t('batch.ok_fail',{created:batchJob.total_created||0,errors:batchJob.total_errors||0}),true);}else if(batchJob.total_created){toast(t('batch.complete_n',{n:batchJob.total_created}));}else{toast(t('batch.none_created'),true);}}
-async function controlBatchCreate(action){var ids=selectedBatchAccountIds();if(!ids.length){toast(t('batch.need_account'),true);return}var busy=batchBusyAccountIds(batchJob);var paused=batchPausedAccountIds(batchJob);if(action==='pause'&&!ids.some(function(id){return !!busy[id];})){toast(t('batch.need_creating'),true);return}if(action==='stop'&&!ids.some(function(id){return !!busy[id]||!!paused[id];})){toast(t('batch.need_creating'),true);return}var pauseBtn=E('btnBatchPause'),stopBtn=E('btnBatchStop');if(pauseBtn)pauseBtn.disabled=true;if(stopBtn)stopBtn.disabled=true;var d=await api('/api/create-control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:action,account_ids:ids})});if(!d.ok){updateCreateControlButtons();toast(d.error||t('batch.control_fail'),true);return}if(d.job){batchJob=d.job;renderBatchJob(batchJob);if(batchJob.status==='queued'||batchJob.status==='running')scheduleBatchPoll();}toast(t(action==='pause'?'batch.paused_ok':'batch.stopped_ok',{n:(d.affected||ids).length}));updateCreateControlButtons();refreshAll();}
-async function execBatchCreate(){var checks=document.querySelectorAll('#batchChkGroup input:checked');var ids=[];checks.forEach(function(c){ids.push(c.value)});if(!ids.length){toast(t('batch.need_account'),true);return}var count=Math.max(1,Math.min(parseInt(E('batchCount').value)||5,750));E('batchCount').value=count;var label=E('batchLabel').value.trim();var btn=E('btnBatchExec');btn.disabled=true;btn.textContent=t('batch.starting');var d=await api('/api/create-batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({account_ids:ids,count_per_account:count,label:label})});if(!d.ok){btn.textContent=t('settings.start');updateCreateControlButtons();if(d.job_id){batchJob={id:d.job_id,status:'running'};scheduleBatchPoll();}toast(d.error||t('batch.start_fail'),true);return}batchJob=d.job;renderBatchJob(batchJob);scheduleBatchPoll();}
+function renderBatchJob(job){var box=E('batchProgress');if(!job){box.innerHTML='';return}var total=job.total_accounts||0,done=job.completed_accounts||0,created=job.total_created||0,errors=job.total_errors||0,target=batchTargetCount(job)||0;var processed=target?Math.min(target,created+errors):created+errors;var pct=target?Math.round(processed*100/target):0;var displayStatus=jobDisplayStatus(job);var statusColor=displayStatus==='partial'?'#b7791f':displayStatus==='completed'?'var(--green)':(displayStatus==='failed'||displayStatus==='limited')?'var(--red)':displayStatus==='waiting'?'#b7791f':'var(--ink)';var running=job.status==='queued'||job.status==='running';var barMode=displayStatus==='waiting'?'is-wait':(running?'is-run':'');var h='<div class="progress-card"><div class="progress-head"><strong style="color:'+statusColor+'">'+esc(batchStatusText(displayStatus))+'</strong><span>'+created+' / '+target+' · '+pct+'%</span></div>'+progressBarHtml(created,errors,target,barMode)+'<div class="progress-meta"><span>'+t('batch.accounts_done',{done:done,total:total})+'</span><span>'+t('batch.ok_fail',{created:created,errors:errors})+'</span></div>';Object.keys(job.accounts||{}).forEach(function(id){var item=job.accounts[id],color=item.status==='partial'?'#b7791f':item.status==='completed'?'var(--green)':(item.status==='limited'||item.status==='failed'||item.status==='stopped')?'var(--red)':(item.status==='waiting'?'#b7791f':(item.status==='paused'?'var(--ink)':'var(--muted)'));var accTarget=batchAccountTarget(job,item),accCreated=item.created||0,accErrors=item.errors||0;var accMode=item.status==='waiting'?'is-wait':((item.status==='running'||item.status==='queued')?'is-run':'');var extra=retryLeftText(item.retry_at);var note=item.error||((item.status==='running'||item.status==='queued')?'正在向 Apple 申请':'');var canRelease=String(note).indexOf('创建已暂停：')===0||String(note).indexOf('创建已暂停:')===0;var releaseHtml=canRelease?' <button type="button" class="btn btn-outline btn-xs batch-release-guard" data-account-id="'+escAttr(id)+'">解除暂停</button>':'';h+='<div class="progress-item"><div class="progress-head"><strong>'+esc(item.name||id)+'</strong><span style="color:'+color+'">'+esc(batchStatusText(item.status))+(accTarget?(' · '+accCreated+' / '+accTarget):(' · '+accCreated))+'</span></div>'+progressBarHtml(accCreated,accErrors,accTarget||Math.max(accCreated+accErrors,1),accMode)+((note||extra)?('<div class="progress-note" style="color:var(--red)">'+esc(note)+(extra?(' · '+esc(extra)):'' )+releaseHtml+'</div>'):'')+'</div>';});h+='</div>';box.innerHTML=h;box.querySelectorAll('.batch-release-guard').forEach(function(btn){btn.onclick=function(){releaseCreationGuard(btn.dataset.accountId,true);};});var busy=batchBusyAccountIds(job);var checks=document.querySelectorAll('#batchChkGroup input[type=checkbox]');var canStart=false;checks.forEach(function(box){if(!busy[box.value])canStart=true;});E('btnBatchExec').textContent=t('settings.start');updateCreateControlButtons();renderSidebar();if(curTab==='accounts')renderDashboard();}function scheduleBatchPoll(){if(batchPollTimer)clearTimeout(batchPollTimer);batchPollTimer=setTimeout(pollBatchJob,1200);}
+async function pollBatchJob(){if(!batchJob||!batchJob.id||_batchPollBusy)return;var generation=_batchGeneration;_batchPollBusy=true;try{var d=await api('/api/create-batch/'+encodeURIComponent(batchJob.id));if(generation!==_batchGeneration)return;if(!d.ok){toast(t('batch.progress_fail',{err:d.error||t('error.unknown')}),true);return}batchJob=d.job;renderBatchJob(batchJob);if(batchJob.status==='queued'||batchJob.status==='running'){scheduleBatchPoll();return}if(batchJob.status==='paused'){await refreshAll(true);return}await refreshAll(true);if(generation!==_batchGeneration)return;if(batchJob.status==='partial'){toast(t('batch.partial')+' · '+t('batch.ok_fail',{created:batchJob.total_created||0,errors:batchJob.total_errors||0}),true);}else if(batchJob.total_created){toast(t('batch.complete_n',{n:batchJob.total_created}));}else{toast(t('batch.none_created'),true);}}finally{_batchPollBusy=false;}}
+async function controlBatchCreate(action){if(_uiBusy.batchControl)return;_uiBusy.batchControl=true;_batchGeneration++;try{var ids=selectedBatchAccountIds();if(!ids.length){toast(t('batch.need_account'),true);return}var busy=batchBusyAccountIds(batchJob);var paused=batchPausedAccountIds(batchJob);if(action==='pause'&&!ids.some(function(id){return !!busy[id];})){toast(t('batch.need_creating'),true);return}if(action==='stop'&&!ids.some(function(id){return !!busy[id]||!!paused[id];})){toast(t('batch.need_creating'),true);return}var pauseBtn=E('btnBatchPause'),stopBtn=E('btnBatchStop');if(pauseBtn)pauseBtn.disabled=true;if(stopBtn)stopBtn.disabled=true;var d=await api('/api/create-control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:action,account_ids:ids})});if(!d.ok){updateCreateControlButtons();toast(d.error||t('batch.control_fail'),true);return}if(d.job){batchJob=d.job;renderBatchJob(batchJob);if(batchJob.status==='queued'||batchJob.status==='running')scheduleBatchPoll();}toast(t(action==='pause'?'batch.paused_ok':'batch.stopped_ok',{n:(d.affected||ids).length}));updateCreateControlButtons();refreshAll(true);}finally{_uiBusy.batchControl=false;}}
+async function execBatchCreate(){if(_uiBusy.batchExec)return;_uiBusy.batchExec=true;_batchGeneration++;var checks=document.querySelectorAll('#batchChkGroup input:checked');var ids=[];checks.forEach(function(c){ids.push(c.value)});if(!ids.length){_uiBusy.batchExec=false;toast(t('batch.need_account'),true);return}var count=Math.max(1,Math.min(parseInt(E('batchCount').value)||5,750));E('batchCount').value=count;var label=E('batchLabel').value.trim();var btn=E('btnBatchExec');btn.disabled=true;btn.textContent=t('batch.starting');try{var d=await api('/api/create-batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({account_ids:ids,count_per_account:count,label:label})});if(!d.ok){btn.textContent=t('settings.start');updateCreateControlButtons();if(d.job_id){batchJob={id:d.job_id,status:'running'};scheduleBatchPoll();}toast(d.error||t('batch.start_fail'),true);return}batchJob=d.job;renderBatchJob(batchJob);scheduleBatchPoll();}finally{_uiBusy.batchExec=false;}}
 function setInboxBusy(busy){_inboxBusy=busy;['btnInboxSearch','btnInboxAll'].forEach(function(id){var btn=E(id);if(btn)btn.disabled=busy});}
 function beginInboxRequest(){if(_inboxSse){_inboxSse.close();_inboxSse=null}_inboxStreamMsgs=[];_inboxRequestSeq+=1;setInboxBusy(true);return _inboxRequestSeq;}
 function inboxRequestCurrent(seq,accId){return seq===_inboxRequestSeq&&E('inboxAccount').value===accId;}
@@ -1551,8 +1661,8 @@ function closeAppPwdModal(){var m=E('appPwdModal');if(m)m.remove()}
 async function setAppPassword(accId){var pwd=E('appPwdInput').value.trim();var email=E('icloudEmailInput').value.trim();if(!email){E('appPwdMsg').innerHTML='<span style="color:var(--red)">'+t('pwd.need_email')+'</span>';return}if(!pwd){E('appPwdMsg').innerHTML='<span style="color:var(--red)">'+t('pwd.need_pwd')+'</span>';return}var btn=E('btnSetPwd');btn.disabled=true;btn.textContent=t('pwd.testing');var d=await api('/api/accounts/'+encodeURIComponent(accId)+'/app-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({app_password:pwd,icloud_email:email})});btn.disabled=false;btn.textContent=t('pwd.save');if(d.ok){E('appPwdMsg').innerHTML='<span style="color:var(--green)">'+t('pwd.ok',{n:d.inbox_count})+'</span>';var acc=accounts.find(function(a){return a.id===accId});if(acc){acc.has_app_password=true;acc.icloud_email=email;}setTimeout(closeAppPwdModal,1500);updateInboxAccountSelect();renderDashboard();if(curTab==='inbox')refreshInbox();}else{E('appPwdMsg').innerHTML='<span style="color:var(--red)">'+esc(d.error||t('inbox.connect_fail'))+'</span>';}}
 function setCreateBusy(accId,busy){if(busy)_createBusyByAccount[accId]=true;else delete _createBusyByAccount[accId];document.querySelectorAll('.acc-actions button').forEach(function(btn){var action=btn.getAttribute('onclick')||'';if(action.indexOf("createForAccount('"+accId+"'")>=0)btn.disabled=busy;});}
 async function createForAccount(accId,count){if(_createBusyByAccount[accId]){toast(t('create.busy'),true);return}setCreateBusy(accId,true);try{var d=await api('/api/accounts/'+encodeURIComponent(accId)+'/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({count:count})});if(d.ok)toast(t('create.ok',{n:d.created}));else toast(d.error||t('create.fail'),true);}finally{setCreateBusy(accId,false);await refreshAll();}}
-async function validateAccount(accId){toast(t('status.checking_login'));var d=await api('/api/accounts/'+encodeURIComponent(accId)+'/validate',{method:'POST'});if(d.ok)toast(t('status.login_ok_email',{email:d.real_email}));else toast(d.error||t('status.login_expired'),true);refreshAll();}
-async function removeAccount(accId){if(!confirm(t('account.delete_confirm')))return;var d=await api('/api/accounts/'+encodeURIComponent(accId)+'/remove',{method:'POST'});if(!d.ok){toast(d.error||t('error.unknown'),true);return;}if(batchPollTimer){clearTimeout(batchPollTimer);batchPollTimer=null;}batchJob=null;renderBatchJob(null);toast(t('account.deleted'));await refreshAll();await loadCurrentBatchJob();}
+async function validateAccount(accId){if(_uiBusy['validate:'+accId])return;_uiBusy['validate:'+accId]=true;toast(t('status.checking_login'));try{var d=await api('/api/accounts/'+encodeURIComponent(accId)+'/validate',{method:'POST'});if(d.ok)toast(t('status.login_ok_email',{email:d.real_email}));else toast(d.error||t('status.login_expired'),true);await refreshAll(true);}finally{delete _uiBusy['validate:'+accId];}}
+async function removeAccount(accId){if(_uiBusy['remove:'+accId])return;if(!confirm(t('account.delete_confirm')))return;_uiBusy['remove:'+accId]=true;_batchGeneration++;try{var d=await api('/api/accounts/'+encodeURIComponent(accId)+'/remove',{method:'POST'});if(!d.ok){toast(d.error||t('error.unknown'),true);return;}if(batchPollTimer){clearTimeout(batchPollTimer);batchPollTimer=null;}batchJob=null;renderBatchJob(null);toast(t('account.deleted'));await refreshAll(true);await loadCurrentBatchJob();}finally{delete _uiBusy['remove:'+accId];}}
 async function toggleScheduler(){var act=state.running?'stop':'start';var d=await api('/api/scheduler/'+act,{method:'POST'});if(d.ok)toast(state.running?t('auto.stopped'):t('auto.started'));refreshAll();}
 function copyOne(email){copyText(email,t('copy.one',{email:email}));}
 function copyAll(){var filtered=visibleAliases();if(!filtered.length){toast(t('emails.empty_filter'),true);return}copyText(filtered.map(function(e){return e.email}).join('\n'),t('copy.n',{n:filtered.length}));}
@@ -1612,9 +1722,13 @@ def api_accounts():
 
 @app.route("/api/accounts/add", methods=["POST"])
 def api_add_account():
-    data = request.get_json() or {}
-    name = data.get("name","未命名账号")
-    cookie_input = data.get("cookie_input","")
+    data = _json_object()
+    name = _bounded_text(data.get("name", "未命名账号"), _MAX_NAME_LENGTH)
+    cookie_input = data.get("cookie_input", "")
+    if name is None:
+        return _api_error("账号名称过长或格式无效", 400)
+    if not isinstance(cookie_input, str) or len(cookie_input) > _MAX_COOKIE_INPUT:
+        return _api_error("Cookie 内容过大或格式无效", 400)
     if not cookie_input:
         return jsonify({"ok":False,"error":"请提供 cookie_input"}), 400
     requested_host = str(data.get("host") or "").strip().lower()
@@ -1631,16 +1745,21 @@ def api_add_account():
             payload["error"] = account.get("last_error") or "账号校验失败"
         return jsonify(payload), 200 if ok else 400
     except ValueError as e:
-        return jsonify({"ok":False,"error":str(e)}), 400
-    except Exception as e:
-        return jsonify({"ok":False,"error":str(e)}), 500
+        message = str(e)
+        if "已有创建任务" in message:
+            return _api_error(message, 409)
+        return _api_error("账号导入失败，请检查 Cookie 和账号状态", 400)
+    except Exception:
+        return _api_error("账号导入失败，请稍后重试", 502)
 
 
 
 @app.route("/api/accounts/<acc_id>/reimport", methods=["POST"])
 def api_reimport_account(acc_id):
-    data = request.get_json(silent=True) or {}
+    data = _json_object()
     cookie_input = data.get("cookie_input") or ""
+    if not isinstance(cookie_input, str) or len(cookie_input) > _MAX_COOKIE_INPUT:
+        return _api_error("Cookie 内容过大或格式无效", 400)
     if not cookie_input:
         return jsonify({"ok": False, "error": "请提供 cookie_input"}), 400
     if not _account_mgr.get_account(acc_id):
@@ -1673,9 +1792,9 @@ def api_reimport_account(acc_id):
     except KeyError:
         return jsonify({"ok": False, "error": "账号不存在"}), 404
     except ValueError as e:
-        return jsonify({"ok": False, "error": str(e)}), 400
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)[:300]}), 500
+        return _api_error(str(e), 400)
+    except Exception:
+        return _api_error("账号重新导入失败", 502)
 
 
 _ACTIVE_BATCH_ACCOUNT_STATUSES = ("queued", "running", "waiting")
@@ -1722,6 +1841,15 @@ def _requeue_finished_batch_account(job, acc_id, count, previous):
     guard = getattr(_account_mgr, "creation_guard", None)
     if guard is not None:
         guard.reset_task_account(job.get("id"), acc_id)
+        # Explicit requeue acknowledges only a transient network block left by
+        # the previous failed segment.  Do not bypass auth/quota/uncertain
+        # protections merely because an account was selected again.
+        try:
+            protected = (guard.snapshot().get("accounts") or {}).get(acc_id) or {}
+            if protected.get("blocked") in ("network", "unknown"):
+                guard.unblock(acc_id)
+        except Exception:
+            pass
     replacement = _new_batch_account_entry(acc_id, previous_created + int(count))
     replacement["created"] = previous_created
     replacement["journal_base_created"] = previous_created
@@ -1734,11 +1862,22 @@ def _pending_batch_account_ids(job, inflight_ids=None):
     for acc_id in job.get("account_ids") or []:
         if acc_id in inflight_ids:
             continue
-        entry = (job.get("accounts") or {}).get(acc_id) or {}
+        entry = (job.get("accounts") or {}).get(acc_id)
+        # A stale account id must not be treated as an empty queued entry: the
+        # runner would submit it again forever and the UI would appear frozen.
+        if not isinstance(entry, dict):
+            continue
         status = entry.get("status")
         if status in (_PAUSED_BATCH_ACCOUNT_STATUS, "stopped"):
             continue
-        if entry.get("finished_at") and status in _FINISHED_BATCH_ACCOUNT_STATUSES:            continue
+        if entry.get("finished_at") and status in _FINISHED_BATCH_ACCOUNT_STATUSES:
+            continue
+        if status == "waiting" and entry.get("retry_at"):
+            try:
+                if datetime.fromisoformat(str(entry["retry_at"])) > datetime.now(_BJ_TZ):
+                    continue
+            except (TypeError, ValueError):
+                pass
         pending.append(acc_id)
     return pending
 
@@ -1763,6 +1902,12 @@ def _account_create_in_progress(acc_id) -> bool:
         if acc_id in _manual_creating_accounts:
             return True
     return _batch_uses_account(acc_id)
+
+
+# AccountManager also protects the duplicate-email import path.  Register the
+# application-level checker so a waiting durable batch counts as busy, not just
+# workers currently inside Apple HTTP calls.
+_account_mgr.set_creation_activity_checker(_account_create_in_progress)
 
 
 def _remove_latest_emails_for_account(acc_id):
@@ -1896,7 +2041,11 @@ _deletion_lock = threading.RLock()
 def _load_account_deletions():
     from durable_json import read_object
     with _deletion_lock:
-        return read_object(RESULTS_DIR / 'account_deletions.json').get('pending', {})
+        data = read_object(RESULTS_DIR / 'account_deletions.json')
+        pending = data.get('pending', {})
+        if not isinstance(pending, dict):
+            raise RuntimeError('account_deletions.json 数据损坏，请从备份恢复')
+        return pending
 
 
 def _set_account_deletion(acc_id, pending):
@@ -1963,7 +2112,7 @@ def api_validate_account(acc_id):
         if not ok:
             payload["error"] = account.get("last_error") or "账号校验失败"
         return jsonify(payload), 200 if ok else 400
-    except Exception as e: return jsonify({"ok":False,"error":str(e)}), 500
+    except Exception: return _api_error("账号校验失败", 502)
 
 def _ensure_pickup_for_created(result):
     if not result or not result.get("ok"):
@@ -1977,7 +2126,7 @@ def _ensure_pickup_for_created(result):
 
 @app.route("/api/accounts/<acc_id>/create", methods=["POST"])
 def api_create_for_account(acc_id):
-    data = request.get_json() or {}
+    data = _json_object()
     try:
         count = int(data.get("count", 1))
     except (TypeError, ValueError):
@@ -1990,7 +2139,9 @@ def api_create_for_account(acc_id):
         if acc_id in _manual_creating_accounts or _batch_uses_account(acc_id):
             return jsonify({"ok": False, "error": "该账号已有创建任务正在运行"}), 409
         _manual_creating_accounts.add(acc_id)
-    label = data.get("label","")
+    label = _bounded_text(data.get("label", ""), _MAX_LABEL_LENGTH)
+    if label is None:
+        return _api_error("标签过长或格式无效", 400)
     _update_state(creating=True)
     _emit_log("info",f"手动创建: 账号 {acc_id} x{count}")
     try:
@@ -2020,8 +2171,8 @@ def api_create_for_account(acc_id):
         if created: _emit_log("success",f"创建完成: {len(created)} 个")
         status = 200 if created else 400
         return jsonify({"ok":len(created)>0,"emails":created,"created":len(created),"errors":len(errors),"error":errors[0] if errors else None}), status
-    except Exception as e:
-        return jsonify({"ok":False,"error":str(e)}), 500
+    except Exception:
+        return _api_error("邮箱创建失败", 502)
     finally:
         with _manual_create_lock:
             _manual_creating_accounts.discard(acc_id)
@@ -2053,7 +2204,7 @@ def api_creation_guard():
             else:
                 return jsonify(ok=False, error="无效操作"), 400
         except (TypeError, ValueError) as e:
-            return jsonify(ok=False, error=str(e)), 400
+            return _api_error(str(e), 400)
     snapshot = guard.snapshot()
     # Resolve day counters on reads as well as writes.
     with guard.lock:
@@ -2086,9 +2237,9 @@ def api_network_proxy():
         _emit_log("info", "网络代理配置已更新（认证信息不写入日志）")
         return jsonify(ok=True, config=config)
     except ValueError as e:
-        return jsonify(ok=False, error=str(e)), 400
+        return _api_error(str(e), 400)
     except Exception:
-        return jsonify(ok=False, error="代理配置处理失败，请检查服务器配置文件和依赖"), 500
+        return _api_error("代理配置处理失败，请检查服务器配置文件和依赖", 500)
 
 
 @app.route("/api/network-proxy/status", methods=["GET"])
@@ -2112,9 +2263,9 @@ def api_proxy_subscription():
         _emit_log("info", "代理订阅地址已更新（地址和令牌不写入日志）")
         return jsonify(ok=True, subscription=result)
     except ValueError as e:
-        return jsonify(ok=False, error=str(e)), 400
+        return _api_error(str(e), 400)
     except Exception:
-        return jsonify(ok=False, error="代理订阅配置处理失败，请检查服务器权限"), 500
+        return _api_error("代理订阅配置处理失败，请检查服务器权限", 500)
 
 
 def _batch_job_snapshot(job_id):
@@ -2238,10 +2389,13 @@ def _create_account_with_cooldown(job, acc_id, count, label, name):
                 )
         finally:
             stop_heartbeat.set()
-        successful.extend(result for result in results if result.get("ok"))
+        current_successes = [result for result in results if result.get("ok")]
+        successful.extend(current_successes)
         _raise_if_halted()
         errors = [result for result in results if not result.get("ok")]
-        if successful:
+        # Reset the counter only after this attempt succeeded.  Using the
+        # cumulative list made one old success mask endless later failures.
+        if current_successes:
             # A successful request proves the route recovered.  Network retry
             # attempts are consecutive failures, not a permanent account state.
             with _batch_lock:
@@ -2547,6 +2701,23 @@ def _run_batch_job(job_id):
                         futures[executor.submit(_run_batch_account, job, acc_id, acc_count, label)] = acc_id
                     total_accounts = len(job.get("account_ids") or [])
                 if not futures:
+                    # A persisted network/Apple cooldown is still active. Do
+                    # not finalize the job as partial merely because no worker
+                    # is runnable at this instant; wake when the earliest
+                    # retry is due and let _pending_batch_account_ids submit it.
+                    with _batch_lock:
+                        waiting_at = []
+                        for item in (job.get("accounts") or {}).values():
+                            if item.get("status") != "waiting" or not item.get("retry_at"):
+                                continue
+                            try:
+                                waiting_at.append(datetime.fromisoformat(str(item["retry_at"])))
+                            except (TypeError, ValueError):
+                                pass
+                    if waiting_at:
+                        delay = max(0.05, min(0.4, (min(waiting_at) - datetime.now(_BJ_TZ)).total_seconds()))
+                        time.sleep(delay)
+                        continue
                     break
                 done, _pending = wait(futures, timeout=0.4, return_when=FIRST_COMPLETED)
                 if not done:
@@ -2650,7 +2821,9 @@ def _resume_batch_job_if_needed():
         for entry in job.get("accounts", {}).values():
             if entry.get("status") == "paused":
                 continue
-            if not entry.get("finished_at") and entry.get("status") in ("running", "waiting"):
+            # Keep a waiting retry's deadline across restart.  Promoting it to
+            # queued here bypassed network backoff and consumed retry slots.
+            if not entry.get("finished_at") and entry.get("status") == "running":
                 entry["status"] = "queued"
                 entry["retry_at"] = None
         _save_batch_state_locked()
@@ -2905,6 +3078,8 @@ def _stop_account_create(acc_id):
 
 def _resume_account_create(acc_id):
     acc_id = str(acc_id)
+    if not _account_mgr.get_account(acc_id):
+        return False
     with _account_control_lock:
         _paused_account_ids.discard(acc_id)
         _save_create_controls_locked()
@@ -2983,9 +3158,11 @@ def api_create_batch_current():
 
 @app.route("/api/accounts/<acc_id>/app-password", methods=["POST"])
 def api_set_app_password(acc_id):
-    data = request.get_json() or {}
-    pwd = data.get("app_password","").strip()
-    icloud_email = data.get("icloud_email","").strip()
+    data = _json_object()
+    pwd = _bounded_text(data.get("app_password", ""), _MAX_APP_PASSWORD_LENGTH)
+    icloud_email = _bounded_text(data.get("icloud_email", ""), _MAX_EMAIL_LENGTH)
+    if pwd is None or icloud_email is None:
+        return _api_error("密码或邮箱格式无效", 400)
     if not pwd:
         return jsonify({"ok":False,"error":"密码不能为空"}), 400
     try:
@@ -3009,12 +3186,12 @@ def api_set_app_password(acc_id):
             mail_last_checked=datetime.now().isoformat(),
         )
         return jsonify(result)
-    except Exception as e:
-        return jsonify({"ok":False,"saved":False,"error":str(e)}), 400
+    except Exception:
+        return _api_error("收信密码验证失败", 400)
 
 @app.route("/api/accounts/<acc_id>/inbox")
 def api_inbox(acc_id):
-    limit = request.args.get("limit",50,type=int)
+    limit = _bounded_query_int("limit", 50, 1, _MAX_PAGE_LIMIT)
     force = request.args.get("force","0")=="1"
     try:
         emails = _account_mgr.check_inbox(acc_id, limit=limit, force=force)
@@ -3023,19 +3200,19 @@ def api_inbox(acc_id):
         return jsonify({"emails":emails,"count":len(emails),"cached":stats})
     except Exception as e:
         _apply_mail_watch_result(acc_id, False, str(e))
-        return jsonify({"emails":[],"count":0,"error":str(e)})
+        return _api_error("收件箱读取失败", 502)
 
 @app.route("/api/accounts/<acc_id>/inbox-stream")
 def api_inbox_stream(acc_id):
-    limit = request.args.get("limit",50,type=int)
-    days = request.args.get("days",7,type=int)
+    limit = _bounded_query_int("limit", 50, 1, _MAX_PAGE_LIMIT)
+    days = _bounded_query_int("days", 7, 1, _MAX_PAGE_DAYS)
     def generate():
         yield f"data: {json.dumps({'type':'start'})}\n\n"
         try:
             mail = _account_mgr.get_mail_client(acc_id)
         except Exception as e:
             _apply_mail_watch_result(acc_id, False, str(e))
-            yield f"data: {json.dumps({'type':'error','error':str(e)[:200]})}\n\n"
+            yield f"data: {json.dumps({'type':'error','error':'收件箱连接失败','request_id':_request_id()}, ensure_ascii=False)}\n\n"
             return
         try:
             count = 0
@@ -3048,7 +3225,7 @@ def api_inbox_stream(acc_id):
             pass
         except Exception as e:
             _apply_mail_watch_result(acc_id, False, str(e))
-            yield f"data: {json.dumps({'type':'error','error':str(e)[:200]})}\n\n"
+            yield f"data: {json.dumps({'type':'error','error':'收件箱读取失败','request_id':_request_id()}, ensure_ascii=False)}\n\n"
         finally:
             try: mail.disconnect()
             except: pass
@@ -3062,38 +3239,46 @@ def api_message_body(acc_id, msg_id):
             full = mail.fetch_full(msg_id.encode() if isinstance(msg_id,str) else msg_id)
             return jsonify({"ok":True,"message":full})
         finally: mail.disconnect()
-    except Exception as e: return jsonify({"ok":False,"error":str(e)})
+    except Exception: return _api_error("邮件正文读取失败", 502)
 
 @app.route("/api/accounts/<acc_id>/mail/<alias_email>")
 def api_specific_alias_mail(acc_id, alias_email):
-    limit = request.args.get("limit",20,type=int)
-    days = request.args.get("days",30,type=int)
+    limit = _bounded_query_int("limit", 20, 1, _MAX_PAGE_LIMIT)
+    days = _bounded_query_int("days", 30, 1, _MAX_PAGE_DAYS)
+    if len(alias_email) > _MAX_EMAIL_LENGTH:
+        return _api_error("邮箱地址过长", 400)
+    if not _pickup_alias_belongs_to_account(acc_id, alias_email):
+        return _api_error("邮箱不属于该账号或账号不存在", 404)
     force = request.args.get("force","0")=="1"
     try:
         msgs = _account_mgr.check_alias_mail(acc_id, alias_email, limit=limit, days=days, force=force)
         return jsonify({"emails":msgs,"count":len(msgs),"alias":alias_email})
-    except Exception as e: return jsonify({"emails":[],"count":0,"error":str(e)})
+    except Exception: return _api_error("隐私邮箱收件读取失败", 502)
 
 @app.route("/api/mail")
 def api_mail_by_email():
     email = request.args.get("email","").strip().lower()
     alias = request.args.get("alias","").strip().lower()
-    limit = request.args.get("limit",20,type=int)
-    days = request.args.get("days",30,type=int)
-    if not email: return jsonify({"error":"请提供 email 参数"})
+    limit = _bounded_query_int("limit", 20, 1, _MAX_PAGE_LIMIT)
+    days = _bounded_query_int("days", 30, 1, _MAX_PAGE_DAYS)
+    if not email: return _api_error("请提供 email 参数", 400)
+    if len(email) > _MAX_EMAIL_LENGTH or len(alias) > _MAX_EMAIL_LENGTH:
+        return _api_error("邮箱地址过长", 400)
     acc_id = None
     for a in _account_mgr.list_accounts():
         if a.get("icloud_email","").lower()==email or a.get("real_email","").lower()==email: acc_id=a["id"]; break
-    if not acc_id: return jsonify({"error":f"未找到邮箱对应的账号: {email}"})
+    if not acc_id: return _api_error("未找到邮箱对应的账号", 404)
     try:
         if alias:
+            if not _pickup_alias_belongs_to_account(acc_id, alias):
+                return _api_error("邮箱不属于该账号", 404)
             msgs = _account_mgr.check_alias_mail(acc_id, alias, limit=limit, days=days)
             return jsonify({"emails":msgs,"count":len(msgs),"alias":alias,"account":email})
         else:
             by_alias = _account_mgr.check_all_aliases_mail(acc_id, limit_per=limit, days=days)
             total = sum(len(v) for v in by_alias.values())
             return jsonify({"by_alias":by_alias,"total":total,"account":email})
-    except Exception as e: return jsonify({"error":str(e)})
+    except Exception: return _api_error("邮件读取失败", 502)
 
 @app.route("/api/accounts/<acc_id>/alias-mail")
 def api_alias_mail(acc_id):
@@ -3103,7 +3288,7 @@ def api_alias_mail(acc_id):
         total = sum(len(v) for v in by_alias.values())
         stats = _account_mgr._cache.get_stats(acc_id)
         return jsonify({"by_alias":by_alias,"total":total,"cached":stats})
-    except Exception as e: return jsonify({"by_alias":{},"total":0,"error":str(e)})
+    except Exception: return _api_error("隐私邮箱收件读取失败", 502)
 
 @app.route("/api/aliases")
 def api_aliases():
@@ -3126,8 +3311,41 @@ def api_aliases():
             "accounts": accounts,
             "failures": failures,
         })
-    except Exception as e:
-        return jsonify({"ok":False,"aliases":[],"count":0,"error":str(e)}), 500
+    except Exception:
+        return _api_error("邮箱同步失败", 502)
+
+
+def _pickup_alias_belongs_to_account(acc_id, alias_email):
+    """Check ownership before creating/revoking an opaque pickup link.
+
+    A link endpoint must not become an oracle that creates links for arbitrary
+    account ids and addresses.  Prefer the durable alias index and tolerate a
+    missing/stale index while the account manager is refreshing aliases.
+    """
+    acc_id = str(acc_id or "").strip()
+    alias_email = str(alias_email or "").strip().lower()
+    if not acc_id or not alias_email or "@" not in alias_email:
+        return False
+    if not _account_mgr.get_account(acc_id):
+        return False
+    try:
+        with _account_mgr._latest_emails_lock:
+            latest = RESULTS_DIR / "latest_emails.txt"
+            if latest.exists():
+                for line in latest.read_text(encoding="utf-8").splitlines():
+                    parts = line.split("\t")
+                    if len(parts) > 1 and parts[1].strip() == acc_id:
+                        if parts[0].strip().lower() == alias_email:
+                            return True
+    except (OSError, UnicodeError):
+        pass
+    try:
+        for item in (_pickup_store.list_for_account(acc_id) or []):
+            if str((item or {}).get("alias_email") or "").strip().lower() == alias_email:
+                return True
+    except Exception:
+        pass
+    return False
 
 @app.route("/api/pickup-links")
 def api_pickup_links():
@@ -3136,25 +3354,40 @@ def api_pickup_links():
         links = _pickup_store.list_all()
         base = PICKUP_BASE_URL or request.host_url.rstrip("/")
         return jsonify({"links": [
-            {"account_id": x["account_id"], "email": x["alias_email"], "token": x["token"],
+            # Keep the bearer token only inside the opaque URL.  Returning a
+            # second raw token field makes accidental logging/exfiltration easy.
+            {"account_id": x["account_id"], "email": x["alias_email"],
              "url": f"{base}/pickup/{x['token']}", "created_at": x["created_at"]}
             for x in links
         ], "count": len(links)})
-    except Exception as e:
-        return jsonify({"links": [], "count": 0, "error": str(e)})
+    except Exception:
+        return _api_error("取件链接读取失败", 502)
 
 @app.route("/api/pickup-links/<acc_id>/<path:alias_email>", methods=["POST"])
 def api_ensure_pickup_link(acc_id, alias_email):
+    alias_email = _bounded_text(alias_email, _MAX_EMAIL_LENGTH)
+    if alias_email is None or "@" not in alias_email:
+        return _api_error("邮箱地址格式无效", 400)
+    if not _pickup_alias_belongs_to_account(acc_id, alias_email):
+        return _api_error("邮箱不属于该账号或账号不存在", 404)
     try:
         item = _pickup_store.ensure(acc_id, alias_email)
         base = PICKUP_BASE_URL or request.host_url.rstrip("/")
         return jsonify({"ok": True, "url": f"{base}/pickup/{item['token']}"})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception:
+        return _api_error("取件链接生成失败", 502)
 
 @app.route("/api/pickup-links/<acc_id>/<path:alias_email>", methods=["DELETE"])
 def api_revoke_pickup_link(acc_id, alias_email):
-    return jsonify({"ok": _pickup_store.revoke(acc_id, alias_email)})
+    alias_email = _bounded_text(alias_email, _MAX_EMAIL_LENGTH)
+    if alias_email is None or "@" not in alias_email:
+        return _api_error("邮箱地址格式无效", 400)
+    if not _account_mgr.get_account(acc_id):
+        return _api_error("账号不存在", 404)
+    try:
+        return jsonify({"ok": _pickup_store.revoke(acc_id, alias_email)})
+    except Exception:
+        return _api_error("取件链接删除失败", 502)
 
 @app.route("/api/pickup-links/export", methods=["POST"])
 def api_export_pickup_links():
@@ -3553,7 +3786,7 @@ def pickup_message(token, msg_id):
 
 @app.route("/api/emails")
 def api_emails():
-    limit = request.args.get("limit",0,type=int)
+    limit = _bounded_query_int("limit", 0, 0, _MAX_PAGE_LIMIT)
     emails = []
     pickup_by_email = {
         item.get("alias_email", "").strip().lower(): item
@@ -3653,6 +3886,8 @@ def api_scheduler_start():
         _scheduler_thread = threading.Thread(target=_scheduler_loop, daemon=True)
         _scheduler_thread.start()
         _update_state(running=True)
+        # An explicit API start is an operator decision to repair/enable the
+        # flag, including after a malformed flag was found at startup.
         _save_scheduler_enabled(True)
         return jsonify({"ok":True,"already_running":False})
 
@@ -3698,6 +3933,8 @@ def api_log_stream():
 
 def main():
     import argparse, os, signal as _signal
+    import atexit
+    from process_lock import LockAlreadyHeld, service_process_lock
     parser = argparse.ArgumentParser(description="iCloud HME Web UI")
     parser.add_argument("--port",type=int,default=int(os.environ.get("PORT",5050)))
     parser.add_argument("--host",type=str,default=os.environ.get("HOST","127.0.0.1"))
@@ -3708,6 +3945,13 @@ def main():
         print("[!] Refusing to bind", args.host, "without ADMIN_ACCESS_TOKEN")
         print("    Use --host 127.0.0.1, or set ADMIN_ACCESS_TOKEN first")
         raise SystemExit(2)
+    service_lock = service_process_lock(HERE)
+    try:
+        service_lock.acquire()
+    except LockAlreadyHeld:
+        print("[!] Another iCloud HME service or scheduler instance is already running", file=sys.stderr)
+        raise SystemExit(2)
+    atexit.register(service_lock.release)
     if not args.no_sync:
         offset = _sync_time()
         if abs(offset)>0.5: print(f"[*] Time sync: offset {offset:.1f}s")
@@ -3717,11 +3961,13 @@ def main():
     _account_mgr._cache.prune_accounts(_account_mgr.accounts)
     with _account_control_lock:
         _paused_account_ids.intersection_update(_account_mgr.accounts)
-        _save_create_controls_locked()
+        if not _CREATE_CONTROL_LOAD_FAILED:
+            _save_create_controls_locked()
     # Upgrade legacy plaintext before starting any concurrent workers.
     _account_mgr._save()
     with _batch_lock:
-        _save_batch_state_locked()
+        if not _BATCH_STATE_LOAD_FAILED:
+            _save_batch_state_locked()
     _initialize_mail_pauses()
     threading.Thread(target=_health_loop, daemon=True).start()
     threading.Thread(target=_mail_watch_loop, daemon=True).start()
@@ -3779,17 +4025,21 @@ def main():
     _signal.signal(_signal.SIGINT, _shutdown)
     _signal.signal(_signal.SIGTERM, _shutdown)
     try:
-        from waitress import serve
-        print(f"\n  Production → http://{args.host}:{args.port}\n")
-        serve(
-            app,
-            host=args.host,
-            port=args.port,
-            threads=_env_int("WEB_THREADS", 32, 8, 64),
-            connection_limit=2000,
-        )
-    except ImportError:
-        print(f"\n  Dev server → http://{args.host}:{args.port}\n")
-        app.run(host=args.host, port=args.port, debug=False, threaded=True)
+        try:
+            from waitress import serve
+        except ImportError:
+            print(f"\n  Dev server → http://{args.host}:{args.port}\n")
+            app.run(host=args.host, port=args.port, debug=False, threaded=True)
+        else:
+            print(f"\n  Production → http://{args.host}:{args.port}\n")
+            serve(
+                app,
+                host=args.host,
+                port=args.port,
+                threads=_env_int("WEB_THREADS", 32, 8, 64),
+                connection_limit=2000,
+            )
+    finally:
+        service_lock.release()
 
 if __name__=="__main__": main()
