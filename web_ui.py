@@ -1513,7 +1513,7 @@ setTimeout(loadNetworkProxy,1000);
 setTimeout(loadProxySubscription,1000);
 async function loadCreationGuard(){var d=await api('/api/creation-guard');if(!d.ok)return;var g=d.protection;E('guardConcurrency').value=g.settings.concurrency;E('guardDaily').value=g.settings.daily_limit;var now=Date.now()/1000;var ids=Object.keys(g.accounts||{}).filter(function(id){var a=g.accounts[id]||{};return !!(a.blocked||a.pending||(a.retry_at||0)>now);});var h='<p>'+ (g.multi_account_alert?'多个账号出现同类异常，请检查；其他账号继续创建':'账号独立保护，其他账号不受牵连')+'</p>';if(!ids.length){h+='<p class="hint">当前没有需要处理的创建保护记录。</p>';}ids.forEach(function(id){var a=g.accounts[id]||{};var canRelease=!!a.blocked;h+='<div style="padding:8px;border-bottom:1px solid #eee">'+esc(id)+' · 今日尝试 '+(a.attempts||0)+' / 成功 '+(a.successes||0)+' · '+esc(a.blocked||a.last_error_kind||'冷却中')+((a.retry_at||0)>now?' · 冷却至 '+new Date(a.retry_at*1000).toLocaleString():'')+(a.pending?' · 有待核对地址':'')+(canRelease?' <button class="btn btn-sm guard-release" data-account-id="'+escAttr(id)+'">检查后解除账号暂停</button>':'')+'</div>';});E('creationGuardStatus').innerHTML=h;Array.from(E('creationGuardStatus').querySelectorAll('.guard-release')).forEach(function(b){b.onclick=function(){releaseCreationGuard(b.dataset.accountId,true);};});}
 async function saveCreationGuard(){var d=await api('/api/creation-guard',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'settings',concurrency:Number(E('guardConcurrency').value),daily_limit:Number(E('guardDaily').value)})});toast(d.ok?'保护设置已保存':d.error,!d.ok);if(d.ok)loadCreationGuard();}
-async function releaseCreationGuard(id,ask){if(id&&ask!==false&&!confirm('确认解除这个账号的创建暂停？解除后不会自动开始创建，需要你重新选择账号并点击“开始创建”。'))return;var d=await api('/api/creation-guard',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'release',account_id:id||null})});toast(d.ok?'暂停已解除；冷却和待核对记录仍保留':d.error,!d.ok);if(d.ok){await loadCreationGuard();await refreshAll();}}
+async function releaseCreationGuard(id,ask){if(id&&ask!==false&&!confirm('确认解除这个账号的创建暂停？解除后会重新排队；如果 Cookie 仍失效，会再次暂停。'))return;var d=await api('/api/creation-guard',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'release',account_id:id||null})});toast(d.ok?(d.requeued?'暂停已解除，已重新排队；如果 Cookie 仍失效会再次暂停':'暂停已解除；冷却和待核对记录仍保留'):d.error,!d.ok);if(d.ok){await loadCreationGuard();await refreshAll();}}
 setTimeout(loadCreationGuard,1000);
 async function apiSlow(path,opts){return api(path,Object.assign({timeout:60000},opts||{}));}
 function fillMailWatch(){var n=parseInt((state&&state.mail_watch_hours)||1,10);if(!(n>=1&&n<=24))n=1;var input=E('mailWatchHours');if(input&&document.activeElement!==input)input.value=n;}async function saveMailWatch(){var n=parseInt(E('mailWatchHours').value,10);if(!(n>=1&&n<=24)){toast(t('settings.mail_watch_invalid'),true);return}var d=await api('/api/mail-watch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({interval_hours:n})});if(!d.ok){toast(d.error||t('error.unknown'),true);return}state.mail_watch_hours=d.interval_hours;fillMailWatch();toast(t('settings.mail_watch_saved',{n:d.interval_hours}));}async function refreshAll(force){if(_refreshBusy){if(force)_refreshQueued=true;return} _refreshBusy=true;var generation=++_refreshGeneration;try{var results=await Promise.all([api('/api/accounts'),api('/api/state')]);var a=results[0],s=results[1];if(generation!==_refreshGeneration)return;if(a.ok!==false&&Array.isArray(a.accounts)){accounts=a.accounts;}else{_refreshLastError=a.error||'账号列表读取失败';}if(s.ok!==false&&s&&typeof s==='object'){state=s;}else{_refreshLastError=s.error||'状态读取失败';}renderSidebar();renderDashboard();updateEmptyState();if(curTab==='emails'){await refreshEmails();renderAliasTable();}if(curTab==='settings'){renderBatchPanel();fillMailWatch();}await loadLogs();updateInboxAccountSelect();}finally{_refreshBusy=false;if(_refreshQueued){_refreshQueued=false;refreshAll(true);}}}
@@ -1856,6 +1856,33 @@ def _requeue_finished_batch_account(job, acc_id, count, previous):
     return replacement
 
 
+def _requeue_batch_account_after_guard_release(acc_id):
+    """Requeue a finished batch entry after its creation guard is released."""
+    with _batch_lock:
+        if not _batch_active_id:
+            return None
+        job = _batch_jobs.get(_batch_active_id)
+        if not job or job.get("status") not in ("queued", "running", "paused"):
+            return None
+        entry = (job.get("accounts") or {}).get(acc_id)
+        if not isinstance(entry, dict):
+            return None
+        error = str(entry.get("error") or "")
+        if not (error.startswith("创建已暂停：") or error.startswith("创建已暂停:")):
+            return None
+        target = _batch_account_target(job, acc_id, entry)
+        created = max(0, int(entry.get("created", 0) or 0))
+        remaining = target - created
+        if remaining <= 0:
+            return None
+        job["accounts"][acc_id] = _requeue_finished_batch_account(
+            job, acc_id, remaining, entry
+        )
+        _sync_job_status_locked(job)
+        _save_batch_state_locked()
+        return job.get("id")
+
+
 def _pending_batch_account_ids(job, inflight_ids=None):
     inflight_ids = inflight_ids or set()
     pending = []
@@ -2184,6 +2211,7 @@ def api_creation_guard():
     # Older versions did not remove guard records when an account was deleted.
     # Prune those records on every read so the settings page stays actionable.
     guard.prune_accounts(account["id"] for account in _account_mgr.list_accounts())
+    requeued_job_id = None
     if request.method == "POST":
         data = request.get_json(silent=True) or {}
         try:
@@ -2197,7 +2225,17 @@ def api_creation_guard():
                     if account and account.get("create_status") == "limited":
                         _account_mgr.update_account(acc_id, create_status="available",
                             create_last_error=None, create_limited_at=None)
-                _emit_log("info", "管理员更新创建保护状态" + (f": {acc_id}" if acc_id else "（清除多账号异常提醒）"))
+                    requeued_job_id = _requeue_batch_account_after_guard_release(acc_id)
+                detail = "管理员更新创建保护状态" + (f": {acc_id}" if acc_id else "（清除多账号异常提醒）")
+                if requeued_job_id:
+                    detail += f"，批量任务 {requeued_job_id} 已重新排队"
+                _emit_log("info", detail)
+                if requeued_job_id:
+                    with _batch_lock:
+                        should_start = requeued_job_id not in _batch_runner_jobs
+                    if should_start:
+                        threading.Thread(target=_run_batch_job,
+                                         args=(requeued_job_id,), daemon=True).start()
             elif data.get("action") == "settings":
                 guard.configure(data.get("concurrency"), data.get("daily_limit"))
                 _emit_log("info", "创建保护参数已更新")
@@ -2211,7 +2249,7 @@ def api_creation_guard():
         for acc_id in list(guard.data["accounts"]):
             guard.account(acc_id)
         snapshot = guard.snapshot()
-    return jsonify(ok=True, protection=snapshot)
+    return jsonify(ok=True, protection=snapshot, requeued=bool(requeued_job_id))
 
 
 @app.route("/api/network-proxy", methods=["GET", "POST"])
