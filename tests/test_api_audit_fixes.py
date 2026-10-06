@@ -19,6 +19,18 @@ def test_api_responses_are_uncached_and_have_request_id():
     assert response.headers.get("X-Request-ID")
 
 
+def test_mail_watch_status_exposes_cycle_state_without_credentials():
+    import web_ui
+
+    response = web_ui.app.test_client().get("/api/mail-watch/status")
+    payload = response.get_json()
+    assert response.status_code == 200
+    assert payload["ok"] is True
+    assert 1 <= payload["interval_hours"] <= 24
+    assert payload["status"]["state"] in {"starting", "waiting", "running", "idle"}
+    assert "app_password" not in payload
+
+
 def test_unknown_api_route_has_sanitized_json_error():
     import web_ui
 

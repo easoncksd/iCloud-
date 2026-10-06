@@ -777,6 +777,29 @@ _MAIL_WATCH_FRESH_SECONDS = 120
 _MAIL_WATCH_BUSY_WAIT_SECONDS = 60
 _MAIL_WATCH_BUSY_RETRIES = 8
 
+_mail_watch_status_lock = threading.Lock()
+_mail_watch_status = {
+    "state": "starting",
+    "cycle": 0,
+    "cycle_started_at": None,
+    "last_finished_at": None,
+    "next_run_at": None,
+    "last_duration_seconds": None,
+    "last_success_count": 0,
+    "last_failure_count": 0,
+    "last_busy_count": 0,
+}
+
+
+def _set_mail_watch_status(**updates):
+    with _mail_watch_status_lock:
+        _mail_watch_status.update(updates)
+
+
+def _mail_watch_status_snapshot():
+    with _mail_watch_status_lock:
+        return dict(_mail_watch_status)
+
 
 def _hold_mail_pulls(acc_id):
     acc_id = str(acc_id or "")
@@ -949,9 +972,14 @@ def _check_account_mail_once(account, wait_timeout=0, fresh_seconds=None, force=
 def _mail_watch_loop():
     reported = set()
     first = True
+    cycle = 0
     while not _shutdown_event.is_set():
         hours = _load_mail_watch_hours()
         wait_sec = 20 if first else max(60, hours * 3600)
+        _set_mail_watch_status(
+            state="waiting",
+            next_run_at=(datetime.now() + timedelta(seconds=wait_sec)).isoformat(),
+        )
         waited = 0
         while waited < wait_sec:
             step = 5 if wait_sec - waited > 5 else max(1, wait_sec - waited)
@@ -964,10 +992,19 @@ def _mail_watch_loop():
         first = False
         hours = _load_mail_watch_hours()
         fresh_seconds = max(_MAIL_WATCH_FRESH_SECONDS, hours * 3600)
+        cycle += 1
+        cycle_started = time.monotonic()
+        _set_mail_watch_status(
+            state="running",
+            cycle=cycle,
+            cycle_started_at=datetime.now().isoformat(),
+            next_run_at=None,
+        )
         pending = [
             account for account in _account_mgr.list_accounts()
             if account.get("app_password")
         ]
+        success_count = failure_count = busy_count = 0
         attempt = 0
         while pending and attempt < _MAIL_WATCH_BUSY_RETRIES and not _shutdown_event.is_set():
             still = []
@@ -981,23 +1018,38 @@ def _mail_watch_loop():
                         fresh_seconds=fresh_seconds,
                     )
                 except Exception as exc:
+                    failure_count += 1
+                    still.append(account)
                     if acc_id not in reported:
                         _emit_log("warn", f"收信检查失败 [{account.get('name') or account.get('real_email') or acc_id}]: {str(exc)[:100]}")
                         reported.add(acc_id)
                     continue
                 label = account.get("name") or account.get("real_email") or acc_id
                 if status == "busy":
+                    busy_count += 1
                     still.append(account)
                 elif status == "auth_failed":
+                    failure_count += 1
                     if acc_id not in reported:
                         _emit_log("warn", f"收信认证失败 [{label}]: 已暂停同步，等待延迟复查或手动验证恢复")
                         reported.add(acc_id)
                 elif status == "ok":
+                    success_count += 1
                     reported.discard(acc_id)
+                elif status not in ("skip", "paused"):
+                    failure_count += 1
             pending = still
             attempt += 1
             if pending and not _shutdown_event.is_set():
                 _shutdown_event.wait(3)
+        _set_mail_watch_status(
+            state="idle",
+            last_finished_at=datetime.now().isoformat(),
+            last_duration_seconds=round(time.monotonic() - cycle_started, 3),
+            last_success_count=success_count,
+            last_failure_count=failure_count,
+            last_busy_count=busy_count,
+        )
 
 
 # ----- HTML -----
@@ -1393,6 +1445,7 @@ textarea{width:100%;min-height:140px}
             <input type="number" id="mailWatchHours" value="1" min="1" max="24" step="1">
             <button class="btn btn-primary btn-sm" onclick="saveMailWatch()" data-i18n="settings.mail_watch_save">保存</button>
           </div>
+          <div id="mailWatchStatus" class="hint">监控状态加载中...</div>
         </div>
         <div class="settings-section">
           <h3 data-i18n="settings.create">创建邮箱</h3>
@@ -1686,7 +1739,10 @@ async function refreshAliases(){if(_aliasesBusy){toast(t('sync.busy'),true);retu
 function updateInboxAccountSelect(){var sel=E('inboxAccount');if(!sel)return;var old=sel.value;sel.innerHTML='<option value="">'+t('inbox.select_account')+'</option>';accounts.forEach(function(a){var hasPwd=a.has_app_password?t('inbox.ready'):t('inbox.no_pwd');var imapEmail=a.icloud_email||a.real_email||'';sel.innerHTML+='<option value="'+escAttr(a.id)+'">'+esc((a.name||a.real_email||a.id).substring(0,20))+' | '+esc(imapEmail.substring(0,25))+' '+hasPwd+'</option>';});sel.value=old||'';renderInboxSetupHintIfNeeded();}
 function renderDocs(){var el=E('docsContent');if(el)el.innerHTML='';}
 bindAliasSearch();
+async function refreshMailWatchStatus(){var box=E('mailWatchStatus');if(!box)return;try{var d=await api('/api/mail-watch/status');var s=d.status||{};var stateText=s.state==='running'?'检查中':s.state==='waiting'?'等待下一轮':s.state==='idle'?'正常':'启动中';var last=s.last_finished_at?s.last_finished_at.replace('T',' ').slice(0,19):'尚未完成';var next=s.next_run_at?s.next_run_at.replace('T',' ').slice(0,19):'本轮进行中';box.textContent='状态：'+stateText+' · 上次完成：'+last+' · 下次检查：'+next+' · 成功 '+(s.last_success_count||0)+' / 异常 '+(s.last_failure_count||0);}catch(_){box.textContent='监控状态暂时无法读取';}}
 applyStaticI18n();
+refreshMailWatchStatus();
+setInterval(refreshMailWatchStatus,30000);
 refreshAll().then(connectSSE);setInterval(refreshLight,10000);setInterval(refreshAll,30000);
 </script>
 </body>
@@ -1707,6 +1763,7 @@ def api_state():
         state["alias_count"] = summary["total_aliases"]
         state["alias_active"] = summary["total_active_aliases"]
         state["mail_watch_hours"] = _load_mail_watch_hours()
+        state["mail_watch_status"] = _mail_watch_status_snapshot()
     return jsonify(state)
 
 @app.route("/api/accounts")
@@ -3869,11 +3926,19 @@ def api_resume_mail(acc_id):
 @app.route("/api/mail-watch", methods=["GET", "POST"])
 def api_mail_watch():
     if request.method == "GET":
-        return jsonify({"ok": True, "interval_hours": _load_mail_watch_hours()})
+        return jsonify({"ok": True, "interval_hours": _load_mail_watch_hours(),
+                        "status": _mail_watch_status_snapshot()})
     data = request.get_json(silent=True) or {}
     hours = _save_mail_watch_hours(data.get("interval_hours"))
     _emit_log("info", f"收信监控间隔已设为 {hours} 小时")
-    return jsonify({"ok": True, "interval_hours": hours})
+    return jsonify({"ok": True, "interval_hours": hours,
+                    "status": _mail_watch_status_snapshot()})
+
+
+@app.route("/api/mail-watch/status")
+def api_mail_watch_status():
+    return jsonify({"ok": True, "interval_hours": _load_mail_watch_hours(),
+                    "status": _mail_watch_status_snapshot()})
 
 @app.route("/api/scheduler/start", methods=["POST"])
 def api_scheduler_start():

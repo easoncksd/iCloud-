@@ -111,3 +111,6 @@ def test_deploy_script_covers_full_validation_and_optional_workflow():
     assert "build_source_manifest" in script
     assert "rsync -a --delete" in script
     assert 'if [[ -f "$SOURCE_DIR/.github/workflows/tests.yml" ]]' in script
+    assert "SERVICE_WAS_ACTIVE" in script
+    assert "remove_source_managed_paths" in script
+    assert "SKIP_DEPLOY_TESTS" in script

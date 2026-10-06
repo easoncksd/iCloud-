@@ -30,8 +30,11 @@ fi
 "$PYTHON_BIN" -m compileall -q .
 if "$PYTHON_BIN" -c 'import pytest' 2>/dev/null; then
     "$PYTHON_BIN" -m pytest -q
-else
+elif [[ "${SKIP_DEPLOY_TESTS:-0}" == "1" ]]; then
     echo "warning: pytest is not installed in the production runtime; local CI tests must be green before deployment" >&2
+else
+    echo "pytest is required; set SKIP_DEPLOY_TESTS=1 only after external CI verification" >&2
+    exit 1
 fi
 
 build_source_manifest() {
@@ -51,6 +54,18 @@ build_source_manifest() {
 SOURCE_MANIFEST=$(mktemp)
 trap 'rm -f "$SOURCE_MANIFEST"' EXIT
 build_source_manifest "$SOURCE_DIR" "$SOURCE_MANIFEST"
+
+SERVICE_WAS_ACTIVE=0
+if systemctl is-active --quiet icloud-hme.service; then
+    SERVICE_WAS_ACTIVE=1
+    systemctl stop icloud-hme.service
+fi
+restart_after_preflight_failure() {
+    if [[ "$SERVICE_WAS_ACTIVE" == "1" ]] && ! systemctl is-active --quiet icloud-hme.service; then
+        systemctl start icloud-hme.service || true
+    fi
+}
+trap restart_after_preflight_failure EXIT
 
 mkdir -m 700 "$BACKUP_DIR"
 cp -a "$PROJECT_DIR" "$BACKUP_DIR/project"
@@ -73,16 +88,29 @@ for old_backup in "${OLD_DEPLOY_BACKUPS[@]}"; do
     rm -rf -- "$old_backup"
 done
 
+remove_source_managed_paths() {
+    while IFS= read -r -d '' item; do
+        base=$(basename "$item")
+        case "$base" in
+            results|logs|accounts.json|.credentials.key|.venv|.git) continue ;;
+        esac
+        rm -rf -- "$item"
+    done < <(find "$PROJECT_DIR" -mindepth 1 -maxdepth 1 -print0)
+}
+
 rollback() {
     trap - ERR
     echo "deployment failed; restoring $BACKUP_DIR" >&2
+    remove_source_managed_paths
     cp -a "$BACKUP_DIR/project/." "$PROJECT_DIR/"
     cp -a "$BACKUP_DIR/icloud-pickup.conf" "$NGINX_VHOST"
     cp -a "$BACKUP_DIR/00-icloud-security-zones.conf" "$NGINX_ZONES"
     cp -a "$BACKUP_DIR/icloud-hme-override.conf" "$SYSTEMD_OVERRIDE"
     systemctl daemon-reload
     nginx -t
-    systemctl restart icloud-hme.service
+    if [[ "$SERVICE_WAS_ACTIVE" == "1" ]]; then
+        systemctl restart icloud-hme.service
+    fi
     systemctl reload nginx
 }
 trap rollback ERR
@@ -100,13 +128,7 @@ else
     echo "warning: rsync is not installed; using tar-based source sync" >&2
     # Keep runtime state and the service virtualenv, then replace every
     # source-managed path so removed modules cannot remain on the server.
-    while IFS= read -r -d '' item; do
-        base=$(basename "$item")
-        case "$base" in
-            results|logs|accounts.json|.credentials.key|.venv|.git) continue ;;
-        esac
-        rm -rf -- "$item"
-    done < <(find "$PROJECT_DIR" -mindepth 1 -maxdepth 1 -print0)
+    remove_source_managed_paths
     tar -C "$SOURCE_DIR" \
         --exclude='./results' --exclude='./logs' \
         --exclude='./accounts.json' --exclude='./.credentials.key' \
@@ -135,16 +157,20 @@ install -m 600 deploy/icloud-hme-override.conf "$SYSTEMD_OVERRIDE"
 
 nginx -t
 systemctl daemon-reload
-systemctl restart icloud-hme.service
+if [[ "$SERVICE_WAS_ACTIVE" == "1" ]]; then
+    systemctl restart icloud-hme.service
+fi
 systemctl reload nginx
 
-for _ in $(seq 1 40); do
-    if curl -fsS http://127.0.0.1:5050/healthz >/dev/null; then
-        break
-    fi
-    sleep 0.25
-done
-curl -fsS http://127.0.0.1:5050/healthz >/dev/null
+if [[ "$SERVICE_WAS_ACTIVE" == "1" ]]; then
+    for _ in $(seq 1 40); do
+        if curl -fsS http://127.0.0.1:5050/healthz >/dev/null; then
+            break
+        fi
+        sleep 0.25
+    done
+    curl -fsS http://127.0.0.1:5050/healthz >/dev/null
+fi
 
 # Old combined logs contain bearer URLs. Keep the protected backup and start a
 # fresh redacted log after the new format is active.
