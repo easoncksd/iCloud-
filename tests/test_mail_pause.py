@@ -136,6 +136,10 @@ def test_authentication_rejection_records_pause_and_does_not_retry(setup, monkey
             raise imaplib.IMAP4.error('[AUTHENTICATIONFAILED] Authentication Failed')
         def logout(self):
             pass
+    # Production mail connections go through network_proxy.connect_imap when
+    # a proxy is configured. Mock that seam so this test remains independent
+    # of the machine's live proxy mode while still exercising auth handling.
+    monkeypatch.setattr('network_proxy.connect_imap', lambda *x, **kw: Connection())
     monkeypatch.setattr(icloud_mail.imaplib, 'IMAP4_SSL', lambda *x, **kw: Connection())
     monkeypatch.setattr(mgr, '_cache', SimpleNamespace(get_all_alias_mail=lambda _: {}, get_inbox=lambda _: []))
     with pytest.raises(icloud_mail.MailAuthenticationError):
