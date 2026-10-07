@@ -16,7 +16,8 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
-HERE = Path(__file__).resolve().parent
+from runtime_paths import DATA_ROOT
+HERE = DATA_ROOT
 CACHE_FILE = HERE / "results" / "mail_cache.json"
 
 def message_sort_key(message: Dict) -> datetime:
@@ -89,6 +90,7 @@ class MailCache:
     def set_inbox(self, acc_id: str, emails: List[Dict]):
         with self._lock:
             self._ensure_account(acc_id)
+            emails = self._current_epoch_messages(acc_id, emails)
             existing_ids = {str(e.get("id")) for e in self._data[acc_id]["inbox_emails"]}
             new_emails = []
             for email in emails:
@@ -112,6 +114,7 @@ class MailCache:
     def set_alias_mail(self, acc_id: str, alias_email: str, emails: List[Dict]):
         with self._lock:
             self._ensure_account(acc_id)
+            emails = self._current_epoch_messages(acc_id, emails)
             if alias_email not in self._data[acc_id]["alias_emails"]:
                 self._data[acc_id]["alias_emails"][alias_email] = []
             existing_ids = {str(e.get("id")) for e in self._data[acc_id]["alias_emails"][alias_email]}
@@ -133,6 +136,7 @@ class MailCache:
             self._ensure_account(acc_id)
             changed = False
             for alias, emails in by_alias.items():
+                emails = self._current_epoch_messages(acc_id, emails)
                 if alias not in self._data[acc_id]["alias_emails"]:
                     self._data[acc_id]["alias_emails"][alias] = []
                 existing_ids = {str(e.get("id")) for e in self._data[acc_id]["alias_emails"][alias]}
@@ -160,6 +164,47 @@ class MailCache:
         with self._lock:
             self._ensure_account(acc_id)
             return self._data[acc_id].get("last_checked")
+
+    def sync_cursor(self, acc_id, epoch, aliases):
+        with self._lock:
+            item = self._data.get(acc_id, {}).get('pickup_cursor', {})
+            if item.get('epoch') != str(epoch) or item.get('aliases') != sorted(aliases):
+                return 0
+            return max(0, int(item.get('uid', 0)))
+
+    def begin_epoch(self, acc_id, epoch):
+        with self._lock:
+            before = self._data.pop(acc_id, None)
+            self._ensure_account(acc_id)
+            self._data[acc_id]['uidvalidity'] = str(epoch)
+            try:
+                self._save()
+            except Exception:
+                if before is None:
+                    self._data.pop(acc_id, None)
+                else:
+                    self._data[acc_id] = before
+                raise
+
+    def _current_epoch_messages(self, acc_id, messages):
+        epoch = self._data[acc_id].get('uidvalidity')
+        if epoch is None:
+            return messages
+        return [m for m in messages if str(m.get('_uidvalidity')) == epoch]
+
+    def set_sync_cursor(self, acc_id, epoch, aliases, uid):
+        with self._lock:
+            self._ensure_account(acc_id)
+            before = self._data[acc_id].get('pickup_cursor')
+            self._data[acc_id]['pickup_cursor'] = dict(epoch=str(epoch), aliases=sorted(aliases), uid=uid)
+            try:
+                self._save()
+            except Exception:
+                if before is None:
+                    self._data[acc_id].pop('pickup_cursor', None)
+                else:
+                    self._data[acc_id]['pickup_cursor'] = before
+                raise
 
     def cache_age_seconds(self, acc_id: str) -> float:
         lc = self.last_checked(acc_id)

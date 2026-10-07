@@ -114,10 +114,11 @@ def test_failed_manual_resume_keeps_pause(setup, monkeypatch):
 
 def test_paused_pickup_returns_persisted_body_without_network(setup, monkeypatch):
     w, mgr, a = setup
+    a['mail_uidvalidity'] = 1
     w._apply_mail_watch_result('a', False, 'AUTHENTICATIONFAILED')
     monkeypatch.setattr(w, '_pickup_store', SimpleNamespace(get_by_token=lambda _: {'account_id': 'a', 'alias_email': 'alias@icloud.com'}))
-    monkeypatch.setattr(mgr, '_cache', SimpleNamespace(get_alias_mail=lambda *x: [{'id': '7'}, {'id': '8'}]))
-    monkeypatch.setattr(w, '_pickup_body_store', SimpleNamespace(get=lambda a, m: {'body': 'cached'} if m == '7' else None))
+    monkeypatch.setattr(mgr, '_cache', SimpleNamespace(get_alias_mail=lambda *x: [{'id': '7', '_uidvalidity': 1}, {'id': '8', '_uidvalidity': 1}]))
+    monkeypatch.setattr(w, '_pickup_body_store', SimpleNamespace(get=lambda a, m: {'body': 'cached'} if m == '1:7' else None))
     monkeypatch.setattr(w, '_pickup_body_cache', {})
     monkeypatch.setattr(w, '_pickup_executor', SimpleNamespace(submit=lambda *x: pytest.fail('unexpected network task')))
     client = w.app.test_client()

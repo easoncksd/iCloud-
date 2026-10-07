@@ -27,9 +27,10 @@ from account_manager import AccountManager
 from durable_json import read_object, write_object
 from process_lock import LockAlreadyHeld, service_process_lock
 
-LOG_DIR = HERE / "logs"
-RESULT_DIR = HERE / "results"
-STATE_FILE = HERE / "scheduler_state.json"
+from runtime_paths import DATA_ROOT
+LOG_DIR = DATA_ROOT / "logs"
+RESULT_DIR = DATA_ROOT / "results"
+STATE_FILE = DATA_ROOT / "scheduler_state.json"
 
 def setup_logging(verbose: bool = True) -> logging.Logger:
     LOG_DIR.mkdir(parents=True, exist_ok=True); RESULT_DIR.mkdir(parents=True, exist_ok=True)

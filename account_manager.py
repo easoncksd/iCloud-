@@ -32,7 +32,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 
-HERE = Path(__file__).resolve().parent
+from runtime_paths import DATA_ROOT
+HERE = DATA_ROOT
 ACCOUNTS_FILE = HERE / "accounts.json"
 OLD_COOKIES_FILE = HERE / "cookies.json"
 RESULTS_DIR = HERE / "results"
@@ -90,6 +91,7 @@ class AccountManager:
         self._mail_clients: Dict[str, Any] = {}
         # Keep lock identity while any worker holds it, without retaining deleted IDs.
         self._mail_sync_locks = weakref.WeakValueDictionary()
+        self._mail_epoch_locks = weakref.WeakValueDictionary()
         self._operation_locks = weakref.WeakValueDictionary()
         self._latest_emails_lock = threading.Lock()
         # web_ui installs a checker so duplicate imports cannot replace an
@@ -367,6 +369,13 @@ class AccountManager:
         # locks in the opposite order.
         if existing_id and self._account_creation_in_progress(existing_id):
             raise ValueError("该账号已有创建任务，结束后再重新导入")
+        if existing_id:
+            # Use the same locked update path as explicit reimport. Cookie
+            # verification must never reset unrelated IMAP pause/epoch state.
+            updated = self.reimport_account(existing_id, cookie_input, host)
+            if name and name != "未命名账号":
+                updated = self.update_account(existing_id, name=name)
+            return updated
         with self._lock:
             # Re-check identity after the callback in case another import won
             # the race while we were validating the new credentials. The
@@ -374,17 +383,7 @@ class AccountManager:
             # lock-order inversion with web_ui's batch status readers.
             existing_id = self._existing_account_id_locked(account.get("real_email", ""))
             if existing_id:
-                old = self.accounts[existing_id]
-                acc_id = existing_id
-                account["id"] = existing_id
-                account["created_at"] = old.get("created_at") or account["created_at"]
-                if old.get("app_password"):
-                    account["app_password"] = old["app_password"]
-                if old.get("icloud_email") and not account.get("icloud_email"):
-                    account["icloud_email"] = old["icloud_email"]
-                if (not name or name == "未命名账号") and old.get("name"):
-                    account["name"] = old["name"]
-                self.accounts[existing_id] = account
+                raise ValueError("该账号已被另一个请求导入，请使用重新导入")
             else:
                 self.accounts[acc_id] = account
             self._save()
@@ -664,6 +663,23 @@ class AccountManager:
         with self._lock:
             return self._mail_sync_locks.setdefault(acc_id, threading.Lock())
 
+    def _observe_mail_epoch(self, acc_id, epoch):
+        if epoch is None:
+            return
+        with self._mail_epoch_lock(acc_id):
+            account = self.get_account(acc_id)
+            if not account:
+                raise KeyError(acc_id)
+            if str(account.get('mail_uidvalidity')) != str(epoch):
+                # Clear before acknowledging the new epoch. A crash can cause
+                # a rescan, never reuse headers from the previous mailbox.
+                self._cache.begin_epoch(acc_id, epoch)
+                self.update_account(acc_id, mail_uidvalidity=epoch)
+
+    def _mail_epoch_lock(self, acc_id):
+        with self._lock:
+            return self._mail_epoch_locks.setdefault(acc_id, threading.RLock())
+
     def mail_sync_paused(self, acc_id):
         account = self.accounts.get(acc_id) or {}
         return bool(account.get("mail_sync_paused") or account.get("mail_status") == "auth_failed")
@@ -713,6 +729,7 @@ class AccountManager:
                     mail_last_checked=datetime.now().isoformat(),
                     mail_next_retry_at=time.time() + max(3600, int(os.environ.get("MAIL_AUTH_RECHECK_SECONDS", "21600"))))
         mail.on_auth_failure = record_failure
+        mail.on_selected = lambda epoch: self._observe_mail_epoch(acc_id, epoch)
         return mail
 
     def check_inbox(self, acc_id: str, limit: int = 50, days: int = 7,
@@ -822,110 +839,90 @@ class AccountManager:
 
     def sync_pickup_mail(self, acc_id: str, alias_emails: List[str],
                          scan_limit: int = 100, days: int = 30) -> Dict:
-        """Incrementally sync pickup mail over IMAP without using iCloud cookies."""
+        """Sync with a durable UID cursor independent of the display cache."""
         aliases = {x.strip().lower() for x in alias_emails if x and x.strip()}
         if not aliases:
             return {"messages": {}, "bodies": {}}
-
-        cached_by_alias = self._cache.get_all_alias_mail(acc_id)
-        inbox_messages = self._cache.get_inbox(acc_id)
-        known_ids = set()
-        for messages in cached_by_alias.values():
-            known_ids.update(
-                str(msg.get("id", ""))
-                for msg in messages
-                if msg.get("id") is not None
-            )
-
-        # A message may have reached the general inbox cache before a pickup
-        # link was created. Map cached headers first so it is not skipped forever.
-        recovered_by_alias: Dict[str, List[Dict]] = {}
-        for header in inbox_messages:
-            msg_id = str(header.get("id", ""))
-            for matched in self._match_aliases(header, aliases):
-                alias_known = {str(m.get("id")) for m in cached_by_alias.get(matched, [])}
-                if msg_id not in alias_known:
-                    recovered_by_alias.setdefault(matched, []).append(header)
-        known_ids.update(
-            str(message.get("id", ""))
-            for message in inbox_messages
-            if message.get("id") is not None
-        )
-
         with self._mail_sync_lock(acc_id):
             self._require_mail_sync(acc_id)
             for attempt in range(2):
-                new_headers: List[Dict] = []
-                by_alias: Dict[str, List[Dict]] = {
-                    alias: list(messages)
-                    for alias, messages in recovered_by_alias.items()
-                }
-                bodies: Dict[str, Dict] = {}
-                with self._lock:
-                    mail = self._mail_clients.get(acc_id)
-                if not mail:
-                    mail = self.get_mail_client(acc_id)
-                    with self._lock:
-                        self._mail_clients[acc_id] = mail
-                # Establish SELECTED state so the client can expose the
-                # server's UIDVALIDITY before we build the local known-id set.
-                ensure_connected = getattr(mail, "_ensure_connected", None)
-                if callable(ensure_connected):
-                    ensure_connected()
-                uidvalidity = getattr(mail, "uidvalidity", None)
-                account = self.get_account(acc_id) or {}
-                previous_uidvalidity = account.get("mail_uidvalidity")
-                if uidvalidity is not None and previous_uidvalidity is not None and str(uidvalidity) != str(previous_uidvalidity):
-                    # IMAP UIDs are only stable within a UIDVALIDITY.  A
-                    # mailbox reset can reuse numbers, so discard headers
-                    # before scanning or new mail could be skipped forever.
-                    self._cache.clear_account(acc_id)
-                    inbox_messages = []
-                    cached_by_alias = {}
-                    recovered_by_alias = {}
-                    known_ids.clear()
-                if uidvalidity is not None and str(uidvalidity) != str(previous_uidvalidity):
-                    self.update_account(acc_id, mail_uidvalidity=uidvalidity)
                 try:
-                    # Do not cap this incremental UID scan at 100: a mailbox
-                    # can receive more messages than the cache warm-up limit
-                    # between polls.  Known UIDs are cheap to skip locally.
+                    with self._lock:
+                        mail = self._mail_clients.get(acc_id)
+                    if not mail:
+                        mail = self.get_mail_client(acc_id)
+                        with self._lock:
+                            self._mail_clients[acc_id] = mail
+                    ensure = getattr(mail, '_ensure_connected', None)
+                    if callable(ensure):
+                        ensure()
+                    epoch = getattr(mail, 'uidvalidity', None)
+                    self._observe_mail_epoch(acc_id, epoch)
+                    # Read snapshots only after epoch invalidation and under the
+                    # account lock. Never carry recovered old headers across it.
+                    cached = self._cache.get_all_alias_mail(acc_id)
+                    inbox = self._cache.get_inbox(acc_id)
+                    known = {str(m.get('id')) for rows in cached.values() for m in rows}
+                    known.update(str(m.get('id')) for m in inbox)
+                    by_alias, bodies, new_headers = {}, {}, []
+                    for header in inbox:
+                        for alias in self._match_aliases(header, aliases):
+                            if str(header.get('id')) not in {str(m.get('id')) for m in cached.get(alias, [])}:
+                                by_alias.setdefault(alias, []).append(header)
+                    cursor = self._cache.sync_cursor(acc_id, epoch, aliases)
+                    highwater, complete = cursor, True
+                    candidates = []
                     for uid in mail.recent_uids(limit=None, days=days):
                         uid_text = uid.decode() if isinstance(uid, bytes) else str(uid)
-                        if uid_text in known_ids:
+                        number = int(uid_text)
+                        highwater = max(highwater, number)
+                        if number <= cursor or uid_text in known:
                             continue
-                        header = mail.fetch_header(uid)
-                        if not header:
-                            continue
-                        new_headers.append(header)
-                        for matched in self._match_aliases(header, aliases):
-                            by_alias.setdefault(matched, []).append(header)
-
-                    # The first item for each alias is the newest UID. Fetch its
-                    # body while the authenticated IMAP connection is still open.
-                    for messages in by_alias.values():
+                        candidates.append(uid_text)
+                    bulk_fetch = getattr(mail, 'fetch_headers', None)
+                    for start in range(0, len(candidates), 100):
+                        batch = candidates[start:start + 100]
+                        headers = (bulk_fetch(batch) if callable(bulk_fetch) else
+                                   {uid: mail.fetch_header(uid.encode()) for uid in batch})
+                        for uid_text in batch:
+                            header = headers.get(uid_text)
+                            if not header:
+                                # A failed FETCH must not advance past a hole.
+                                complete = False
+                                continue
+                            header = dict(header, _uidvalidity=epoch)
+                            new_headers.append(header)
+                            for alias in self._match_aliases(header, aliases):
+                                by_alias.setdefault(alias, []).append(header)
+                    # Header publication must not wait for thousands of body
+                    # fetches. Other bodies are warmed gradually or on demand.
+                    for messages in list(by_alias.values())[:8]:
                         if not messages:
                             continue
-                        message = messages[0]
-                        msg_id = str(message.get("id", ""))
-                        if not msg_id:
-                            continue
+                        message = max(messages, key=lambda m: int(m['id']))
+                        msg_id = str(message['id'])
                         full = mail.fetch_full(msg_id.encode())
                         if full is not None and ("body" in full or "html" in full):
                             full.update(message)
+                            full['_uidvalidity'] = epoch
                             bodies[msg_id] = full
-                    break
+                    # A cursor becomes durable only after all headers are durable.
+                    with self._mail_epoch_lock(acc_id):
+                        current_epoch = (self.get_account(acc_id) or {}).get('mail_uidvalidity')
+                        if epoch is not None and str(current_epoch) != str(epoch):
+                            raise RuntimeError('邮箱世代已变化，重新同步')
+                        self._cache.set_inbox(acc_id, new_headers)
+                        if by_alias:
+                            self._cache.set_alias_mail_batch(acc_id, by_alias)
+                        if complete:
+                            self._cache.set_sync_cursor(acc_id, epoch, aliases, highwater)
+                    return {"messages": by_alias, "bodies": bodies}
                 except Exception as exc:
                     from icloud_mail import MailAuthenticationError
                     self._drop_mail_client(acc_id)
                     if isinstance(exc, MailAuthenticationError) or attempt:
                         raise
-
-        # Calling set_inbox even with no new messages advances last_checked.
-        self._cache.set_inbox(acc_id, new_headers)
-        if by_alias:
-            self._cache.set_alias_mail_batch(acc_id, by_alias)
-        return {"messages": by_alias, "bodies": bodies}
+        return {"messages": {}, "bodies": {}}
 
     @staticmethod
     def _match_alias(header: Dict, aliases) -> Optional[str]:
@@ -947,7 +944,7 @@ class AccountManager:
             }
         return sorted(alias for alias in aliases if alias in recipients)
 
-    def fetch_pickup_message(self, acc_id: str, msg_id: str) -> Dict:
+    def fetch_pickup_message(self, acc_id: str, msg_id: str, expected_epoch=None) -> Dict:
         """Fetch one full message through the account's persistent IMAP session."""
         with self._mail_sync_lock(acc_id):
             self._require_mail_sync(acc_id)
@@ -959,7 +956,17 @@ class AccountManager:
                     with self._lock:
                         self._mail_clients[acc_id] = mail
                 try:
-                    return mail.fetch_full(str(msg_id).encode()) or {}
+                    ensure = getattr(mail, '_ensure_connected', None)
+                    if callable(ensure):
+                        ensure()
+                    epoch = getattr(mail, 'uidvalidity', None)
+                    self._observe_mail_epoch(acc_id, epoch)
+                    if expected_epoch is not None and str(epoch) != str(expected_epoch):
+                        raise RuntimeError('邮箱已重置，请刷新邮件列表')
+                    full = mail.fetch_full(str(msg_id).encode()) or {}
+                    if full:
+                        full['_uidvalidity'] = epoch
+                    return full
                 except Exception as exc:
                     from icloud_mail import MailAuthenticationError
                     self._drop_mail_client(acc_id)
@@ -1250,13 +1257,13 @@ if __name__ == "__main__":
     mgr = AccountManager()
     summary = mgr.get_summary()
     print(f"当前账号数: {summary['account_count']}")
-    
+
     header = "X_APPLE_WEB_KB=abc123; SESSION_TOKEN=xyz789"
     parsed = mgr.parse_cookie_input(header)
     print(f"Header String → {len(parsed)} 个 cookie")
-    
+
     json_in = '{"X_APPLE_WEB_KB":"abc123","SESSION_TOKEN":"xyz789"}'
     parsed2 = mgr.parse_cookie_input(json_in)
     print(f"JSON → {len(parsed2)} 个 cookie")
-    
+
     print("自测完成 ✓")

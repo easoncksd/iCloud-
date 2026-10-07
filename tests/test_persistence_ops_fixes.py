@@ -100,7 +100,7 @@ def test_backup_manifest_records_maintenance_lock_and_excludes_lock_file(tmp_pat
         names = archive.getnames()
         manifest = json.load(archive.extractfile("backup-manifest.json"))
         assert "_snapshot" in manifest
-        assert manifest["_snapshot"]["consistency"] == "maintenance-lock"
+        assert manifest["_snapshot"]["consistency"] == "service-lock-offline"
         assert not any(name.endswith("icloud-hme.maintenance.lock") for name in names)
 
 

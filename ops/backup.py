@@ -3,13 +3,15 @@
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import shutil
 import sqlite3
 import sys
 import tarfile
 import tempfile
 import time
 import uuid
+from contextlib import closing
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -29,6 +31,8 @@ CONFIG_PATHS = [
     'etc/systemd/system/icloud-hme-backup.timer',
     'usr/local/sbin/icloud-hme-backup',
     'www/server/panel/vhost/nginx/icloud-pickup.conf',
+    'www/server/panel/vhost/nginx/00-icloud-security-zones.conf',
+    'www/server/nginx/conf/icloud-security-headers.conf',
     'etc/ssh/sshd_config.d/99-icloud-hardening.conf',
     'etc/fail2ban/jail.d/icloud-hardening.local',
 ]
@@ -112,10 +116,13 @@ def make_snapshot(root, stage):
         if source.exists():
             copy_file(source, stage / 'root/iCloud' / rel)
             copied.add(source)
-    sources = list(project.glob('*.py')) + list(project.glob('requirements*.txt'))
-    sources += list((project / 'results').glob('*'))
+    sources = []
+    for folder, dirs, names in os.walk(project):
+        dirs[:] = [d for d in dirs if d not in {'.git', '.venv', '__pycache__', '.pytest_cache', 'logs'}
+                   and not (Path(folder) / d).is_symlink()]
+        sources.extend(Path(folder) / name for name in names)
     for source in sources:
-        if source in copied or not source.is_file() or source.name.endswith(('.tmp', '-wal', '-shm', '.lock')):
+        if source in copied or source.is_symlink() or not source.is_file() or source.name.endswith(('.tmp', '-wal', '-shm', '.lock', '.pyc')):
             continue
         target = stage / source.relative_to(root)
         if source.suffix in ('.sqlite3', '.db'):
@@ -130,6 +137,27 @@ def make_snapshot(root, stage):
         for item in files:
             if item.is_file() and not item.is_symlink() and not item.name.endswith('.tmp'):
                 copy_file(item, stage / item.relative_to(root))
+
+
+def verify_snapshot(stage):
+    """Verify a restore without loading web_ui or emitting any credentials."""
+    project = Path(stage) / 'root/iCloud'
+    account_file = project / 'accounts.json'
+    accounts = json.loads(account_file.read_text(encoding='utf-8')).get('accounts', {}) if account_file.exists() else {}
+    if not isinstance(accounts, dict):
+        raise RuntimeError('Backup account schema invalid')
+    from credential_store import unseal
+    for acc_id, account in accounts.items():
+        if 'credentials_encrypted' in account:
+            unseal(acc_id, account['credentials_encrypted'], project / '.credentials.key')
+    databases = 0
+    for path in project.rglob('*'):
+        if path.is_file() and path.suffix in ('.sqlite3', '.db'):
+            with closing(sqlite3.connect(path.as_uri() + '?mode=ro&immutable=1', uri=True)) as db:
+                if db.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+                    raise RuntimeError('Restored SQLite integrity check failed')
+            databases += 1
+    return {'accounts': len(accounts), 'databases': databases, 'credentials_verified': True}
 
 
 def run(root=Path('/'), dest=Path('/var/backups/icloud-hme')):
@@ -150,13 +178,15 @@ def run(root=Path('/'), dest=Path('/var/backups/icloud-hme')):
         with tempfile.TemporaryDirectory(prefix='.snapshot-', dir=dest) as td:
             stage = Path(td)
             make_snapshot(root, stage)
+            verification = verify_snapshot(stage)
             manifest = {
                 f.relative_to(stage).as_posix(): hashlib.sha256(f.read_bytes()).hexdigest()
                 for f in stage.rglob('*') if f.is_file()
             }
             manifest['_snapshot'] = {
                 'schema_version': 2,
-                'consistency': 'maintenance-lock',
+                'consistency': 'service-lock-offline',
+                'restore_verification': verification,
                 'lock_path': str(lock.path),
                 'started_at': snapshot_started,
                 'finished_at': time.time(),
@@ -196,5 +226,47 @@ def run(root=Path('/'), dest=Path('/var/backups/icloud-hme')):
     return target
 
 
+def verify_archive(path):
+    """Restore a backup into a disposable directory and verify all file hashes."""
+    with tempfile.TemporaryDirectory(prefix='icloud-restore-check-') as td:
+        stage = Path(td)
+        with tarfile.open(path, 'r:gz') as archive:
+            for member in archive:
+                rel = PurePosixPath(member.name)
+                if rel.is_absolute() or '..' in rel.parts or ':' in member.name or '\\' in member.name:
+                    raise RuntimeError('Unsafe backup member path')
+                target = stage.joinpath(*rel.parts)
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                elif member.isfile():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with archive.extractfile(member) as src, target.open('wb') as out:
+                        shutil.copyfileobj(src, out)
+                    target.chmod(0o600)
+                else:
+                    raise RuntimeError('Backup links and special files are not supported')
+        manifest = json.loads((stage / 'backup-manifest.json').read_text())
+        actual = {p.relative_to(stage).as_posix() for p in stage.rglob('*') if p.is_file()}
+        expected = {name for name in manifest if name != '_snapshot'}
+        if actual != expected | {'backup-manifest.json'}:
+            raise RuntimeError('Backup manifest membership mismatch')
+        for name in expected:
+            digest = hashlib.sha256()
+            with (stage / name).open('rb') as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                    digest.update(chunk)
+            if digest.hexdigest() != manifest[name]:
+                raise RuntimeError('Backup manifest hash mismatch')
+        return verify_snapshot(stage)
+
+
 if __name__ == '__main__':
-    run()
+    if len(sys.argv) == 3 and sys.argv[1] == '--verify-archive':
+        print(json.dumps(verify_archive(sys.argv[2]), sort_keys=True))
+    elif len(sys.argv) == 2 and sys.argv[1] == '--verified-backup':
+        target = run()
+        print(json.dumps(verify_archive(target), sort_keys=True))
+    elif len(sys.argv) == 1:
+        run()
+    else:
+        raise SystemExit('usage: backup.py [--verified-backup | --verify-archive PATH]')

@@ -8,11 +8,15 @@ NGINX_ZONES=/www/server/panel/vhost/nginx/00-icloud-security-zones.conf
 SYSTEMD_OVERRIDE=/etc/systemd/system/icloud-hme.service.d/pickup.conf
 STAMP=$(date +%Y%m%d-%H%M%S)
 BACKUP_DIR=/root/icloud-production-backup-$STAMP
+BACKUP_LAUNCHER=/usr/local/sbin/icloud-hme-backup
 
 if [[ $(id -u) -ne 0 ]]; then
     echo "must run as root" >&2
     exit 1
 fi
+
+exec 9>/run/lock/icloud-hme-operations.lock
+flock -w 300 9
 
 cd "$SOURCE_DIR"
 PYTHON_BIN=${PYTHON_BIN:-/root/iCloud/.venv/bin/python}
@@ -56,22 +60,49 @@ trap 'rm -f "$SOURCE_MANIFEST"' EXIT
 build_source_manifest "$SOURCE_DIR" "$SOURCE_MANIFEST"
 
 SERVICE_WAS_ACTIVE=0
+CHANGES_STARTED=0
+DATA_LOCK_HELD=0
+lock_runtime() {
+    exec 8>"$PROJECT_DIR/results/icloud-hme.service.lock"
+    flock -w 45 8 || return 1
+    DATA_LOCK_HELD=1
+}
+unlock_runtime() {
+    if [[ "$DATA_LOCK_HELD" == 1 ]]; then
+        flock -u 8
+        exec 8>&-
+        DATA_LOCK_HELD=0
+    fi
+}
+deployment_exit() {
+    local status=$?
+    trap - EXIT ERR
+    if [[ "$status" != 0 && "$CHANGES_STARTED" == 1 ]]; then
+        if ! rollback; then
+            echo "rollback failed; service left stopped for manual recovery; backup=$BACKUP_DIR" >&2
+        fi
+    elif [[ "$SERVICE_WAS_ACTIVE" == 1 ]] && ! systemctl is-active --quiet icloud-hme.service; then
+        unlock_runtime
+        systemctl start icloud-hme.service || true
+    fi
+    rm -f "$SOURCE_MANIFEST"
+    exit "$status"
+}
+trap deployment_exit EXIT
 if systemctl is-active --quiet icloud-hme.service; then
     SERVICE_WAS_ACTIVE=1
     systemctl stop icloud-hme.service
 fi
-restart_after_preflight_failure() {
-    if [[ "$SERVICE_WAS_ACTIVE" == "1" ]] && ! systemctl is-active --quiet icloud-hme.service; then
-        systemctl start icloud-hme.service || true
-    fi
-}
-trap restart_after_preflight_failure EXIT
-
+"$PYTHON_BIN" ops/backup.py --verified-backup
+lock_runtime
 mkdir -m 700 "$BACKUP_DIR"
 cp -a "$PROJECT_DIR" "$BACKUP_DIR/project"
 cp -a "$NGINX_VHOST" "$BACKUP_DIR/icloud-pickup.conf"
 cp -a "$NGINX_ZONES" "$BACKUP_DIR/00-icloud-security-zones.conf"
 cp -a "$SYSTEMD_OVERRIDE" "$BACKUP_DIR/icloud-hme-override.conf"
+if [[ -f "$BACKUP_LAUNCHER" ]]; then
+    cp -a "$BACKUP_LAUNCHER" "$BACKUP_DIR/backup-launcher"
+fi
 cp -a /www/wwwlogs/icloud-mail-access.log "$BACKUP_DIR/" 2>/dev/null || true
 cp -a /www/wwwlogs/icloud-mail-error.log "$BACKUP_DIR/" 2>/dev/null || true
 chmod -R go-rwx "$BACKUP_DIR"
@@ -94,27 +125,40 @@ remove_source_managed_paths() {
         case "$base" in
             results|logs|accounts.json|.credentials.key|.venv|.git) continue ;;
         esac
-        rm -rf -- "$item"
+        rm -rf -- "$item" || return 1
     done < <(find "$PROJECT_DIR" -mindepth 1 -maxdepth 1 -print0)
 }
 
 rollback() {
-    trap - ERR
     echo "deployment failed; restoring $BACKUP_DIR" >&2
-    remove_source_managed_paths
-    cp -a "$BACKUP_DIR/project/." "$PROJECT_DIR/"
-    cp -a "$BACKUP_DIR/icloud-pickup.conf" "$NGINX_VHOST"
-    cp -a "$BACKUP_DIR/00-icloud-security-zones.conf" "$NGINX_ZONES"
-    cp -a "$BACKUP_DIR/icloud-hme-override.conf" "$SYSTEMD_OVERRIDE"
-    systemctl daemon-reload
-    nginx -t
-    if [[ "$SERVICE_WAS_ACTIVE" == "1" ]]; then
-        systemctl restart icloud-hme.service
+    systemctl stop icloud-hme.service || return 1
+    if [[ "$DATA_LOCK_HELD" != 1 ]]; then
+        lock_runtime || return 1
     fi
-    systemctl reload nginx
+    # Revert code/config only. Never overwrite progress, credentials, SQLite,
+    # WAL or SHM produced by the new process with the pre-deployment snapshot.
+    remove_source_managed_paths || return 1
+    tar -C "$BACKUP_DIR/project" \
+        --exclude='./results' --exclude='./logs' \
+        --exclude='./accounts.json' --exclude='./.credentials.key' \
+        --exclude='./.git' --exclude='./.venv' \
+        -cf - . | tar -C "$PROJECT_DIR" -xf - || return 1
+    cp -a "$BACKUP_DIR/icloud-pickup.conf" "$NGINX_VHOST" || return 1
+    cp -a "$BACKUP_DIR/00-icloud-security-zones.conf" "$NGINX_ZONES" || return 1
+    cp -a "$BACKUP_DIR/icloud-hme-override.conf" "$SYSTEMD_OVERRIDE" || return 1
+    if [[ -f "$BACKUP_DIR/backup-launcher" ]]; then
+        cp -a "$BACKUP_DIR/backup-launcher" "$BACKUP_LAUNCHER" || return 1
+    fi
+    systemctl daemon-reload || return 1
+    nginx -t || return 1
+    systemctl reload nginx || return 1
+    unlock_runtime || return 1
+    if [[ "$SERVICE_WAS_ACTIVE" == "1" ]]; then
+        systemctl restart icloud-hme.service || return 1
+    fi
 }
-trap rollback ERR
 
+CHANGES_STARTED=1
 mkdir -p "$PROJECT_DIR"
 if command -v rsync >/dev/null 2>&1; then
     rsync -a --delete \
@@ -154,9 +198,11 @@ install -m 600 "$SOURCE_MANIFEST" "$BACKUP_DIR/source-manifest.sha256"
 install -m 600 deploy/icloud-pickup.conf "$NGINX_VHOST"
 install -m 600 deploy/00-icloud-security-zones.conf "$NGINX_ZONES"
 install -m 600 deploy/icloud-hme-override.conf "$SYSTEMD_OVERRIDE"
+install -m 700 deploy/icloud-hme-backup "$BACKUP_LAUNCHER"
 
 nginx -t
 systemctl daemon-reload
+unlock_runtime
 if [[ "$SERVICE_WAS_ACTIVE" == "1" ]]; then
     systemctl restart icloud-hme.service
 fi
@@ -177,6 +223,5 @@ fi
 : > /www/wwwlogs/icloud-mail-access.log
 nginx -s reopen
 
-trap - ERR
 echo "deployment complete"
 echo "backup=$BACKUP_DIR"

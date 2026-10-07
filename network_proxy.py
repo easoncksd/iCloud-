@@ -8,7 +8,8 @@ import threading
 from pathlib import Path
 from urllib.parse import quote
 
-CONFIG_FILE = Path(__file__).resolve().parent / 'results' / 'network_proxy.json'
+from runtime_paths import DATA_ROOT
+CONFIG_FILE = DATA_ROOT / 'results' / 'network_proxy.json'
 LOCK = threading.RLock()
 DEFAULT = dict(mode='system', protocol='http', host='', port=8080, username='', password='')
 

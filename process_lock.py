@@ -165,13 +165,14 @@ class ProcessLock:
 
 
 def service_lock_path(project_root=None):
-    root = Path(project_root) if project_root is not None else Path(__file__).resolve().parent
+    from runtime_paths import DATA_ROOT
+    root = Path(project_root) if project_root is not None else DATA_ROOT
     return root / "results" / "icloud-hme.service.lock"
 
 
 def maintenance_lock_path(project_root=None):
-    root = Path(project_root) if project_root is not None else Path(__file__).resolve().parent
-    return root / "results" / "icloud-hme.maintenance.lock"
+    # Offline snapshots and application writers must exclude each other.
+    return service_lock_path(project_root)
 
 
 def service_process_lock(project_root=None, timeout=0.0):

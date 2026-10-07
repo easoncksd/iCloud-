@@ -17,7 +17,7 @@ def test_parse_cookie_header_string():
     """Cookie Header String 格式解析"""
     from account_manager import AccountManager
     mgr = AccountManager()
-    
+
     raw = "X_APPLE_WEB_KB=abc123; SESSION_TOKEN=xyz789"
     cookies = mgr.parse_cookie_input(raw)
     assert len(cookies) == 2
@@ -30,7 +30,7 @@ def test_parse_cookie_json():
     """JSON 格式 Cookie 解析"""
     from account_manager import AccountManager
     mgr = AccountManager()
-    
+
     raw = '{"X_APPLE_WEB_KB":"abc123","SESSION_TOKEN":"xyz789"}'
     cookies = mgr.parse_cookie_input(raw)
     assert len(cookies) == 2
@@ -42,7 +42,7 @@ def test_parse_empty_input():
     """空输入应抛出 ValueError"""
     from account_manager import AccountManager
     mgr = AccountManager()
-    
+
     try:
         mgr.parse_cookie_input("")
         assert False, "应该抛出 ValueError"
@@ -85,19 +85,19 @@ def test_mail_cache_basic():
     temp_dir = tempfile.TemporaryDirectory()
     mail_cache.CACHE_FILE = Path(temp_dir.name) / "mail_cache.json"
     cache = mail_cache.MailCache()
-    
+
     emails = [
         {"id": "1", "from": "a@b.com", "to": "x@icloud.com", "subject": "Hello", "date": "2025-01-01T00:00:00"},
         {"id": "2", "from": "c@d.com", "to": "y@icloud.com", "subject": "World", "date": "2025-01-02T00:00:00"},
         {"id": "1", "from": "a@b.com", "to": "x@icloud.com", "subject": "Hello Duplicate", "date": "2025-01-03T00:00:00"},
     ]
-    
+
     cache.set_inbox("test_acc", emails)
     cached = cache.get_inbox("test_acc")
-    
+
     # 应该有 2 封（第 3 封 id 重复被去重）
     assert len(cached) == 2, f"期望 2 封，实际 {len(cached)}"
-    
+
     # 清理
     cache.clear_account("test_acc")
     assert len(cache.get_inbox("test_acc")) == 0
@@ -266,7 +266,7 @@ def test_scheduler_start_is_idempotent():
 def test_strip_html():
     """HTML 标签剥离"""
     from icloud_mail import _strip_html
-    
+
     html = "<html><body><p>Hello</p><br><div>World</div></body></html>"
     text = _strip_html(html)
     assert "Hello" in text
@@ -279,7 +279,7 @@ def test_strip_html():
 def test_strip_html_with_link():
     """HTML 链接保留文字"""
     from icloud_mail import _strip_html
-    
+
     html = '<a href="https://example.com">Click here</a>'
     text = _strip_html(html)
     assert "Click here" in text
@@ -976,17 +976,21 @@ def test_pickup_uses_persistent_body_and_deduplicates_sync():
 
     class FakeCache:
         def get_alias_mail(self, _account_id, _alias):
-            return [{"id": "7", "subject": "cached"}]
+            return [{"id": "7", "subject": "cached", "_uidvalidity": 1}]
 
     class FakeManager:
         _cache = FakeCache()
 
+        def _mail_epoch_lock(self, account_id):
+            from contextlib import nullcontext
+            return nullcontext()
+
         def get_account(self, account_id):
-            return {'id': account_id}
+            return {'id': account_id, 'mail_uidvalidity': 1}
 
     class FakeBodyStore:
         def get(self, account_id, message_id):
-            if account_id == "acc" and message_id == "7":
+            if account_id == "acc" and message_id == "1:7":
                 return {"id": "7", "body": "persisted body", "html": ""}
             return None
 
@@ -2228,10 +2232,10 @@ if __name__ == "__main__":
         ("create_aliases_stops_after_first_failure", test_create_aliases_stops_after_first_failure),
         ("batch_create_emits_heartbeat_while_apple_call_hangs", test_batch_create_emits_heartbeat_while_apple_call_hangs),
     ]
-    
+
     passed = 0
     failed = 0
-    
+
     for name, fn in tests:
         try:
             fn()
@@ -2239,9 +2243,9 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"  FAIL {name}: {e}")
             failed += 1
-    
+
     print(f"\n{'='*40}")
     print(f"结果: {passed} 通过, {failed} 失败")
-    
+
     if failed:
         sys.exit(1)

@@ -67,6 +67,15 @@ Cookie Editor: https://chromewebstore.google.com/detail/cookie-editor/hlkenndedn
 
 - `accounts.json` 不直接保存 Cookie 和收信密码；凭据使用账号绑定的 AES-GCM 密文保存，`.credentials.key` 是解密所需的独立密钥。两个文件必须一起备份、权限保持为仅服务账号可读，任何一个丢失都应从同一份备份恢复。
 - 不要把 `accounts.json`、`.credentials.key`、`results/`、`logs/` 或生产备份提交到 Git，也不要发给别人。部署脚本会保留这些运行时文件，不会用源码覆盖它们。
+
+### 备份、测试与失败恢复
+
+- 定时备份入口由部署脚本安装为 `deploy/icloud-hme-backup`，统一调用当前版本 `ops/backup.py`，不再维护另一份 Python 副本。
+- 一致性备份会短暂停止原本运行中的 `icloud-hme`，取得与服务相同的数据锁，完成后恢复服务。备份期间网页可能暂时不可用；账号、创建任务和剩余数量保留。
+- 快照包含 `.credentials.key`，生成时验证凭据解密与 SQLite 完整性。可用 `.venv/bin/python ops/backup.py --verify-archive /var/backups/icloud-hme/具体备份.tar.gz` 在临时目录做恢复演练；只输出统计，不输出凭据。
+- 部署失败会先停止服务，再回滚代码与配置；不会用部署前的账号、任务或数据库覆盖新进度。回滚本身失败时保持停服，保留备份供人工恢复。
+- `ICLOUD_DATA_DIR` 可指定独立数据根目录；pytest 会在导入代码前自动建立临时目录，禁止使用真实账号或凭据进行单元测试。Web 服务须通过 `python web_ui.py` 启动，以确保在初始化存储和迁移前取得进程锁。
+- 邮件正文按 UIDVALIDITY 世代分开缓存。升级后旧版无世代缓存须先完成一次 IMAP 同步才能安全读取；认证暂停的账号需要验证恢复后重建这部分缓存。
 - 取件链接 `/pickup/<token>` 不需要登录，拿到链接就能读这封隐私邮箱，不要公开传播。
 - 管理界面生产环境必须设置高强度 `ADMIN_ACCESS_TOKEN`，并只通过 HTTPS 反代；不要把 token 放在公开链接、截图、日志或聊天记录中。服务默认只监听 `127.0.0.1`，不建议直接暴露端口。
 - 备份会在维护锁下生成清单并校验文件哈希；恢复时应先停止服务，再按清单验证源码和状态文件，避免和运行中的写入交叉。

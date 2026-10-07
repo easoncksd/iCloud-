@@ -19,6 +19,7 @@ iCloud Mail — IMAP 收件箱检查模块
 """
 
 import imaplib
+import re
 import email
 import time
 from datetime import datetime, timedelta
@@ -44,6 +45,7 @@ class ICloudMail:
         self.app_password = app_password
         self.verbose = verbose
         self.on_auth_failure = None
+        self.on_selected = None
         self._conn: Optional[imaplib.IMAP4_SSL] = None
         self.uidvalidity = None
         from network_proxy import load_config
@@ -77,6 +79,7 @@ class ICloudMail:
             raise RuntimeError(f"IMAP 连接失败: {e}")
 
     def disconnect(self):
+        self.uidvalidity = None
         if self._conn:
             try:
                 self._conn.logout()
@@ -99,11 +102,17 @@ class ICloudMail:
             if status != "OK":
                 raise RuntimeError("无法选中 INBOX")
             status, values = self._conn.response("UIDVALIDITY")
-            if status == "OK" and values and values[0]:
+            self.uidvalidity = None
+            if status == "UIDVALIDITY" and values and values[0]:
                 try:
                     self.uidvalidity = int(values[0])
                 except (TypeError, ValueError):
-                    self.uidvalidity = str(values[0])
+                    pass
+            if not self.uidvalidity or self.uidvalidity < 1:
+                self.disconnect()
+                raise RuntimeError('IMAP UIDVALIDITY 缺失或无效，已停止同步以保护邮件身份')
+            if self.on_selected:
+                self.on_selected(self.uidvalidity)
 
     def check_inbox(self, limit: int = 50, days: int = 7) -> List[Dict]:
         self._ensure_connected()
@@ -161,6 +170,31 @@ class ICloudMail:
     def fetch_header(self, uid: bytes) -> Optional[Dict]:
         self._ensure_connected()
         return self._fetch_headers_uid(uid)
+
+    def fetch_headers(self, uids) -> Dict:
+        """Batch FETCH avoids one network round trip per cached mail header."""
+        self._ensure_connected()
+        wanted = {str(x.decode() if isinstance(x, bytes) else x) for x in uids}
+        if not wanted or any(not x.isdigit() for x in wanted):
+            return {}
+        status, data = self._conn.uid('FETCH', ','.join(sorted(wanted, key=int)),
+                                      '(UID BODY.PEEK[HEADER])')
+        if status != 'OK':
+            raise RuntimeError('IMAP 批量邮件头读取失败')
+        result = {}
+        for item in data or []:
+            if not isinstance(item, tuple) or not isinstance(item[0], bytes):
+                continue
+            match = re.search(rb'\bUID\s+(\d+)\b', item[0], re.I)
+            if not match:
+                continue
+            uid = match.group(1).decode()
+            if uid not in wanted:
+                continue
+            header = self._parse_header_response([item], uid)
+            if header:
+                result[uid] = header
+        return result
 
     def stream_inbox(self, limit: int = 50, days: int = 7):
         self._ensure_connected()
@@ -229,6 +263,7 @@ class ICloudMail:
         recipients = [address.lower() for _, address in getaddresses(recipient_headers) if address]
         return {
             "id": msg_id.decode() if isinstance(msg_id, bytes) else str(msg_id),
+            "_uidvalidity": self.uidvalidity,
             "from": self._decode_header(msg.get("From", "")),
             "to": self._decode_header(msg.get("To", "")),
             "recipients": recipients,

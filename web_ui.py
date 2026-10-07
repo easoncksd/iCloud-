@@ -21,10 +21,9 @@ from mail_body_store import MailBodyStore
 from pickup_links import PickupLinkStore
 
 # ---- config ----
-RESULTS_DIR = HERE / "results"
-LOGS_DIR = HERE / "logs"
-RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-LOGS_DIR.mkdir(parents=True, exist_ok=True)
+from runtime_paths import DATA_ROOT
+RESULTS_DIR = DATA_ROOT / "results"
+LOGS_DIR = DATA_ROOT / "logs"
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
@@ -189,10 +188,9 @@ _scheduler_thread = None
 _scheduler_lock = threading.Lock()
 _scheduler_stop_event = threading.Event()
 _shutdown_event = threading.Event()
-_account_mgr = AccountManager()
-_pickup_store = PickupLinkStore(RESULTS_DIR / "pickup_links.json")
-_export_store = ExportHistoryStore(RESULTS_DIR / "export_history.json")
-_pickup_store.rebind_stale_accounts(_account_mgr.accounts.keys())
+_account_mgr = None
+_pickup_store = None
+_export_store = None
 PICKUP_BASE_URL = os.environ.get("PICKUP_BASE_URL", "").rstrip("/")
 _pickup_refresh_lock = threading.Lock()
 _pickup_refreshing_accounts = set()
@@ -223,11 +221,7 @@ _PICKUP_BODY_MAX_BYTES = 64 * 1024 * 1024
 _pickup_body_cache = OrderedDict()
 _pickup_body_cache_bytes = 0
 _pickup_body_refreshing = set()
-_pickup_body_store = MailBodyStore(
-    RESULTS_DIR / "mail_bodies.sqlite3",
-    max_items=5000,
-    max_bytes=_PICKUP_BODY_MAX_BYTES,
-)
+_pickup_body_store = None
 
 
 def _migrate_stale_account_data():
@@ -287,7 +281,7 @@ def _migrate_stale_account_data():
     }
 
 
-_DATA_MIGRATION_STATS = _migrate_stale_account_data()
+_DATA_MIGRATION_STATS = {}
 _batch_lock = threading.RLock()
 _BATCH_STATE_FILE = RESULTS_DIR / "batch_jobs.json"
 _BATCH_JOB_HISTORY = 20
@@ -894,6 +888,7 @@ def _apply_mail_watch_result(acc_id, ok, error_text="", verified=False):
             mail_next_retry_at=None,
             mail_last_error=None,
             mail_last_checked=now,
+            mail_last_success_at=now,
         )
         return "ok"
     err = str(error_text or "error")[:200]
@@ -913,7 +908,9 @@ def _apply_mail_watch_result(acc_id, ok, error_text="", verified=False):
             _account_mgr.update_account(acc_id, mail_last_checked=now,
                 mail_next_retry_at=time.time() + _MAIL_AUTH_RECHECK_SECONDS)
     else:
-        _account_mgr.update_account(acc_id, mail_last_checked=now)
+        _account_mgr.update_account(acc_id, mail_last_checked=now,
+            mail_status='network_error', mail_last_error=err,
+            mail_last_failure_at=now)
     return "transient"
 
 
@@ -944,7 +941,7 @@ def _check_account_mail_once(account, wait_timeout=0, fresh_seconds=None, force=
     live = _account_mgr.get_account(acc_id) or account
     if not force and _mail_account_paused(acc_id) and not _mail_retry_due(live):
         return "paused"
-    if not force and _mail_checked_within(live, fresh_seconds) and not _mail_account_paused(acc_id):
+    if not force and live.get('mail_status') == 'ok' and _mail_checked_within(dict(live, mail_last_checked=live.get('mail_last_success_at')), fresh_seconds) and not _mail_account_paused(acc_id):
         return live.get("mail_status") or "ok"
     _hold_mail_pulls(acc_id)
     try:
@@ -953,7 +950,7 @@ def _check_account_mail_once(account, wait_timeout=0, fresh_seconds=None, force=
         live = _account_mgr.get_account(acc_id) or live
         if not force and _mail_account_paused(acc_id) and not _mail_retry_due(live):
             return "paused"
-        if not force and _mail_checked_within(live, fresh_seconds) and not _mail_account_paused(acc_id):
+        if not force and live.get('mail_status') == 'ok' and _mail_checked_within(dict(live, mail_last_checked=live.get('mail_last_success_at')), fresh_seconds) and not _mail_account_paused(acc_id):
             return live.get("mail_status") or "ok"
         if _mail_sync_busy(acc_id):
             return "busy"
@@ -1601,7 +1598,7 @@ function renderDashboard(){
   c.innerHTML=accounts.map(function(a){
     var stCls=a.status==='active'?'ok':'err';
     var stText=a.status==='active'?t('status.login_ok'):(a.last_error||t('status.login_expired'));
-    var mailCls='';var mailReady=t('status.mail_blocked');if(a.has_app_password){if(a.mail_sync_paused||a.mail_status==='auth_failed'){mailReady=t('mail.paused');mailCls=' style="color:var(--red)"';}else{mailReady=t('status.mail_ready');}}
+    var mailCls='';var mailReady=t('status.mail_blocked');if(a.has_app_password){if(a.mail_sync_paused||a.mail_status==='auth_failed'){mailReady=t('mail.paused');mailCls=' style="color:var(--red)"';}else if(a.mail_status==='network_error'){mailReady=lang==='en'?'Mail network error':'收信网络异常';mailCls=' style="color:var(--red)"';}else if(a.mail_status!=='ok'){mailReady=lang==='en'?'Mail not verified':'收信待验证';}else{mailReady=t('status.mail_ready');}}
     var email=a.real_email||'';
     var used=a.alias_total||0;
     var pct=Math.min(100, used*100/limit);
@@ -1739,7 +1736,7 @@ async function refreshAliases(){if(_aliasesBusy){toast(t('sync.busy'),true);retu
 function updateInboxAccountSelect(){var sel=E('inboxAccount');if(!sel)return;var old=sel.value;sel.innerHTML='<option value="">'+t('inbox.select_account')+'</option>';accounts.forEach(function(a){var hasPwd=a.has_app_password?t('inbox.ready'):t('inbox.no_pwd');var imapEmail=a.icloud_email||a.real_email||'';sel.innerHTML+='<option value="'+escAttr(a.id)+'">'+esc((a.name||a.real_email||a.id).substring(0,20))+' | '+esc(imapEmail.substring(0,25))+' '+hasPwd+'</option>';});sel.value=old||'';renderInboxSetupHintIfNeeded();}
 function renderDocs(){var el=E('docsContent');if(el)el.innerHTML='';}
 bindAliasSearch();
-async function refreshMailWatchStatus(){var box=E('mailWatchStatus');if(!box)return;try{var d=await api('/api/mail-watch/status');var s=d.status||{};var stateText=s.state==='running'?'检查中':s.state==='waiting'?'等待下一轮':s.state==='idle'?'正常':'启动中';var last=s.last_finished_at?s.last_finished_at.replace('T',' ').slice(0,19):'尚未完成';var next=s.next_run_at?s.next_run_at.replace('T',' ').slice(0,19):'本轮进行中';box.textContent='状态：'+stateText+' · 上次完成：'+last+' · 下次检查：'+next+' · 成功 '+(s.last_success_count||0)+' / 异常 '+(s.last_failure_count||0);}catch(_){box.textContent='监控状态暂时无法读取';}}
+async function refreshMailWatchStatus(){var box=E('mailWatchStatus');if(!box)return;try{var d=await api('/api/mail-watch/status');if(!d||d.ok===false)throw new Error('monitor unavailable');var s=d.status||{};var stateText=s.state==='running'?'检查中':s.state==='waiting'?'等待下一轮':s.state==='idle'?'正常':'启动中';var last=s.last_finished_at?s.last_finished_at.replace('T',' ').slice(0,19):'尚未完成';var next=s.next_run_at?s.next_run_at.replace('T',' ').slice(0,19):'本轮进行中';box.textContent='状态：'+stateText+' · 上次完成：'+last+' · 下次检查：'+next+' · 成功 '+(s.last_success_count||0)+' / 异常 '+(s.last_failure_count||0);}catch(_){box.textContent='监控状态暂时无法读取';}}
 applyStaticI18n();
 refreshMailWatchStatus();
 setInterval(refreshMailWatchStatus,30000);
@@ -1991,7 +1988,25 @@ def _account_create_in_progress(acc_id) -> bool:
 # AccountManager also protects the duplicate-email import path.  Register the
 # application-level checker so a waiting durable batch counts as busy, not just
 # workers currently inside Apple HTTP calls.
-_account_mgr.set_creation_activity_checker(_account_create_in_progress)
+def _initialize_runtime(service_lock):
+    """Initialize mutable stores only after the caller owns the data-root lock."""
+    global _account_mgr, _pickup_store, _export_store, _pickup_body_store
+    global _DATA_MIGRATION_STATS
+    from process_lock import service_lock_path
+    if not service_lock.locked or service_lock.path.resolve() != service_lock_path(DATA_ROOT).resolve():
+        raise RuntimeError('Initialization requires the data-root service lock')
+    if _account_mgr is not None:
+        return
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    _account_mgr = AccountManager()
+    _pickup_store = PickupLinkStore(RESULTS_DIR / 'pickup_links.json')
+    _export_store = ExportHistoryStore(RESULTS_DIR / 'export_history.json')
+    _pickup_body_store = MailBodyStore(RESULTS_DIR / 'mail_bodies.sqlite3',
+                                     max_items=5000, max_bytes=_PICKUP_BODY_MAX_BYTES)
+    _pickup_store.rebind_stale_accounts(_account_mgr.accounts.keys())
+    _DATA_MIGRATION_STATS = _migrate_stale_account_data()
+    _account_mgr.set_creation_activity_checker(_account_create_in_progress)
 
 
 def _remove_latest_emails_for_account(acc_id):
@@ -3290,7 +3305,6 @@ def api_inbox(acc_id):
     force = request.args.get("force","0")=="1"
     try:
         emails = _account_mgr.check_inbox(acc_id, limit=limit, force=force)
-        _apply_mail_watch_result(acc_id, True)
         stats = _account_mgr._cache.get_stats(acc_id)
         return jsonify({"emails":emails,"count":len(emails),"cached":stats})
     except Exception as e:
@@ -3632,14 +3646,27 @@ def _prepare_pickup_message(message):
     return prepared
 
 
+def _body_storage_id(account_id, msg_id):
+    account = _account_mgr.get_account(account_id) or {}
+    epoch = account.get('mail_uidvalidity')
+    return f'{epoch}:{msg_id}' if epoch is not None else str(msg_id)
+
+
 def _store_pickup_body(account_id, msg_id, message):
     prepared = _prepare_pickup_message(message)
     with _pickup_refresh_lock:
         if _account_removed(account_id):
             return prepared
-    _pickup_body_store.put(account_id, str(msg_id), prepared)
-    with _pickup_refresh_lock:
-        _cache_pickup_body_locked((account_id, str(msg_id)), prepared)
+    # The same account lock serializes epoch changes and body publication.
+    with _account_mgr._mail_epoch_lock(account_id):
+        account = _account_mgr.get_account(account_id) or {}
+        epoch = account.get('mail_uidvalidity')
+        if epoch is not None and str(prepared.get('_uidvalidity')) != str(epoch):
+            raise RuntimeError('邮箱世代已变化，忽略过期正文')
+        storage_id = _body_storage_id(account_id, msg_id)
+        _pickup_body_store.put(account_id, storage_id, prepared)
+        with _pickup_refresh_lock:
+            _cache_pickup_body_locked((account_id, storage_id), prepared)
     return prepared
 
 
@@ -3653,6 +3680,8 @@ def _refresh_pickup_account(account_id):
         # API here so an expired browser cookie cannot block IMAP delivery.
         links = _pickup_store.list_for_account(account_id)
         aliases = [item.get("alias_email", "") for item in links]
+        if not aliases:
+            return  # No IMAP request occurred; do not report a successful probe.
         synced = _account_mgr.sync_pickup_mail(account_id, aliases, scan_limit=100, days=30)
         with _pickup_refresh_lock:
             removed = _account_removed(account_id)
@@ -3678,7 +3707,7 @@ def _refresh_pickup_account(account_id):
                 if str(item.get("id", "")).isdigit() else 0,
             )
             msg_id = str(latest.get("id", ""))
-            if not msg_id or _pickup_body_store.contains(account_id, msg_id):
+            if not msg_id or _pickup_body_store.contains(account_id, _body_storage_id(account_id, msg_id)):
                 continue
             key = (account_id, msg_id)
             with _pickup_refresh_lock:
@@ -3689,7 +3718,8 @@ def _refresh_pickup_account(account_id):
 
         for key, header in warm_targets:
             try:
-                full = _account_mgr.fetch_pickup_message(account_id, key[1])
+                full = _account_mgr.fetch_pickup_message(account_id, key[1],
+                    expected_epoch=header.get('_uidvalidity'))
                 if full:
                     full.update(header)
                     _store_pickup_body(account_id, key[1], full)
@@ -3807,7 +3837,9 @@ def _refresh_pickup_body(account_id, msg_id):
     global _pickup_pending
     key = (account_id, msg_id)
     try:
-        full = _account_mgr.fetch_pickup_message(account_id, msg_id)
+        account = _account_mgr.get_account(account_id) or {}
+        full = _account_mgr.fetch_pickup_message(account_id, msg_id,
+            expected_epoch=account.get('mail_uidvalidity'))
         if not full or not ("body" in full or "html" in full):
             raise RuntimeError("邮件正文尚未成功读取")
         _store_pickup_body(account_id, msg_id, full)
@@ -3846,6 +3878,15 @@ def pickup_messages(token):
 
 @app.route("/pickup/<token>/message/<msg_id>")
 def pickup_message(token, msg_id):
+    # Prevent an epoch switch between authorization and returning cached data.
+    item = _pickup_store.get_by_token(token)
+    if not item:
+        return jsonify({'error': '取件链接无效或已撤销'}), 404
+    with _account_mgr._mail_epoch_lock(item['account_id']):
+        return _pickup_message_locked(token, msg_id)
+
+
+def _pickup_message_locked(token, msg_id):
     global _pickup_pending
     item = _pickup_store.get_by_token(token)
     if not item:
@@ -3854,13 +3895,23 @@ def pickup_message(token, msg_id):
     allowed = _account_mgr._cache.get_alias_mail(account_id, item["alias_email"])
     if msg_id not in {str(m.get("id", "")) for m in allowed}:
         return jsonify({"error": "邮件不存在"}), 404
-    key = (account_id, msg_id)
+    epoch = (_account_mgr.get_account(account_id) or {}).get('mail_uidvalidity')
+    if epoch is None:
+        paused = _mail_account_paused(account_id)
+        if not paused:
+            _schedule_pickup_account_refresh(account_id)
+        return jsonify({'ready': False, 'paused': paused,
+                        'error': '需先验证邮箱编号后才能读取旧缓存'}), 503 if paused else 202
+    if epoch is not None and not any(str(m.get('id')) == msg_id and str(m.get('_uidvalidity')) == str(epoch) for m in allowed):
+        return jsonify({'ready': False, 'error': '邮件列表已过期，请等待重新同步'}), 202
+    storage_id = _body_storage_id(account_id, msg_id)
+    key = (account_id, storage_id)
     with _pickup_refresh_lock:
         cached_body = _get_pickup_body_locked(key)
         if cached_body is not None:
             return jsonify({"ready": True, "message": cached_body}), 200, {"Cache-Control": "no-store"}
 
-    persisted_body = _pickup_body_store.get(account_id, msg_id)
+    persisted_body = _pickup_body_store.get(account_id, storage_id)
     if persisted_body is not None:
         with _pickup_refresh_lock:
             _cache_pickup_body_locked(key, persisted_body)
@@ -3871,6 +3922,7 @@ def pickup_message(token, msg_id):
     with _pickup_refresh_lock:
         if account_id in _mail_watch_hold_accounts:
             return jsonify({"ready": False, "refreshing": True}), 202, {"Cache-Control": "no-store"}
+        key = (account_id, msg_id)
         refreshing = key in _pickup_body_refreshing
         if not refreshing and _pickup_pending < _PICKUP_MAX_PENDING:
             _pickup_body_refreshing.add(key)
@@ -4048,13 +4100,14 @@ def main():
         print("[!] Refusing to bind", args.host, "without ADMIN_ACCESS_TOKEN")
         print("    Use --host 127.0.0.1, or set ADMIN_ACCESS_TOKEN first")
         raise SystemExit(2)
-    service_lock = service_process_lock(HERE)
+    service_lock = service_process_lock(DATA_ROOT)
     try:
         service_lock.acquire()
     except LockAlreadyHeld:
         print("[!] Another iCloud HME service or scheduler instance is already running", file=sys.stderr)
         raise SystemExit(2)
     atexit.register(service_lock.release)
+    _initialize_runtime(service_lock)
     if not args.no_sync:
         offset = _sync_time()
         if abs(offset)>0.5: print(f"[*] Time sync: offset {offset:.1f}s")
