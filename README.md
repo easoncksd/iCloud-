@@ -65,7 +65,9 @@ Cookie Editor: https://chromewebstore.google.com/detail/cookie-editor/hlkenndedn
 
 ## 安全
 
-- `accounts.json` 不直接保存 Cookie 和收信密码；凭据使用账号绑定的 AES-GCM 密文保存，`.credentials.key` 是解密所需的独立密钥。两个文件必须一起备份、权限保持为仅服务账号可读，任何一个丢失都应从同一份备份恢复。
+- `accounts.json` 不直接保存 Cookie、收信密码和网页登录续期令牌；凭据使用账号绑定的 AES-GCM 密文保存，`.credentials.key` 是解密所需的独立密钥。两个文件必须一起备份、权限保持为仅服务账号可读，任何一个丢失都应从同一份备份恢复。
+- Apple 更新的 Cookie 会保留域名、路径、有效期等信息并及时保存，服务重启后继续使用。重新导入会替换旧网页登录会话；同一账号的网页登录请求串行执行，避免凭据更新相互覆盖。
+- 登录验证或读取请求遇到认证失败时，有可用的会话令牌才会尝试一次 `accountLogin` 恢复。创建、保留和删除操作不会自动重放；没有可用令牌、恢复失败或 Apple 要求人工验证时，需在浏览器完成验证并重新导入 Cookie。网页登录失效不等于 IMAP 收信失效。
 - 不要把 `accounts.json`、`.credentials.key`、`results/`、`logs/` 或生产备份提交到 Git，也不要发给别人。部署脚本会保留这些运行时文件，不会用源码覆盖它们。
 
 ### 备份、测试与失败恢复

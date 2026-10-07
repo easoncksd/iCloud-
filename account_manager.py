@@ -120,6 +120,16 @@ class AccountManager:
                 if 'credentials_encrypted' in account:
                     account.update(unseal(acc_id, account.pop('credentials_encrypted'),
                                           ACCOUNTS_FILE.with_name('.credentials.key')))
+                # Old upstream error bodies can contain trust tokens. Replace
+                # them with guidance rather than displaying the raw response.
+                from icloud_hme import WebSessionExpired
+                for key in ('last_error', 'create_last_error'):
+                    error = str(account.get(key) or '')
+                    if 'trusttokens' in error.lower() or any(
+                            f'HTTP {code}' in error for code in (401, 403, 421)):
+                        status = next((code for code in (401, 403, 421)
+                                       if f'HTTP {code}' in error), 421)
+                        account[key] = str(WebSessionExpired(status))
 
     def _save(self):
         with self._lock:
@@ -127,7 +137,7 @@ class AccountManager:
             stored = {}
             for acc_id, account in self.accounts.items():
                 item = dict(account)
-                credentials = {key: item.pop(key) for key in ('cookies', 'app_password') if key in item}
+                credentials = {key: item.pop(key) for key in ('cookies', 'app_password', 'web_session') if key in item}
                 if credentials:
                     item['credentials_encrypted'] = seal(acc_id, credentials,
                                                          ACCOUNTS_FILE.with_name('.credentials.key'))
@@ -143,6 +153,36 @@ class AccountManager:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(tmp, ACCOUNTS_FILE)
+
+    def _bind_web_client(self, account, client, persist=True):
+        bind = getattr(client, 'bind_session', None)
+        if not callable(bind):
+            return client
+        generation = account.get('credential_generation')
+
+        def save_session(state):
+            with self._lock:
+                if persist and (self.accounts.get(account['id']) is not account or
+                                account.get('credential_generation') != generation):
+                    return  # A removed account or older import cannot publish credentials.
+                previous = {key: copy.deepcopy(account.get(key)) for key in
+                            ('cookies', 'web_session', 'web_session_updated_at')}
+                account['web_session'] = state
+                account['cookies'] = {item['name']: item['value'] for item in state['cookies']}
+                account['web_session_updated_at'] = datetime.now().isoformat()
+                try:
+                    if persist:
+                        self._save()
+                except Exception:
+                    for key, value in previous.items():
+                        if value is None:
+                            account.pop(key, None)
+                        else:
+                            account[key] = value
+                    raise
+
+        bind(copy.deepcopy(account.get('web_session')), save_session)
+        return client
 
     def _migrate_old_cookies(self):
         try:
@@ -334,6 +374,7 @@ class AccountManager:
 
         try:
             client = ICloudHME(cookies, host=host, verbose=False)
+            self._bind_web_client(account, client, persist=False)
             client.validate_session()
             info = client.get_account_info()
             if info:
@@ -372,7 +413,8 @@ class AccountManager:
         if existing_id:
             # Use the same locked update path as explicit reimport. Cookie
             # verification must never reset unrelated IMAP pause/epoch state.
-            updated = self.reimport_account(existing_id, cookie_input, host)
+            updated = self.reimport_account(existing_id, json.dumps(account['cookies']), host,
+                                           _session_state=account.get('web_session'))
             if name and name != "未命名账号":
                 updated = self.update_account(existing_id, name=name)
             return updated
@@ -415,7 +457,7 @@ class AccountManager:
         return False
 
     def reimport_account(
-        self, acc_id: str, cookie_input: str, host: str = "icloud.com"
+        self, acc_id: str, cookie_input: str, host: str = "icloud.com", *, _session_state=None
     ) -> Dict:
         from icloud_hme import ICloudHME
 
@@ -431,8 +473,12 @@ class AccountManager:
                 raise ValueError("该账号已有创建任务，结束后再重新导入")
 
             client = None
+            candidate = {'id': acc_id, 'cookies': cookies}
+            if _session_state is not None:
+                candidate['web_session'] = copy.deepcopy(_session_state)
             try:
                 client = ICloudHME(cookies, host=host, verbose=False)
+                self._bind_web_client(candidate, client, persist=False)
                 client.validate_session()
                 info = client.get_account_info() or {}
 
@@ -465,7 +511,12 @@ class AccountManager:
                 account = self.accounts.get(acc_id)
                 if not account:
                     raise KeyError(f"账号不存在: {acc_id}")
-                account["cookies"] = cookies
+                account["cookies"] = candidate['cookies']
+                account.pop('web_session', None)
+                account.pop('web_session_updated_at', None)
+                for key in ('web_session', 'web_session_updated_at'):
+                    if key in candidate:
+                        account[key] = candidate[key]
                 account["host"] = host
                 account["status"] = "active"
                 account["last_error"] = None
@@ -557,6 +608,7 @@ class AccountManager:
                 host=account.get("host", "icloud.com"),
                 verbose=False,
             )
+            self._bind_web_client(account, client)
             client.validate_session()
             info = client.get_account_info()
             if info:
@@ -625,11 +677,11 @@ class AccountManager:
         account = self.accounts.get(acc_id)
         if not account:
             raise KeyError(f"账号不存在: {acc_id}")
-        return ICloudHME(
+        return self._bind_web_client(account, ICloudHME(
             account["cookies"],
             host=account.get("host", "icloud.com"),
             verbose=verbose,
-        )
+        ))
 
     def set_app_password(self, acc_id: str, app_password: str):
         self.set_mail_credentials(acc_id, app_password)
@@ -795,13 +847,9 @@ class AccountManager:
             return cached_slice()
 
         try:
-            client = self.get_client(acc_id, verbose=False)
-            try:
-                aliases = client.list_aliases()
-            finally:
-                close = getattr(client, "close", None)
-                if callable(close):
-                    close()
+            # Use the same account lock as creation, validation and reimport:
+            # independent clients must not race to rotate the same cookies.
+            aliases = self.get_aliases_for_account(acc_id, raise_errors=True)
         except Exception:
             if cached:
                 return cached_slice()
@@ -1034,6 +1082,7 @@ class AccountManager:
             host=account.get("host", "icloud.com"),
             verbose=False,
         )
+        self._bind_web_client(account, client)
 
         guard = self.creation_guard
         try:

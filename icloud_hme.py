@@ -41,6 +41,8 @@ import argparse
 import hashlib
 import base64
 import secrets
+import copy
+from http.cookies import SimpleCookie
 from datetime import datetime
 from typing import Optional, Dict, List, Any
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
@@ -62,6 +64,17 @@ ICLOUD_COOKIE_DOMAINS = [
     "setup.icloud.com", "setup.icloud.com.cn",
     "www.icloud.com", "www.icloud.com.cn",
 ]
+
+
+class WebSessionExpired(RuntimeError):
+    """Safe, actionable authentication error with no upstream token contents."""
+
+    def __init__(self, status=421):
+        super().__init__(f"HTTP {status}: iCloud 网页登录需要重新验证，请在浏览器完成验证后重新导入 Cookie；收信认证独立")
+
+
+class WebSessionStorageError(RuntimeError):
+    pass
 
 
 # ============================================================
@@ -222,7 +235,7 @@ class ICloudHME:
     """iCloud Hide My Email 客户端"""
 
     def __init__(self, cookies: Dict[str, str], host: str = "icloud.com", verbose: bool = True):
-        self.cookies = cookies
+        self.cookies = dict(cookies)
         self.host = self._normalize_host(host)
         self.verbose = verbose
         self.session = requests.Session()
@@ -233,6 +246,10 @@ class ICloudHME:
         self._setup_url: Optional[str] = None
         self._service_url: Optional[str] = None
         self._account_info: Optional[Dict] = None
+        self._session_tokens = {}
+        self._session_update = None
+        self._session_fingerprint = None
+        self._recovery_attempted = False
 
     def close(self):
         """Release the requests connection pool held by this client."""
@@ -289,6 +306,112 @@ class ICloudHME:
         params["clientMasteringNumber"] = [CLIENT_BUILD_NUMBER]
         return urlunparse(parsed._replace(query=urlencode(params, doseq=True)))
 
+    def bind_session(self, state=None, on_update=None):
+        """Restore account-scoped cookies and encrypted renewal tokens."""
+        state = state or {}
+        self._session_tokens = {key: value for key, value in state.get('tokens', {}).items()
+                                if key in ('session_token', 'trust_token', 'account_country')
+                                and isinstance(value, str)}
+        jar = state.get('cookies')
+        if isinstance(jar, list):
+            self.session.cookies.clear()
+            for item in jar:
+                domain = str(item.get('domain') or '')
+                if domain and not self._icloud_domain(domain):
+                    continue
+                expires = item.get('expires')
+                if expires is not None and expires <= time.time():
+                    continue
+                self.session.cookies.set(item['name'], item['value'],
+                    domain=domain, path=item.get('path') or '/',
+                    secure=bool(item.get('secure')), expires=expires)
+        self._session_update = on_update
+        self._session_fingerprint = self.export_session()
+
+    def _icloud_domain(self, domain):
+        domain = domain.lower().lstrip('.')
+        return domain == self.host or domain.endswith('.' + self.host)
+
+    def export_session(self):
+        return {'version': 1, 'tokens': dict(self._session_tokens), 'cookies': [
+            {'name': c.name, 'value': c.value, 'domain': c.domain,
+             'path': c.path, 'secure': c.secure, 'expires': c.expires}
+            for c in self.session.cookies
+            if (not c.domain or self._icloud_domain(c.domain)) and not c.is_expired()
+        ]}
+
+    def _capture_session(self, response):
+        headers = getattr(response, 'headers', {})
+        for header, key in (('X-Apple-Session-Token', 'session_token'),
+                            ('X-Apple-TwoSV-Trust-Token', 'trust_token'),
+                            ('X-Apple-ID-Account-Country', 'account_country')):
+            if headers.get(header):
+                self._session_tokens[key] = headers[header]
+        # Imported Header cookies have no domain. Remove those shadowed by
+        # scoped Set-Cookie values so an old token is not sent alongside a new one.
+        scoped = {c.name for c in self.session.cookies
+                  if c.domain and self._icloud_domain(c.domain)}
+        # Deletion cookies may already be absent from requests' jar. Still
+        # remove an imported unscoped copy when Apple expires that cookie.
+        raw_headers = getattr(getattr(response, 'raw', None), 'headers', None)
+        cookie_headers = (raw_headers.getlist('Set-Cookie') if
+                          callable(getattr(raw_headers, 'getlist', None)) else
+                          [headers.get('Set-Cookie', '')])
+        for value in cookie_headers:
+            parsed = SimpleCookie()
+            try:
+                parsed.load(value)
+            except Exception:
+                continue
+            for name, morsel in parsed.items():
+                domain = morsel['domain'] or urlparse(getattr(response, 'url', '')).hostname or ''
+                if self._icloud_domain(domain):
+                    scoped.add(name)
+        for cookie in list(self.session.cookies):
+            if not cookie.domain and cookie.name in scoped:
+                self.session.cookies.clear(cookie.domain, cookie.path, cookie.name)
+        state = self.export_session()
+        if state != self._session_fingerprint:
+            if self._session_update:
+                try:
+                    self._session_update(copy.deepcopy(state))
+                except Exception as exc:
+                    raise WebSessionStorageError('网页登录凭据保存失败，请检查服务器存储后重试') from exc
+            self._session_fingerprint = state
+
+    def _recover_session(self, timeout):
+        """Attempt token renewal once; never solicit credentials or replay mutations."""
+        token = self._session_tokens.get('session_token')
+        if self._recovery_attempted or not token:
+            return False
+        self._recovery_attempted = True
+        data = {'dsWebAuthToken': token, 'extended_login': True,
+                'trustToken': self._session_tokens.get('trust_token', '')}
+        if self._session_tokens.get('account_country'):
+            data['accountCountryCode'] = self._session_tokens['account_country']
+        try:
+            response = self.session.request('POST',
+                self._build_url(self.setup_url + '/accountLogin'),
+                headers={'Origin': self.origin, 'Referer': self.origin + '/',
+                         'Content-Type': 'application/json'},
+                data=json.dumps(data), timeout=timeout)
+            self._capture_session(response)
+            if response.status_code in (401, 403, 421):
+                return False
+            if not response.ok:
+                raise RuntimeError(f'HTTP {response.status_code}: iCloud 会话恢复暂时失败')
+            try:
+                result = response.json()
+            except ValueError:
+                raise RuntimeError('网络异常：iCloud 会话恢复响应无法解析') from None
+            if (not isinstance(result, dict) or result.get('success') is False
+                    or result.get('hsaChallengeRequired') or result.get('error')
+                    or not result.get('webservices')):
+                return False
+            return True
+        except requests.exceptions.RequestException:
+            raise RuntimeError('网络异常：iCloud 会话恢复连接失败，请稍后重试') from None
+
     def _request(self, method: str, url: str, json_data: Any = None,
                  timeout: int = REQUEST_TIMEOUT, max_attempts: int = MAX_RETRIES) -> Any:
         if getattr(self, "_creation_mode", False):
@@ -308,10 +431,23 @@ class ICloudHME:
         for attempt in range(1, max_attempts + 1):
             try:
                 resp = self.session.request(method, full_url, headers=headers, data=body, timeout=timeout)
+                self._capture_session(resp)
                 if not resp.ok:
-                    last_err = RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
                     if resp.status_code in (401, 403, 421):
-                        raise last_err
+                        safe_to_retry = (method.upper() == 'GET' or
+                            urlparse(url).path == '/setup/ws/1/validate')
+                        if safe_to_retry and self._recover_session(timeout):
+                            # One retry after renewal, even in creation mode.
+                            resp = self.session.request(method, full_url,
+                                headers=headers, data=body, timeout=timeout)
+                            self._capture_session(resp)
+                            if resp.status_code in (401, 403, 421):
+                                raise WebSessionExpired(resp.status_code)
+                            if resp.ok:
+                                return resp.json() if resp.text else {}
+                        if resp.status_code in (401, 403, 421):
+                            raise WebSessionExpired(resp.status_code)
+                    last_err = RuntimeError(f"HTTP {resp.status_code}: iCloud 接口请求失败")
                     if attempt < max_attempts:
                         time.sleep(RETRY_DELAYS[min(attempt - 1, len(RETRY_DELAYS) - 1)])
                         continue

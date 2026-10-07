@@ -9,6 +9,8 @@ from pathlib import Path
 
 def classify(error):
     text = str(error).lower()
+    if '网页登录凭据保存失败' in text:
+        return 'local'
     if any(s in text for s in ('http 401', 'http 403', 'http 421', 'trusttokens',
                                'authentication', 'cookie', '会话校验失败', 'account locked', 'account disabled')):
         return 'auth'

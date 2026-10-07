@@ -1768,7 +1768,7 @@ def api_accounts():
     accounts = _account_mgr.list_accounts()
     safe = []
     for a in accounts:
-        ac = {k:v for k,v in a.items() if k not in ("cookies", "app_password")}
+        ac = {k:v for k,v in a.items() if k not in ("cookies", "app_password", "web_session", "credentials_encrypted")}
         ac["has_cookies"] = bool(a.get("cookies"))
         ac["has_app_password"] = bool(a.get("app_password"))
         safe.append(ac)

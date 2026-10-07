@@ -1528,7 +1528,7 @@ def test_find_by_recipient_matches_delivered_to():
 def test_check_all_aliases_mail_raises_without_cache():
     from account_manager import AccountManager
 
-    mgr = object.__new__(AccountManager)
+    mgr = AccountManager()
     class Cache:
         def get_all_alias_mail(self, _acc_id):
             return {}
