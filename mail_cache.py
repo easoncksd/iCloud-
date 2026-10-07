@@ -67,12 +67,17 @@ class MailCache:
     def _save(self):
         with self._lock:
             tmp = CACHE_FILE.with_suffix(CACHE_FILE.suffix + ".tmp")
-            payload = json.dumps(self._data, indent=2, ensure_ascii=False)
-            with open(tmp, "w", encoding="utf-8") as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(tmp, CACHE_FILE)
+            try:
+                with open(tmp, "w", encoding="utf-8") as handle:
+                    # Stream to disk: assembling the entire indented cache can
+                    # push the service over MemoryHigh and stall HTTP requests.
+                    json.dump(self._data, handle, ensure_ascii=False,
+                              separators=(",", ":"))
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(tmp, CACHE_FILE)
+            finally:
+                tmp.unlink(missing_ok=True)
 
     def _ensure_account(self, acc_id: str):
         if acc_id not in self._data:
