@@ -1147,7 +1147,7 @@ a{color:var(--green)}
 .btn-xs{padding:4px 8px;font-size:12px}
 .btn:disabled{opacity:.55;cursor:not-allowed;transform:none}
 .copy-btn{border:0;background:transparent;color:var(--green);cursor:pointer;font-size:12px}
-input[type=text],input[type=number],input[type=password],select,textarea{border:1px solid var(--line);border-radius:8px;padding:8px 10px;background:#fff;min-width:0}
+input[type=text],input[type=email],input[type=number],input[type=password],select,textarea{border:1px solid var(--line);border-radius:8px;padding:8px 10px;background:#fff;min-width:0}
 textarea{width:100%;min-height:140px}
 .work-strip{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:16px}
 .work-stat{background:#fff;border:1px solid var(--line);border-radius:8px;padding:12px 14px;box-shadow:var(--shadow);min-width:0;transition:border-color .16s ease,box-shadow .16s ease,transform .16s ease}
@@ -1246,7 +1246,7 @@ textarea{width:100%;min-height:140px}
 }
 
 .modal-box label.hint{display:block;margin:8px 0 6px}
-.modal-box input[type=text],.modal-box input[type=password],.modal-box select,.modal-box textarea{width:100%}
+.modal-box input[type=text],.modal-box input[type=email],.modal-box input[type=password],.modal-box select,.modal-box textarea{width:100%}
 </style>
 </head>
 <body>
@@ -1608,6 +1608,8 @@ function renderDashboard(){
     if(jobBusy){var accTarget=batchAccountTarget(batchJob,job),accCreated=job.created||0,accErrors=job.errors||0,mode=job.status==='waiting'?'is-wait':'is-run';jobHtml='<div class="acc-job"><div class="progress-head"><strong>'+esc(batchStatusText(job.status))+'</strong><span>'+accCreated+(accTarget?(' / '+accTarget):'')+'</span></div>'+progressBarHtml(accCreated,accErrors,accTarget||Math.max(accCreated+accErrors,1),mode)+'</div>';}
     var expired=a.status!=='active';
     var actions='<div class="acc-actions">'+(expired?('<button class="btn btn-primary btn-xs" onclick="showReimportModal(\''+escAttr(a.id)+'\')">'+t('action.reimport')+'</button><button class="btn btn-outline btn-xs" onclick="handlePrimaryAction(\''+escAttr(a.id)+'\')">'+t('action.create_alias')+'</button>'):('<button class="btn btn-primary btn-xs" onclick="handlePrimaryAction(\''+escAttr(a.id)+'\')">'+t('action.create_alias')+'</button>'))+'<button class="btn btn-outline btn-xs" onclick="validateAccount(\''+escAttr(a.id)+'\')">'+t('action.check_login')+'</button><button class="btn btn-outline btn-xs" onclick="showAppPwdModal(\''+escAttr(a.id)+'\')">'+t('action.set_mail')+'</button><button class="btn btn-outline btn-xs" onclick="removeAccount(\''+escAttr(a.id)+'\')">'+t('action.delete')+'</button></div>';
+    actions=actions.replace('</div>','<button class="btn btn-outline btn-xs" onclick="showPasswordLoginModal(\''+escAttr(a.id)+'\')">'+t('login.title')+'</button></div>');
+    if(a.has_password_login){jobHtml+='<p class="hint">'+esc(a.apple_login_needs_code?t('login.pending'):(a.apple_login_auto_paused?t('login.paused'):t('login.saved_status')))+'</p>';}
     if(a.mail_sync_paused||a.mail_status==='auth_failed')actions=actions.replace('</div>','<button class="btn btn-outline btn-xs" onclick="resumeMail(this,\''+escAttr(a.id)+'\')">'+t('mail.resume')+'</button></div>');
     return '<div class="acc-card'+(jobBusy?' is-busy':'')+(expired?' is-expired':'')+'"><div class="acc-top"><div><div class="acc-title">'+esc(a.name||t('name.unnamed'))+'</div><div class="acc-email">'+esc(email)+'</div></div><span class="status-badge '+stCls+'">'+esc(stText.substring(0,42))+'</span></div><div class="acc-usage"><div class="progress-head"><span>'+t('usage.capacity')+'</span><span>'+used+' / '+limit+'</span></div><div class="progress-bar"><div class="fill ok" style="width:'+pct+'%"></div></div></div><div class="acc-stats"><div>'+esc(mailReady)+'</div></div>'+jobHtml+actions+'</div>';  }).join('');
 }
@@ -1726,7 +1728,7 @@ function connectSSE(){if(sseTimer){clearTimeout(sseTimer);sseTimer=null}if(sseCo
 function renderLogs(){var f=E('logFeed');if(!f)return;if(!logs.length){f.innerHTML='<div class="log-line hint">'+t(logCursor?'settings.logs_cleared':'settings.logs_empty')+'</div>';return;}f.innerHTML=logs.map(function(l){return'<div class="log-line '+l.level+'"><span class="log-time">'+esc(l.time)+'</span>'+esc(l.msg)+'</div>';}).join('\n');f.scrollTop=f.scrollHeight;}
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
 function escAttr(s){return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
-function showAddAccountModal(){closeAddAccModal();var h='<div class="modal-overlay" id="addAccModal" onclick="if(event.target===this)closeAddAccModal()"><div class="modal-box"><h3>'+t('action.add_account')+'</h3><p>'+t('add.help_before')+' <a href="https://chromewebstore.google.com/detail/cookie-editor/hlkenndednhfkekhgcdicdfddnkalmdm" target="_blank" rel="noopener noreferrer">Cookie Editor</a>'+t('add.help_mid')+'<br>'+t('add.help_json')+'<code>{"name1":"value1"}</code> <a href="https://chromewebstore.google.com/detail/cookie-editor/hlkenndednhfkekhgcdicdfddnkalmdm" target="_blank" rel="noopener noreferrer">'+t('add.download')+'</a></p><label class="hint">'+t('add.region')+'</label><select id="accHostInput"><option value="icloud.com" selected>'+t('add.region_intl')+'</option><option value="icloud.com.cn">'+t('add.region_cn')+'</option></select><input type="text" id="accNameInput" placeholder="'+escAttr(t('add.name_ph'))+'"><textarea id="cookieInput" placeholder="'+escAttr(t('add.cookie_ph'))+'"></textarea><div class="modal-actions"><button class="btn btn-outline" onclick="closeAddAccModal()">'+t('action.cancel')+'</button><button class="btn btn-primary" id="btnAddAccount" onclick="addAccount()">'+t('action.add_account')+'</button></div><div class="modal-msg" id="addAccMsg"></div></div></div>';document.body.insertAdjacentHTML('beforeend',h);}
+function showCookieAccountModal(){closeAddAccModal();var h='<div class="modal-overlay" id="addAccModal" onclick="if(event.target===this)closeAddAccModal()"><div class="modal-box"><h3>'+t('action.add_account')+'</h3><p>'+t('add.help_before')+' <a href="https://chromewebstore.google.com/detail/cookie-editor/hlkenndednhfkekhgcdicdfddnkalmdm" target="_blank" rel="noopener noreferrer">Cookie Editor</a>'+t('add.help_mid')+'<br>'+t('add.help_json')+'<code>{"name1":"value1"}</code> <a href="https://chromewebstore.google.com/detail/cookie-editor/hlkenndednhfkekhgcdicdfddnkalmdm" target="_blank" rel="noopener noreferrer">'+t('add.download')+'</a></p><label class="hint">'+t('add.region')+'</label><select id="accHostInput"><option value="icloud.com" selected>'+t('add.region_intl')+'</option><option value="icloud.com.cn">'+t('add.region_cn')+'</option></select><input type="text" id="accNameInput" placeholder="'+escAttr(t('add.name_ph'))+'"><textarea id="cookieInput" placeholder="'+escAttr(t('add.cookie_ph'))+'"></textarea><div class="modal-actions"><button class="btn btn-outline" onclick="closeAddAccModal()">'+t('action.cancel')+'</button><button class="btn btn-primary" id="btnAddAccount" onclick="addAccount()">'+t('action.add_account')+'</button></div><div class="modal-msg" id="addAccMsg"></div></div></div>';document.body.insertAdjacentHTML('beforeend',h);}
 function closeAddAccModal(){window._reimportAccId=null;var m=E('addAccModal');if(m)m.remove()}
 function showReimportModal(accId){closeAddAccModal();var acc=accounts.find(function(x){return x.id===accId})||{};window._reimportAccId=accId;var email=acc.real_email||acc.name||accId;var host=acc.host||'icloud.com';var intlSel=host==='icloud.com.cn'?'':' selected';var cnSel=host==='icloud.com.cn'?' selected':'';var h='<div class="modal-overlay" id="addAccModal" onclick="if(event.target===this)closeAddAccModal()"><div class="modal-box"><h3>'+t('reimport.title')+'</h3><p>'+t('reimport.help',{email:esc(email)})+'<br>'+t('add.help_before')+' <a href="https://chromewebstore.google.com/detail/cookie-editor/hlkenndednhfkekhgcdicdfddnkalmdm" target="_blank" rel="noopener noreferrer">Cookie Editor</a>'+t('add.help_mid')+'</p><label class="hint">'+t('add.region')+'</label><select id="accHostInput"><option value="icloud.com"'+intlSel+'>'+t('add.region_intl')+'</option><option value="icloud.com.cn"'+cnSel+'>'+t('add.region_cn')+'</option></select><textarea id="cookieInput" placeholder="'+escAttr(t('add.cookie_ph'))+'"></textarea><div class="modal-actions"><button class="btn btn-outline" onclick="closeAddAccModal()">'+t('action.cancel')+'</button><button class="btn btn-primary" id="btnAddAccount" onclick="submitReimport()">'+t('reimport.submit')+'</button></div><div class="modal-msg" id="addAccMsg"></div></div></div>';document.body.insertAdjacentHTML('beforeend',h);var box=E('cookieInput');if(box)box.focus();}
 async function submitReimport(){var accId=window._reimportAccId;if(!accId)return;var cookies=E('cookieInput').value.trim();if(!cookies){E('addAccMsg').innerHTML='<span style="color:var(--red)">'+t('add.need_cookie')+'</span>';return}var btn=E('btnAddAccount');btn.disabled=true;btn.textContent=t('add.checking');var d=await api('/api/accounts/'+encodeURIComponent(accId)+'/reimport',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cookie_input:cookies,host:(E('accHostInput')&&E('accHostInput').value)||'icloud.com'})});btn.disabled=false;btn.textContent=t('reimport.submit');if(d.ok){E('addAccMsg').innerHTML='<span style="color:var(--green)">'+t('reimport.ok',{email:esc(d.real_email||'')})+'</span>';setTimeout(closeAddAccModal,1200);refreshAll();}else{E('addAccMsg').innerHTML='<span style="color:var(--red)">'+esc(d.error||t('status.login_expired'))+'</span>';}}
@@ -1742,6 +1744,7 @@ refreshMailWatchStatus();
 setInterval(refreshMailWatchStatus,30000);
 refreshAll().then(connectSSE);setInterval(refreshLight,10000);setInterval(refreshAll,30000);
 </script>
+<script src="/static/password_login.js"></script>
 </body>
 </html>
 """
@@ -1765,14 +1768,98 @@ def api_state():
 
 @app.route("/api/accounts")
 def api_accounts():
+    from credential_store import CREDENTIAL_FIELDS
     accounts = _account_mgr.list_accounts()
     safe = []
     for a in accounts:
-        ac = {k:v for k,v in a.items() if k not in ("cookies", "app_password", "web_session", "credentials_encrypted")}
+        ac = {k:v for k,v in a.items() if k not in CREDENTIAL_FIELDS + ("credentials_encrypted",)}
         ac["has_cookies"] = bool(a.get("cookies"))
         ac["has_app_password"] = bool(a.get("app_password"))
+        ac['has_password_login'] = bool(a.get('apple_login'))
+        pending = _account_mgr.password_login_status(a['id'])
+        ac['password_login_pending'] = pending
         safe.append(ac)
     return jsonify({"accounts":safe,"count":len(safe)})
+
+
+@app.before_request
+def _protect_password_login():
+    if request.path.startswith('/api/password-login') and request.method == 'POST':
+        # These routes accept the primary Apple password. Require same-origin JSON
+        # in addition to the existing admin cookie, including on a localhost setup.
+        origin = request.headers.get('Origin')
+        scheme = request.scheme
+        if request.remote_addr in ('127.0.0.1', '::1') and request.headers.get('X-Forwarded-Proto') == 'https':
+            scheme = 'https'
+        # Waitress strips untrusted forwarded headers by default. Use the
+        # configured public URL when Nginx terminates TLS for this same host.
+        from urllib.parse import urlsplit
+        public = urlsplit(PICKUP_BASE_URL)
+        if public.netloc.lower() == request.host.lower() and public.scheme in ('http', 'https'):
+            scheme = public.scheme
+        expected_origin = scheme + '://' + request.host
+        if (not request.is_json or
+                (origin and origin.rstrip('/') != expected_origin) or
+                request.headers.get('Sec-Fetch-Site') == 'cross-site'):
+            return _api_error('登录请求必须来自当前管理页面', 403)
+
+
+@app.route('/api/password-login/start', methods=['POST'])
+def api_password_login_start():
+    from apple_login import AppleLoginError
+    data = _json_object()
+    username = _bounded_text(data.get('username'), _MAX_EMAIL_LENGTH)
+    password = data.get('password', '')
+    name = _bounded_text(data.get('name', '未命名账号'), _MAX_NAME_LENGTH)
+    acc_id = _bounded_text(data.get('account_id'), 80)
+    host = data.get('host', 'icloud.com')
+    if (not username or '@' not in username or any(c in username for c in '\r\n\x00')
+            or not isinstance(password, str) or len(password) > 1024
+            or any(c in password for c in '\r\n\x00') or name is None
+            or acc_id is None or host not in ('icloud.com', 'icloud.com.cn')):
+        return _api_error('账号、密码或地区格式无效', 400)
+    try:
+        return jsonify(_account_mgr.begin_password_login(username, password, name, host, acc_id or None))
+    except KeyError:
+        return _api_error('账号不存在', 404)
+    except AppleLoginError as error:
+        return _api_error(str(error), 429 if error.kind == 'throttle' else 400)
+    except Exception:
+        return _api_error('登录或凭据保存失败，请稍后重试', 502)
+
+
+@app.route('/api/password-login/<token>/<action>', methods=['POST'])
+def api_password_login_action(token, action):
+    from apple_login import AppleLoginError
+    if action not in ('verify', 'sms', 'cancel') or len(token) != 32:
+        return _api_error('登录操作无效', 400)
+    data = _json_object()
+    code = data.get('code', '')
+    method = data.get('method', 'device')
+    phone_id = data.get('phone_id', '')
+    if (action == 'verify' and (not isinstance(code, str) or len(code) != 6
+            or not code.isascii() or not code.isdigit() or method not in ('device', 'sms'))):
+        return _api_error('请输入六位数字验证码', 400)
+    if not isinstance(phone_id, str) or len(phone_id) > 80:
+        return _api_error('手机号选项无效', 400)
+    try:
+        return jsonify(_account_mgr.password_login_action(token, action, code, method, phone_id))
+    except AppleLoginError as error:
+        return _api_error(str(error), 429 if error.kind == 'throttle' else 400)
+    except Exception:
+        return _api_error('登录或凭据保存失败，请稍后重试', 502)
+
+
+@app.route('/api/password-login/forget', methods=['POST'])
+def api_forget_password_login():
+    acc_id = _bounded_text(_json_object().get('account_id'), 80)
+    if not acc_id:
+        return _api_error('请选择账号', 400)
+    try:
+        _account_mgr.forget_password_login(acc_id)
+        return jsonify({'ok': True})
+    except KeyError:
+        return _api_error('账号不存在', 404)
 
 @app.route("/api/accounts/add", methods=["POST"])
 def api_add_account():

@@ -97,6 +97,9 @@ class AccountManager:
         # web_ui installs a checker so duplicate imports cannot replace an
         # account while a durable batch entry is waiting on Apple's cooldown.
         self._creation_activity_checker = None
+        self._apple_login_tasks = {}
+        self._apple_login_recent = {}
+        self._apple_login_slots = threading.BoundedSemaphore(2)
         self._cache = get_cache()
         self._load()
 
@@ -133,11 +136,11 @@ class AccountManager:
 
     def _save(self):
         with self._lock:
-            from credential_store import seal
+            from credential_store import seal, CREDENTIAL_FIELDS
             stored = {}
             for acc_id, account in self.accounts.items():
                 item = dict(account)
-                credentials = {key: item.pop(key) for key in ('cookies', 'app_password', 'web_session') if key in item}
+                credentials = {key: item.pop(key) for key in CREDENTIAL_FIELDS if key in item}
                 if credentials:
                     item['credentials_encrypted'] = seal(acc_id, credentials,
                                                          ACCOUNTS_FILE.with_name('.credentials.key'))
@@ -166,10 +169,14 @@ class AccountManager:
                                 account.get('credential_generation') != generation):
                     return  # A removed account or older import cannot publish credentials.
                 previous = {key: copy.deepcopy(account.get(key)) for key in
-                            ('cookies', 'web_session', 'web_session_updated_at')}
+                            ('cookies', 'web_session', 'web_session_updated_at', 'apple_login')}
                 account['web_session'] = state
                 account['cookies'] = {item['name']: item['value'] for item in state['cookies']}
                 account['web_session_updated_at'] = datetime.now().isoformat()
+                if account.get('apple_login'):
+                    from apple_login import merge_web_session
+                    account['apple_login']['state'] = merge_web_session(
+                        account['apple_login'].get('state'), state)
                 try:
                     if persist:
                         self._save()
@@ -182,6 +189,11 @@ class AccountManager:
                     raise
 
         bind(copy.deepcopy(account.get('web_session')), save_session)
+        if account.get('apple_login') and getattr(client, 'session', None) is not None:
+            from apple_login import USER_AGENT
+            client.session.headers['User-Agent'] = USER_AGENT
+        if persist and account.get('apple_login'):
+            client._password_recovery = lambda: self._auto_apple_login(account, generation)
         return client
 
     def _migrate_old_cookies(self):
@@ -428,7 +440,11 @@ class AccountManager:
                 raise ValueError("该账号已被另一个请求导入，请使用重新导入")
             else:
                 self.accounts[acc_id] = account
-            self._save()
+            try:
+                self._save()
+            except Exception:
+                self.accounts.pop(acc_id, None)
+                raise
         if aliases:
             self.record_known_aliases(acc_id, aliases)
         return account
@@ -457,7 +473,8 @@ class AccountManager:
         return False
 
     def reimport_account(
-        self, acc_id: str, cookie_input: str, host: str = "icloud.com", *, _session_state=None
+        self, acc_id: str, cookie_input: str, host: str = "icloud.com", *,
+        _session_state=None
     ) -> Dict:
         from icloud_hme import ICloudHME
 
@@ -511,9 +528,11 @@ class AccountManager:
                 account = self.accounts.get(acc_id)
                 if not account:
                     raise KeyError(f"账号不存在: {acc_id}")
+                before = copy.deepcopy(account)
                 account["cookies"] = candidate['cookies']
                 account.pop('web_session', None)
                 account.pop('web_session_updated_at', None)
+                account.pop('apple_login', None)
                 for key in ('web_session', 'web_session_updated_at'):
                     if key in candidate:
                         account[key] = candidate[key]
@@ -522,7 +541,9 @@ class AccountManager:
                 account["last_error"] = None
                 account["last_validated"] = datetime.now().isoformat()
                 account.update(last_error_kind=None, health_failures=0, health_retry_at=None,
-                               credential_generation=uuid.uuid4().hex)
+                               credential_generation=uuid.uuid4().hex,
+                               apple_login_needs_code=False, apple_login_auto_paused=False,
+                               apple_login_error=None, apple_login_retry_at=None)
                 if new_email:
                     account["real_email"] = new_email
                 derived = self._derive_icloud_email(info)
@@ -533,7 +554,12 @@ class AccountManager:
                     account["alias_active"] = sum(
                         1 for item in aliases if item.get("active")
                     )
-                self._save()
+                try:
+                    self._save()
+                except Exception:
+                    account.clear()
+                    account.update(before)
+                    raise
             if aliases:
                 self.record_known_aliases(acc_id, aliases)
             return dict(account)
@@ -556,6 +582,273 @@ class AccountManager:
         with self._lock:
             account = self.accounts.get(acc_id)
             return copy.deepcopy(account) if account is not None else None
+
+    def _prune_apple_logins(self):
+        # Caller holds _lock. Never close a session being used by a request.
+        now = time.time()
+        for token, task in list(self._apple_login_tasks.items()):
+            current = self.accounts.get(task['acc_id']) if task['acc_id'] else None
+            stale = task['acc_id'] and (current is None or current.get('credential_generation') != task['generation'])
+            if (now >= task['expires'] or stale) and task['lock'].acquire(blocking=False):
+                try:
+                    self._apple_login_tasks.pop(token, None)
+                    task['client'].close()
+                finally:
+                    task['lock'].release()
+        self._apple_login_recent = {k: v for k, v in self._apple_login_recent.items() if now - v < 60}
+
+    @staticmethod
+    def _apple_challenge(token, task):
+        return {'ok': True, 'requires_code': True, 'login_id': token,
+                'expires_at': task['expires'], 'phones': task['client'].phones}
+
+    def password_login_status(self, acc_id):
+        with self._lock:
+            self._prune_apple_logins()
+            account = self.accounts.get(acc_id) or {}
+            for token, task in self._apple_login_tasks.items():
+                if task['acc_id'] == acc_id and task['generation'] == account.get('credential_generation'):
+                    return self._apple_challenge(token, task)
+        return None
+
+    def _register_apple_challenge(self, client, name, acc_id, generation):
+        from apple_login import AppleLoginError
+        with self._lock:
+            self._prune_apple_logins()
+            if len(self._apple_login_tasks) >= 8:
+                raise AppleLoginError('等待验证的登录过多，请先完成或取消已有登录')
+            token = uuid.uuid4().hex
+            task = {'client': client, 'name': name, 'acc_id': acc_id,
+                    'generation': generation, 'expires': time.time() + 900,
+                    'attempts': 0, 'sms_at': 0, 'lock': threading.Lock()}
+            self._apple_login_tasks[token] = task
+            return self._apple_challenge(token, task)
+
+    def begin_password_login(self, username, password, name='未命名账号', host='icloud.com', acc_id=None):
+        from apple_login import AppleLogin, AppleLoginError
+        identity = username.strip().lower()
+        if not acc_id:
+            with self._lock:
+                acc_id = self._existing_account_id_locked(identity)
+        with self._operation_lock(acc_id or 'apple-login:' + identity):
+            account = self.get_account(acc_id) if acc_id else None
+            if acc_id and not account:
+                raise KeyError(acc_id)
+            if acc_id and self._account_creation_in_progress(acc_id):
+                raise AppleLoginError('这个账号已有创建任务，结束后再登录')
+            if account and identity != str(account.get('real_email') or '').lower():
+                raise AppleLoginError('登录账号与当前账号不一致')
+            if not password and acc_id:
+                pending = self.password_login_status(acc_id)
+                if pending:
+                    return pending
+            saved = (account or {}).get('apple_login') or {}
+            password = password or saved.get('password')
+            if not password:
+                raise AppleLoginError('请输入 Apple 账号的主密码')
+            with self._lock:
+                self._prune_apple_logins()
+                if time.time() - self._apple_login_recent.get(identity, 0) < 60:
+                    raise AppleLoginError('请等待 60 秒后再发起登录', 'throttle')
+                if len(self._apple_login_tasks) >= 8 or len(self._apple_login_recent) >= 128:
+                    raise AppleLoginError('登录请求过多，请先完成已有验证', 'throttle')
+                if not self._apple_login_slots.acquire(blocking=False):
+                    raise AppleLoginError('其他账号正在登录，请稍后重试', 'throttle')
+                self._apple_login_recent[identity] = time.time()
+            client = None
+            retained = False
+            generation = (account or {}).get('credential_generation')
+            try:
+                reuse_state = saved.get('username', '').lower() == identity and host == (account or {}).get('host')
+                client = AppleLogin(username.strip(), password, host, saved.get('state') if reuse_state else None)
+                if client.start():
+                    return self._commit_apple_login(client, name, acc_id, generation)
+                result = self._register_apple_challenge(client, name, acc_id, generation)
+                retained = True
+                return result
+            finally:
+                if client is not None and not retained:
+                    client.close()
+                self._apple_login_slots.release()
+
+    def password_login_action(self, token, action, code='', method='device', phone_id=''):
+        from apple_login import AppleLoginError
+        with self._lock:
+            self._prune_apple_logins()
+            task = self._apple_login_tasks.get(token)
+        if not task:
+            raise AppleLoginError('登录验证已过期或服务器已重启，请重新登录')
+        if not task['lock'].acquire(blocking=False):
+            raise AppleLoginError('这个登录正在处理，请稍后重试', 'throttle')
+        client = task['client']
+        try:
+            if action == 'cancel':
+                with self._lock:
+                    self._apple_login_tasks.pop(token, None)
+                client.close()
+                return {'ok': True}
+            with self._operation_lock(task['acc_id'] or 'apple-login:' + client.username.lower()):
+                if task['acc_id']:
+                    current = self.get_account(task['acc_id'])
+                    if not current or current.get('credential_generation') != task['generation']:
+                        raise AppleLoginError('账号凭据已变更，请重新登录')
+                if not self._apple_login_slots.acquire(blocking=False):
+                    raise AppleLoginError('其他账号正在登录，请稍后重试', 'throttle')
+                try:
+                    client.reset_deadline()
+                    if action == 'sms':
+                        if time.time() - task['sms_at'] < 60:
+                            raise AppleLoginError('请等待 60 秒后再发送验证码', 'throttle')
+                        task['sms_at'] = time.time()
+                        client.send_sms(phone_id)
+                        return {'ok': True}
+                    if action != 'verify':
+                        raise AppleLoginError('登录操作无效')
+                    if task['attempts'] >= 5:
+                        raise AppleLoginError('验证码尝试次数过多，请重新登录')
+                    task['attempts'] += 1
+                    client.verify(code, method)
+                    result = self._commit_apple_login(client, task['name'], task['acc_id'], task['generation'])
+                    with self._lock:
+                        self._apple_login_tasks.pop(token, None)
+                    client.close()
+                    return result
+                finally:
+                    self._apple_login_slots.release()
+        finally:
+            task['lock'].release()
+
+    def _commit_apple_login(self, client, name, acc_id, generation):
+        from apple_login import AppleLoginError
+        info = client.data.get('dsInfo') or {}
+        email = str(info.get('appleId') or info.get('appleIdEmail') or info.get('primaryEmail') or '')
+        if not email or email.lower() != client.username.lower():
+            raise AppleLoginError('登录账号身份不一致，未保存凭据')
+        with self._lock:
+            existing = acc_id or self._existing_account_id_locked(email)
+            if existing and not acc_id:
+                raise AppleLoginError('账号已被另一请求添加，请从账号页重新登录')
+        target = existing or self._generate_id()
+        with self._operation_lock(target), self._mail_sync_lock(target):
+            if self._account_creation_in_progress(target):
+                raise AppleLoginError('这个账号已有创建任务，结束后再登录')
+            with self._lock:
+                account = self.accounts.get(target)
+                if acc_id and (account is None or account.get('credential_generation') != generation):
+                    raise AppleLoginError('账号已删除或凭据已变更，请重新登录')
+                if not existing and self._existing_account_id_locked(email):
+                    raise AppleLoginError('账号已被另一请求添加，请重新选择账号登录')
+                before = copy.deepcopy(account) if account is not None else None
+                if account is None:
+                    account = {'id': target, 'name': name, 'real_email': email,
+                               'alias_total': 0, 'alias_active': 0,
+                               'created_at': datetime.now().isoformat()}
+                    self.accounts[target] = account
+                state = client.web_state()
+                account.update(cookies={c['name']: c['value'] for c in state['cookies']},
+                    web_session=state, web_session_updated_at=datetime.now().isoformat(),
+                    apple_login={'username': client.username, 'password': client.password,
+                                 'state': client.export_state()}, host=client.host,
+                    real_email=email, status='active', last_error=None,
+                    last_validated=datetime.now().isoformat(), credential_generation=uuid.uuid4().hex,
+                    last_error_kind=None, health_failures=0, health_retry_at=None,
+                    apple_login_needs_code=False, apple_login_auto_paused=False,
+                    apple_login_error=None, apple_login_retry_at=None)
+                derived = self._derive_icloud_email(info)
+                if derived:
+                    account['icloud_email'] = derived
+                try:
+                    self._save()
+                except Exception:
+                    if before is None:
+                        self.accounts.pop(target, None)
+                    else:
+                        account.clear()
+                        account.update(before)
+                    raise
+            self._drop_mail_client(target)
+        return {'ok': True, 'requires_code': False, 'id': target, 'real_email': email}
+
+    def forget_password_login(self, acc_id):
+        with self._operation_lock(acc_id), self._lock:
+            account = self.accounts.get(acc_id)
+            if not account:
+                raise KeyError(acc_id)
+            before = copy.deepcopy(account)
+            account.pop('apple_login', None)
+            account.update(apple_login_needs_code=False, apple_login_auto_paused=False,
+                           apple_login_error=None, credential_generation=uuid.uuid4().hex)
+            try:
+                self._save()
+            except Exception:
+                account.clear()
+                account.update(before)
+                raise
+            for token, task in list(self._apple_login_tasks.items()):
+                if task['acc_id'] == acc_id and task['lock'].acquire(blocking=False):
+                    try:
+                        self._apple_login_tasks.pop(token, None)
+                        task['client'].close()
+                    finally:
+                        task['lock'].release()
+
+    def _auto_apple_login(self, account, generation):
+        from apple_login import AppleLogin, AppleLoginError, merge_web_session
+        acc_id = account['id']
+        with self._operation_lock(acc_id):
+            with self._lock:
+                if (self.accounts.get(acc_id) is not account or
+                        account.get('credential_generation') != generation or
+                        not account.get('apple_login') or account.get('apple_login_needs_code') or
+                        account.get('apple_login_auto_paused') or
+                        float(account.get('apple_login_retry_at') or 0) > time.time()):
+                    return None
+                if not self._apple_login_slots.acquire(blocking=False):
+                    return None
+                saved = copy.deepcopy(account['apple_login'])
+                before_retry = account.get('apple_login_retry_at')
+                account['apple_login_retry_at'] = time.time() + 900
+                try:
+                    self._save()  # Persist cooldown before any password attempt.
+                except Exception:
+                    account['apple_login_retry_at'] = before_retry
+                    self._apple_login_slots.release()
+                    raise
+            client, retained = None, False
+            try:
+                client = AppleLogin(saved['username'], saved['password'], account.get('host', 'icloud.com'),
+                                    merge_web_session(saved.get('state'), account.get('web_session') or {}))
+                ready = client.start()
+                with self._lock:
+                    before = copy.deepcopy(account)
+                    if ready:
+                        state = client.web_state()
+                        account.update(web_session=state,
+                            cookies={c['name']: c['value'] for c in state['cookies']},
+                            web_session_updated_at=datetime.now().isoformat(), apple_login_error=None)
+                        account['apple_login']['state'] = client.export_state()
+                    else:
+                        self._register_apple_challenge(client, account.get('name', ''), acc_id, generation)
+                        retained = True
+                        account.update(apple_login_needs_code=True,
+                            apple_login_error='Apple 需要验证码，请点击账号密码登录完成验证')
+                    try:
+                        self._save()
+                    except Exception:
+                        account.clear()
+                        account.update(before)
+                        raise
+                return state if ready else None
+            except AppleLoginError as error:
+                with self._lock:
+                    account['apple_login_error'] = str(error)
+                    account['apple_login_auto_paused'] = error.kind not in ('network', 'throttle')
+                    self._save()
+                return None
+            finally:
+                if client is not None and not retained:
+                    client.close()
+                self._apple_login_slots.release()
 
     def list_accounts(self) -> List[Dict]:
         with self._lock:

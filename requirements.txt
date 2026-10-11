@@ -4,3 +4,4 @@ pywin32>=305; platform_system == "Windows"
 flask>=3.0
 waitress>=3.0
 PyYAML>=6.0
+srp==1.0.22

@@ -9,6 +9,8 @@ import os
 from pathlib import Path
 from Crypto.Cipher import AES
 
+CREDENTIAL_FIELDS = ('cookies', 'app_password', 'web_session', 'apple_login')
+
 
 def _key(path, create=False):
     path = Path(path)

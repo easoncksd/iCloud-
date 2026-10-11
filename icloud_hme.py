@@ -250,6 +250,7 @@ class ICloudHME:
         self._session_update = None
         self._session_fingerprint = None
         self._recovery_attempted = False
+        self._password_recovery = None
 
     def close(self):
         """Release the requests connection pool held by this client."""
@@ -380,11 +381,26 @@ class ICloudHME:
             self._session_fingerprint = state
 
     def _recover_session(self, timeout):
-        """Attempt token renewal once; never solicit credentials or replay mutations."""
-        token = self._session_tokens.get('session_token')
-        if self._recovery_attempted or not token:
+        """One bounded recovery, only for validation/reads; never replay mutations."""
+        if self._recovery_attempted:
             return False
         self._recovery_attempted = True
+        if self._renew_token(timeout):
+            return True
+        if self._password_recovery:
+            try:
+                state = self._password_recovery()
+            except OSError:
+                raise WebSessionStorageError('网页登录凭据保存失败，请检查服务器存储后重试') from None
+            if state:
+                self.bind_session(state, self._session_update)
+                return True
+        return False
+
+    def _renew_token(self, timeout):
+        token = self._session_tokens.get('session_token')
+        if not token:
+            return False
         data = {'dsWebAuthToken': token, 'extended_login': True,
                 'trustToken': self._session_tokens.get('trust_token', '')}
         if self._session_tokens.get('account_country'):
