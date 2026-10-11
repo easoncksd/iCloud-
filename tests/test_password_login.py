@@ -177,10 +177,14 @@ def test_failed_password_storage_restores_previous_account(manager, fake_login, 
     assert manager.get_account('a') == before
 
 
-def test_code_limits_expiry_cancel_and_login_cooldown(manager, fake_login):
+def test_code_limits_expiry_cancel_and_login_cooldown(manager, fake_login, monkeypatch):
+    clock = [time.time()]
+    monkeypatch.setattr(am.time, 'time', lambda: clock[0])
     token = begin(manager)['login_id']
-    with pytest.raises(al.AppleLoginError, match='60'):
+    with pytest.raises(al.AppleLoginError, match='5 秒'):
         begin(manager)
+    clock[0] += 5
+    assert begin(manager)['requires_code']
     for _ in range(5):
         with pytest.raises(al.AppleLoginError):
             manager.password_login_action(token, 'verify', '000000')
@@ -361,7 +365,7 @@ def test_creation_in_progress_blocks_password_login_before_apple_request(manager
 def test_new_account_is_committed_only_after_success_and_duplicate_challenge_cannot_overwrite(manager, fake_login):
     manager.accounts.clear()
     token = manager.begin_password_login('demo@example.com', 'primary-secret')['login_id']
-    manager._apple_login_recent['demo@example.com'] -= 61
+    manager._apple_login_recent['demo@example.com'] -= 6
     second = manager.begin_password_login('demo@example.com', 'older-secret')['login_id']
     assert not manager.accounts
     result = manager.password_login_action(token, 'verify', '123456')

@@ -595,7 +595,7 @@ class AccountManager:
                     task['client'].close()
                 finally:
                     task['lock'].release()
-        self._apple_login_recent = {k: v for k, v in self._apple_login_recent.items() if now - v < 60}
+        self._apple_login_recent = {k: v for k, v in self._apple_login_recent.items() if now - v < 5}
 
     @staticmethod
     def _apple_challenge(token, task):
@@ -648,8 +648,8 @@ class AccountManager:
                 raise AppleLoginError('请输入 Apple 账号的主密码')
             with self._lock:
                 self._prune_apple_logins()
-                if time.time() - self._apple_login_recent.get(identity, 0) < 60:
-                    raise AppleLoginError('请等待 60 秒后再发起登录', 'throttle')
+                if time.time() - self._apple_login_recent.get(identity, 0) < 5:
+                    raise AppleLoginError('请等待 5 秒后再发起登录', 'throttle')
                 if len(self._apple_login_tasks) >= 8 or len(self._apple_login_recent) >= 128:
                     raise AppleLoginError('登录请求过多，请先完成已有验证', 'throttle')
                 if not self._apple_login_slots.acquire(blocking=False):
